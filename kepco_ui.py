@@ -237,6 +237,28 @@ class KepcoController:
         echo = sent_cmd.strip() if sent_cmd else None
         prev = self.sock.gettimeout()
         self.sock.settimeout(timeout)
+
+        def _clean_line(line: str):
+            """Normalize one line by removing Telnet prompt noise.
+
+            Real BIT Telnet responses can include shell-style prompt prefixes
+            like 'KEPCO ... >CMD?' or 'KEPCO ... >0,"No error"'.
+            """
+            line = line.strip()
+            if not line:
+                return None
+
+            # If a device prompt prefix exists, keep only the payload
+            # right of the last prompt marker.
+            if ">" in line:
+                tail = line.rsplit(">", 1)[1].strip()
+                if tail:
+                    line = tail
+
+            if echo and line == echo:
+                return None
+            return line or None
+
         try:
             raw = b""
             deadline = time.time() + timeout
@@ -261,21 +283,20 @@ class KepcoController:
                 trailing = parts[-1]
                 complete = parts[:-1]
                 for line in complete:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if echo and line == echo:
-                        continue          # discard echo
-                    return line
+                    line = _clean_line(line)
+                    if line is not None:
+                        return line
                 # Only echo / empty lines so far — keep the tail
                 raw = trailing.encode("ascii", errors="ignore")
                 if len(raw) > 8192:
                     break
             # Timeout — check anything left in buffer
             if raw:
-                text = raw.decode("ascii", errors="ignore").strip()
-                if text and not (echo and text == echo):
-                    return text
+                text = raw.decode("ascii", errors="ignore")
+                for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                    cleaned = _clean_line(line)
+                    if cleaned is not None:
+                        return cleaned
             return None
         except ConnectionError:
             raise
@@ -403,6 +424,10 @@ class KepcoController:
             return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
 
         try:
+            # Clear stale error queue first so prior test noise is not
+            # reported as a fresh upload failure.
+            self.drain_errors()
+
             # ── Phase 1: Setup ──
             # Real hardware behavior: some BIT firmware revisions reject
             # LIST:DWEL-before-values with -221 Settings conflict.
@@ -678,6 +703,7 @@ class App:
         self.csv_points = None
         self.current_points = []
         self.is_running = False
+        self.device_waveform_active = False
         self.stop_event = threading.Event()
         self._connect_in_flight = False
         self._meas_in_flight = False
@@ -1585,6 +1611,7 @@ class App:
         self.man_volt_entry.insert(0, "0.0")
         self.man_curr_entry.delete(0, "end")
         self.man_curr_entry.insert(0, "0.0")
+        self.device_waveform_active = False
         if err_msg:
             self.log(f"Disconnect with warnings: {err_msg}", "warn")
             messagebox.showwarning(
@@ -1746,6 +1773,16 @@ class App:
         then verified with LIST:{mode}:POIN? and SYST:ERR? before running.
         """
         try:
+            # Always stop any previously running/uploaded waveform before a
+            # new Upload & Run, per test protocol requirement.
+            self._log_safe("Pre-run: stopping previous waveform/output…", "info")
+            ok, msg = self.kepco.stop()
+            if not ok:
+                self._log_safe(f"Pre-run stop failed: {msg}", "warn")
+            else:
+                self._log_safe(f"Pre-run stop: {msg}", "ok")
+            self.device_waveform_active = False
+
             chunks = [points[i:i + MAX_LIST_POINTS]
                       for i in range(0, len(points), MAX_LIST_POINTS)]
             nc = len(chunks)
@@ -1784,6 +1821,7 @@ class App:
                 if not ok:
                     self.root.after(0, lambda: self._handle_comm_failure("run"))
                     return
+                self.device_waveform_active = True
                 self._ui_chunk(-1, points)
                 self.root.after(0, lambda: self.progress.set(1.0))
                 self.root.after(0, lambda: self.prog_lbl.configure(
@@ -1827,6 +1865,7 @@ class App:
                             self.root.after(
                                 0, lambda: self._handle_comm_failure("chunk run"))
                             return
+                        self.device_waveform_active = True
 
                         # Wait for chunk to finish executing + margin
                         wait = len(ck) * dwell + 0.10
@@ -1875,10 +1914,14 @@ class App:
             self._update_graph(self.current_points)
         if self.kepco.connected:
             threading.Thread(target=self._stop_worker, daemon=True).start()
+        else:
+            self.device_waveform_active = False
 
     def _stop_worker(self):
         ok, msg = self.kepco.stop()
         self._log_safe(f"Stop: {msg}", "ok" if ok else "err")
+        if ok:
+            self.device_waveform_active = False
         if not ok:
             self.root.after(0, lambda: self._handle_comm_failure("stop"))
 
