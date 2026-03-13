@@ -1585,24 +1585,75 @@ class App:
             self.log(f"Connection failed: {msg}", "err")
 
     def _disconnect_worker(self):
-        steps = [
-            ("VOLT 0", "set voltage to 0V"),
-            ("CURR 0", "set current to 0A"),
-            ("OUTP OFF", "turn output OFF"),
-        ]
-        err_msg = ""
-        for cmd, desc in steps:
-            ok = self.kepco.send(cmd)
-            if not ok:
-                err = self.kepco.last_error or "send failed"
-                err_msg = f"Could not {desc} before disconnecting ({err})"
-                break
-        self.kepco.disconnect()
-        self.root.after(0, lambda: self._disconnect_done(err_msg))
+        ok, err_msg = self._safe_output_off_before_disconnect()
+        if ok:
+            self.kepco.disconnect()
+        self.root.after(0, lambda: self._disconnect_done(ok, err_msg))
 
-    def _disconnect_done(self, err_msg):
+    def _safe_output_off_before_disconnect(self):
+        """Strict safety interlock: force OFF/0 and verify readback.
+
+        Returns (ok, err_msg).  ok=False means disconnect/close must be blocked.
+        """
+        if not self.kepco.connected:
+            return True, ""
+
+        def _parse_num(raw):
+            try:
+                return float(str(raw).strip())
+            except Exception:
+                return None
+
+        for attempt in range(2):
+            errors = []
+
+            # Exit list execution first so fixed commands are accepted.
+            ok_stop, stop_msg = self.kepco.stop()
+            if not ok_stop:
+                errors.append(f"stop failed ({stop_msg})")
+
+            for cmd, desc in [
+                ("VOLT 0", "set voltage to 0V"),
+                ("CURR 0", "set current to 0A"),
+                ("OUTP OFF", "turn output OFF"),
+            ]:
+                if not self.kepco.send(cmd):
+                    err = self.kepco.last_error or "send failed"
+                    errors.append(f"could not {desc} ({err})")
+
+            outp = (self.kepco.send("OUTP?", query=True) or "").strip().upper()
+            v = _parse_num(self.kepco.send("VOLT?", query=True))
+            c = _parse_num(self.kepco.send("CURR?", query=True))
+
+            outp_ok = outp in ("0", "OFF")
+            zero_ok = (v is not None and c is not None
+                       and abs(v) <= 0.05 and abs(c) <= 0.05)
+
+            if outp_ok and zero_ok:
+                return True, ""
+
+            errors.append(
+                f"verification failed (OUTP?='{outp}', VOLT?='{v}', CURR?='{c}')")
+            if attempt == 0:
+                time.sleep(0.1)
+            else:
+                return False, "; ".join(errors)
+
+        return False, "safety verification failed"
+
+    def _disconnect_done(self, ok, err_msg):
         self._connect_in_flight = False
         self.conn_btn.configure(state="normal")
+        if not ok:
+            self._set_connected_state(True, self.idn_lbl.cget("text"))
+            self.log(f"Disconnect blocked by safety interlock: {err_msg}", "err")
+            messagebox.showerror(
+                "Safety Interlock",
+                "Disconnect blocked.\n"
+                "Output could not be verified OFF at 0V/0A.\n"
+                f"Details: {err_msg}")
+            return
+
         self._set_connected_state(False)
         self.man_outp_var.set("OFF")
         self.man_outp_switch.deselect()
@@ -1612,14 +1663,7 @@ class App:
         self.man_curr_entry.delete(0, "end")
         self.man_curr_entry.insert(0, "0.0")
         self.device_waveform_active = False
-        if err_msg:
-            self.log(f"Disconnect with warnings: {err_msg}", "warn")
-            messagebox.showwarning(
-                "Disconnect Warning",
-                "Disconnected, but safe-state commands were incomplete.\n"
-                f"{err_msg}")
-        else:
-            self.log("Disconnected.")
+        self.log("Disconnected.")
 
     # ──────────────────────────────────────────────────────────────────────
     #  CSV
@@ -1927,11 +1971,18 @@ class App:
 
     def _on_close(self):
         self.stop_event.set()
-        try:
-            if self.kepco.connected:
-                self.kepco.disconnect()
-        finally:
-            self.root.destroy()
+        if self.kepco.connected:
+            ok, err_msg = self._safe_output_off_before_disconnect()
+            if not ok:
+                self.log(f"Close blocked by safety interlock: {err_msg}", "err")
+                messagebox.showerror(
+                    "Safety Interlock",
+                    "Close blocked.\n"
+                    "Output could not be verified OFF at 0V/0A.\n"
+                    f"Details: {err_msg}")
+                return
+            self.kepco.disconnect()
+        self.root.destroy()
 
     # ──────────────────────────────────────────────────────────────────────
     def run(self):
