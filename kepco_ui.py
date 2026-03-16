@@ -989,32 +989,65 @@ class App:
             anchor="w", padx=14, pady=(0, 6))
 
         # Voltage
-        v_row = ctk.CTkFrame(left, fg_color="transparent")
-        v_row.pack(fill="x", padx=14, pady=(0, 4))
+        v_block = ctk.CTkFrame(left, fg_color="transparent")
+        v_block.pack(fill="x", padx=14, pady=(0, 6))
+
+        v_row = ctk.CTkFrame(v_block, fg_color="transparent")
+        v_row.pack(fill="x")
         ctk.CTkLabel(v_row, text="Voltage (V):",
                      font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_volt_entry = ctk.CTkEntry(v_row, width=110,
+        self.man_volt_entry = ctk.CTkEntry(v_row, width=92,
                                            placeholder_text="0.0")
         self.man_volt_entry.insert(0, "0.0")
         self.man_volt_entry.pack(side="left", padx=4)
-        ctk.CTkButton(v_row, text="Set", width=60,
+        ctk.CTkButton(v_row, text="Set", width=66,
                       command=self._man_set_voltage,
                       fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+                      hover_color="#4b5563").pack(side="left", padx=(2, 0))
+
+        v_nudge_row = ctk.CTkFrame(v_block, fg_color="transparent")
+        v_nudge_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(v_nudge_row, text="", width=104).pack(side="left")
+        ctk.CTkButton(v_nudge_row, text="-0.1 V", width=78,
+                      command=lambda: self._man_nudge_voltage(-0.1),
+                      fg_color="#1f4d7a",
+                      hover_color="#2563a6").pack(side="left", padx=(0, 4))
+        ctk.CTkButton(v_nudge_row, text="+0.1 V", width=78,
+                      command=lambda: self._man_nudge_voltage(0.1),
+                      fg_color="#14532d",
+                      hover_color="#166534").pack(side="left", padx=(0, 0))
+
+        ctk.CTkFrame(left, height=1, fg_color="transparent").pack(
+            fill="x", padx=14, pady=(2, 6))
 
         # Current
-        c_row = ctk.CTkFrame(left, fg_color="transparent")
-        c_row.pack(fill="x", padx=14, pady=(0, 4))
+        c_block = ctk.CTkFrame(left, fg_color="transparent")
+        c_block.pack(fill="x", padx=14, pady=(0, 4))
+
+        c_row = ctk.CTkFrame(c_block, fg_color="transparent")
+        c_row.pack(fill="x")
         ctk.CTkLabel(c_row, text="Current (A):",
                      font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_curr_entry = ctk.CTkEntry(c_row, width=110,
+        self.man_curr_entry = ctk.CTkEntry(c_row, width=92,
                                            placeholder_text="0.0")
         self.man_curr_entry.insert(0, "0.0")
         self.man_curr_entry.pack(side="left", padx=4)
-        ctk.CTkButton(c_row, text="Set", width=60,
+        ctk.CTkButton(c_row, text="Set", width=66,
                       command=self._man_set_current,
                       fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+                      hover_color="#4b5563").pack(side="left", padx=(2, 0))
+
+        c_nudge_row = ctk.CTkFrame(c_block, fg_color="transparent")
+        c_nudge_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(c_nudge_row, text="", width=104).pack(side="left")
+        ctk.CTkButton(c_nudge_row, text="-0.1 A", width=78,
+                      command=lambda: self._man_nudge_current(-0.1),
+                      fg_color="#1f4d7a",
+                      hover_color="#2563a6").pack(side="left", padx=(0, 4))
+        ctk.CTkButton(c_nudge_row, text="+0.1 A", width=78,
+                      command=lambda: self._man_nudge_current(0.1),
+                      fg_color="#14532d",
+                      hover_color="#166534").pack(side="left", padx=(0, 0))
 
         ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
             fill="x", padx=14, pady=8)
@@ -1239,6 +1272,9 @@ class App:
         if not ok:
             self._handle_comm_failure("set voltage")
 
+    def _man_nudge_voltage(self, delta):
+        self._man_nudge_value(self.man_volt_entry, delta, "VOLT", "V")
+
     def _man_set_current(self):
         if not self._man_require_conn():
             return
@@ -1252,6 +1288,33 @@ class App:
                  "ok" if ok else "err")
         if not ok:
             self._handle_comm_failure("set current")
+
+    def _man_nudge_current(self, delta):
+        self._man_nudge_value(self.man_curr_entry, delta, "CURR", "A")
+
+    def _man_nudge_value(self, entry, delta, scpi_cmd, unit):
+        try:
+            current = float(entry.get())
+        except ValueError:
+            self.log(f"Invalid {scpi_cmd.lower()} value", "err")
+            return
+
+        # Round to keep clean 0.1-step values in the UI.
+        nudged = round(current + delta, 4)
+        entry.delete(0, "end")
+        entry.insert(0, f"{nudged:.4f}")
+
+        if not self.kepco.connected:
+            self.log(f"{scpi_cmd} nudge prepared: {nudged:.4f} {unit} (not connected)",
+                     "warn")
+            return
+
+        ok = self.kepco.send(f"{scpi_cmd} {nudged:.4f}")
+        self.log(f"{scpi_cmd} nudge → {nudged:.4f} {unit}"
+                 if ok else f"Failed to nudge {scpi_cmd.lower()}",
+                 "ok" if ok else "err")
+        if not ok:
+            self._handle_comm_failure(f"{scpi_cmd.lower()} nudge")
 
     def _man_set_range(self):
         if not self._man_require_conn():
