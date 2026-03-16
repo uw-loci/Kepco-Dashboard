@@ -15,6 +15,7 @@ Hardware Constraints (BIT 802E manual):
 import socket
 import math
 import csv
+import os
 import threading
 import time
 import ipaddress
@@ -707,9 +708,15 @@ class App:
         self.stop_event = threading.Event()
         self._connect_in_flight = False
         self._meas_in_flight = False
+        self.log_file_handle = None
+        self.log_file_path = ""
+
+        self._init_log_file()
 
         self._build_ui()
         self._update_graph()
+        if self.log_file_path:
+            self.log(f"Session log file: {self.log_file_path}", "info")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -897,11 +904,50 @@ class App:
                      font=ctk.CTkFont(size=12)).pack(
             anchor="w", padx=14, pady=(6, 1))
 
+    def _init_log_file(self):
+        """Create a per-session dashboard log file in ./logs."""
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.log_file_path = os.path.join(log_dir, f"kepco_dashboard_date_{stamp}.log")
+            self.log_file_handle = open(self.log_file_path, "a", encoding="utf-8")
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log started\n")
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+            self.log_file_path = ""
+
+    def _write_log_file_line(self, ts, tag, msg):
+        if not self.log_file_handle:
+            return
+        try:
+            line = f"[{ts}] [{tag.upper()}] {msg}\n"
+            self.log_file_handle.write(line)
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+
+    def _close_log_file(self):
+        if not self.log_file_handle:
+            return
+        try:
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log closed\n")
+            self.log_file_handle.flush()
+            self.log_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.log_file_handle = None
+
     def log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
         sym = {"info": "ℹ", "ok": "✓", "warn": "⚠", "err": "✗"}.get(tag, "·")
         self.log_text.insert("end", f"[{ts}] {sym}  {msg}\n")
         self.log_text.see("end")
+        self._write_log_file_line(ts, tag, msg)
 
     def _set_connected_state(self, connected, idn=""):
         """Keep UI connection indicators consistent with transport state."""
@@ -2045,6 +2091,8 @@ class App:
                     f"Details: {err_msg}")
                 return
             self.kepco.disconnect()
+        self.log("Application closed.", "info")
+        self._close_log_file()
         self.root.destroy()
 
     # ──────────────────────────────────────────────────────────────────────

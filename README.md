@@ -7,6 +7,7 @@ A Material-style GUI to generate, preview and upload waveform LISTs to a Kepco B
 - Chunked LIST upload (≤ 1000 pts per chunk) with paced writes and verification
 - Robust SCPI over Telnet (IAC filtering) + socket fallback
 - Live waveform preview, manual SCPI console, auto-discovery on /24 subnets
+- Automatic session log files written to `logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log`
 - Built-in simulator (`kepco_simulator.py`) for development and testing
 - Safety interlocks (sets outputs to 0 and turns OFF before disconnect)
 
@@ -54,6 +55,7 @@ Usage notes & safety
 - The app enforces device pacing (≈35 ms gap) and consumes Telnet echoes to avoid device deadlocks.
 - The app issues safety commands (VOLT 0 / CURR 0 / OUTP OFF) before disconnecting — do not bypass.
 - For multi-chunk waveforms, the UI uploads chunks sequentially and runs each chunk once (or loops if configured).
+- Every line shown in the in-app log panel is also persisted to a session log file under `logs/`.
 
 Command-level state flow
 ```mermaid
