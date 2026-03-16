@@ -783,7 +783,7 @@ class App:
         self.wave_var = ctk.StringVar(value="Sine")
         self.wave_combo = ctk.CTkComboBox(
             cfg, variable=self.wave_var,
-            values=["Sine", "Square", "Triangle", "Sawtooth", "CSV Custom"],
+            values=["Sine", "Square", "Triangle", "Sawtooth", "CSV Custom (untested)"],
             command=self._on_wave_change)
         self.wave_combo.pack(fill="x", padx=14, pady=(0, 6))
 
