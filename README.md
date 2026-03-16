@@ -60,24 +60,24 @@ Usage notes & safety
 Command-level state flow
 ```mermaid
 flowchart TD
-    A["Disconnected"] -->|"Connect<br/>open TCP 5024 (fallback 5025)<br/>*IDN?"| B["Connected / Idle"]
-    B -->|"Preview (local only)<br/>no SCPI sent"| B
+   A["Disconnected"] -->|"Connect<br/>open TCP 5024 (fallback 5025)<br/>*IDN?"| B["Connected / Idle"]
+   B -->|"Preview (local only)<br/>no SCPI sent"| B
 
-    B -->|"Upload & Run (single chunk)<br/>FUNC:MODE {mode}<br/>{mode}:RANG 1<br/>LIST:CLE -> *WAI -> LIST:DWEL {dwell}<br/>LIST:{mode} ... (batched)<br/>*WAI -> LIST:{mode}:POIN? -> SYST:ERR?"| C["Chunk Uploaded (Verified)"]
-    C -->|"Run<br/>LIST:COUN {count}<br/>OUTP ON<br/>{mode}:MODE LIST"| D["Running LIST"]
+   B -->|"Upload & Run (single chunk)<br/>FUNC:MODE {mode}<br/>{mode}:RANG 1<br/>LIST:CLE -> *WAI -> LIST:DWEL {dwell}<br/>LIST:{mode} ... (batched)<br/>*WAI -> LIST:{mode}:POIN? -> SYST:ERR?"| C["Chunk Uploaded (Verified)"]
+   C -->|"Run<br/>LIST:COUN {count}<br/>OUTP ON<br/>{mode}:MODE LIST"| D["Running LIST"]
 
-    B -->|"Upload & Run (multi chunk loop)<br/>for each chunk: upload/verify/run once<br/>wait chunk duration + margin"| E["Running Sequenced Chunks"]
-    E -->|"all chunks complete (iteration)"| B
-    E -->|"loop configured"| E
+   B -->|"Upload & Run (multi chunk loop)<br/>for each chunk: upload/verify/run once<br/>wait chunk duration + margin"| E["Running Sequenced Chunks"]
+   E -->|"all chunks complete (iteration)"| B
+   E -->|"loop configured"| E
 
-    D -->|"Stop<br/>VOLT:MODE FIX<br/>CURR:MODE FIX<br/>OUTP OFF<br/>FUNC:MODE VOLT"| F["Stopped / Safe Fixed State"]
-    E -->|"Stop (same command sequence)"| F
-    F --> B
+   D -->|"Stop<br/>VOLT:MODE FIX<br/>CURR:MODE FIX<br/>OUTP OFF<br/>FUNC:MODE VOLT"| F["Stopped / Safe Fixed State"]
+   E -->|"Stop (same command sequence)"| F
+   F --> B
 
-    B -->|"Disconnect (safety interlock)<br/>VOLT 0<br/>CURR 0<br/>OUTP OFF<br/>close socket"| A
-    F -->|"Disconnect (safety interlock + close socket)"| A
+   B -->|"Disconnect (safety interlock)<br/>VOLT 0<br/>CURR 0<br/>OUTP OFF<br/>close socket"| A
+   F -->|"Disconnect (safety interlock + close socket)"| A
 
-    B -->|"Manual Override (in-place SCPI)<br/>OUTP, VOLT, CURR, FUNC:MODE,<br/>MEAS:VOLT?, MEAS:CURR?, SYST:ERR?, etc."| B
+   B -->|"Manual Override (in-place SCPI)<br/>OUTP, VOLT, CURR, FUNC:MODE,<br/>MEAS:VOLT?, MEAS:CURR?, SYST:ERR?, etc."| B
 ```
 
 Troubleshooting
