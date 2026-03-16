@@ -1778,7 +1778,7 @@ class App:
     #  CSV
     # ──────────────────────────────────────────────────────────────────────
     def _on_wave_change(self, _=None):
-        if self.wave_var.get() == "CSV Custom":
+        if self.wave_var.get() == "CSV Custom (untested)":
             self.csv_frame.pack(fill="x", padx=14, pady=(0, 6),
                                 after=self.wave_combo)
         else:
@@ -1834,7 +1834,7 @@ class App:
             messagebox.showerror("Error", "\n".join(warns))
             return None, None, None
 
-        if p["wave"] == "CSV Custom":
+        if p["wave"] == "CSV Custom (untested)":
             if not self.csv_points:
                 messagebox.showerror("Error", "Load a CSV file first.")
                 return None, None, None
