@@ -15,6 +15,7 @@ Hardware Constraints (BIT 802E manual):
 import socket
 import math
 import csv
+import os
 import threading
 import time
 import ipaddress
@@ -84,6 +85,7 @@ class KepcoController:
         self.transport = "TELNET"
         self.connected = False
         self.last_error = ""
+        self._query_timeout_count = 0
         self._lock = threading.Lock()
 
     # ── connect / disconnect ───────────────────────────────────────────────
@@ -114,6 +116,7 @@ class KepcoController:
                 self.transport = transport
                 self.connected = True
                 self.last_error = ""
+                self._query_timeout_count = 0
                 return True, f"Connected via {transport} ({target_port})"
             except Exception as e:
                 last_err = str(e)
@@ -133,6 +136,7 @@ class KepcoController:
                 pass
         self.sock = None
         self.connected = False
+        self._query_timeout_count = 0
 
     def _safe_reconnect(self):
         if not self.ip:
@@ -234,6 +238,28 @@ class KepcoController:
         echo = sent_cmd.strip() if sent_cmd else None
         prev = self.sock.gettimeout()
         self.sock.settimeout(timeout)
+
+        def _clean_line(line: str):
+            """Normalize one line by removing Telnet prompt noise.
+
+            Real BIT Telnet responses can include shell-style prompt prefixes
+            like 'KEPCO ... >CMD?' or 'KEPCO ... >0,"No error"'.
+            """
+            line = line.strip()
+            if not line:
+                return None
+
+            # If a device prompt prefix exists, keep only the payload
+            # right of the last prompt marker.
+            if ">" in line:
+                tail = line.rsplit(">", 1)[1].strip()
+                if tail:
+                    line = tail
+
+            if echo and line == echo:
+                return None
+            return line or None
+
         try:
             raw = b""
             deadline = time.time() + timeout
@@ -258,21 +284,20 @@ class KepcoController:
                 trailing = parts[-1]
                 complete = parts[:-1]
                 for line in complete:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if echo and line == echo:
-                        continue          # discard echo
-                    return line
+                    line = _clean_line(line)
+                    if line is not None:
+                        return line
                 # Only echo / empty lines so far — keep the tail
                 raw = trailing.encode("ascii", errors="ignore")
                 if len(raw) > 8192:
                     break
             # Timeout — check anything left in buffer
             if raw:
-                text = raw.decode("ascii", errors="ignore").strip()
-                if text and not (echo and text == echo):
-                    return text
+                text = raw.decode("ascii", errors="ignore")
+                for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                    cleaned = _clean_line(line)
+                    if cleaned is not None:
+                        return cleaned
             return None
         except ConnectionError:
             raise
@@ -325,7 +350,14 @@ class KepcoController:
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 resp = self._recv_response(sent_cmd=cmd, timeout=timeout)
                 if resp is None:
+                    self._query_timeout_count += 1
                     self.last_error = f"No response to '{cmd}'"
+                    if self._query_timeout_count >= 2:
+                        self.last_error = (
+                            f"No response to '{cmd}' (connection lost)")
+                        self.disconnect()
+                else:
+                    self._query_timeout_count = 0
                 return resp
             except Exception as e:
                 self.last_error = str(e)
@@ -371,11 +403,12 @@ class KepcoController:
                           progress_cb=None):
         """Upload one chunk (≤ 1000 points) with paced writes + verification.
 
-        Strategy (follows manual Figure B-2 order):
-          1. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI, LIST:DWEL
+                Strategy:
+                    1. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
           2. Values: send LIST:{mode} batches of ≤ 20 values each,
              each followed only by the mandatory 35 ms gap
-          3. Verify: *WAI → LIST:{mode}:POIN? → SYST:ERR?
+                    3. Dwell: send LIST:DWEL once after values
+                    4. Verify: *WAI → LIST:{mode}:POIN? → SYST:ERR?
 
         Key change from previous revision: *OPC? is NOT used anywhere
         in the upload path.  The manual (PAR A.17) recommends *WAI for
@@ -392,8 +425,14 @@ class KepcoController:
             return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
 
         try:
-            # ── Phase 1: Setup (order follows manual Figure B-2) ──
-            #   FUNC:MODE → RANG → LIST:CLE → *WAI → LIST:DWEL
+            # Clear stale error queue first so prior test noise is not
+            # reported as a fresh upload failure.
+            self.drain_errors()
+
+            # ── Phase 1: Setup ──
+            # Real hardware behavior: some BIT firmware revisions reject
+            # LIST:DWEL-before-values with -221 Settings conflict.
+            #   FUNC:MODE → RANG → LIST:CLE → *WAI
             # NOTE: *CLS is intentionally NOT sent here — the manual
             # examples never use it for list operations, and it forces
             # the card to "operation complete idle" which can confuse
@@ -403,7 +442,6 @@ class KepcoController:
                 f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
                 "LIST:CLE",
                 "*WAI",                   # wait for LIST:CLE (PAR A.17)
-                f"LIST:DWEL {dwell:.6f}", # dwell BEFORE values (manual order)
             ]
             for cmd in setup_cmds:
                 if self.send_cmd(cmd) is None:
@@ -447,7 +485,11 @@ class KepcoController:
                 if progress_cb:
                     progress_cb(sent, total)
 
-            # ── Phase 3: Verify ──
+            # ── Phase 3: Set dwell after values ──
+            if self.send_cmd(f"LIST:DWEL {dwell:.6f}") is None:
+                return False, f"Dwell send failed: {self.last_error}"
+
+            # ── Phase 4: Verify ──
             # *WAI ensures all LIST:{mode} values are ingested before
             # the verification query is processed (PAR A.17).
             if not self.sync():
@@ -488,6 +530,14 @@ class KepcoController:
             ]:
                 if self.send_cmd(cmd) is None:
                     return False, f"Run '{cmd}' failed: {self.last_error}"
+
+            outp = (self.send_query("OUTP?") or "").strip().upper()
+            mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
+            if outp not in ("1", "ON"):
+                return False, "Run verification failed: output not enabled"
+            if mode_state and "LIST" not in mode_state:
+                return False, (
+                    f"Run verification failed: {mode}:MODE is '{mode_state}'")
             return True, "Running"
         except Exception as e:
             return False, str(e)
@@ -521,6 +571,16 @@ class Discovery:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(timeout)
                 s.connect((ip_str, port))
+                if port == TELNET_PORT:
+                    # Drain Telnet IAC negotiation before sending a SCPI query.
+                    time.sleep(0.1)
+                    s.setblocking(False)
+                    try:
+                        s.recv(1024)
+                    except (BlockingIOError, OSError):
+                        pass
+                    s.setblocking(True)
+                    s.settimeout(timeout)
                 s.sendall(b"*IDN?\n")
                 resp = s.recv(512).decode("ascii", errors="ignore").strip()
                 s.close()
@@ -644,10 +704,20 @@ class App:
         self.csv_points = None
         self.current_points = []
         self.is_running = False
+        self.device_waveform_active = False
         self.stop_event = threading.Event()
+        self._connect_in_flight = False
+        self._meas_in_flight = False
+        self.log_file_handle = None
+        self.log_file_path = ""
+
+        self._init_log_file()
 
         self._build_ui()
         self._update_graph()
+        if self.log_file_path:
+            self.log(f"Session log file: {self.log_file_path}", "info")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ──────────────────────────────────────────────────────────────────────
     #  UI construction
@@ -713,7 +783,7 @@ class App:
         self.wave_var = ctk.StringVar(value="Sine")
         self.wave_combo = ctk.CTkComboBox(
             cfg, variable=self.wave_var,
-            values=["Sine", "Square", "Triangle", "Sawtooth", "CSV Custom"],
+            values=["Sine", "Square", "Triangle", "Sawtooth", "CSV Custom (untested)"],
             command=self._on_wave_change)
         self.wave_combo.pack(fill="x", padx=14, pady=(0, 6))
 
@@ -834,11 +904,74 @@ class App:
                      font=ctk.CTkFont(size=12)).pack(
             anchor="w", padx=14, pady=(6, 1))
 
+    def _init_log_file(self):
+        """Create a per-session dashboard log file in ./logs."""
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.log_file_path = os.path.join(log_dir, f"kepco_dashboard_date_{stamp}.log")
+            self.log_file_handle = open(self.log_file_path, "a", encoding="utf-8")
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log started\n")
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+            self.log_file_path = ""
+
+    def _write_log_file_line(self, ts, tag, msg):
+        if not self.log_file_handle:
+            return
+        try:
+            line = f"[{ts}] [{tag.upper()}] {msg}\n"
+            self.log_file_handle.write(line)
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+
+    def _close_log_file(self):
+        if not self.log_file_handle:
+            return
+        try:
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log closed\n")
+            self.log_file_handle.flush()
+            self.log_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.log_file_handle = None
+
     def log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
         sym = {"info": "ℹ", "ok": "✓", "warn": "⚠", "err": "✗"}.get(tag, "·")
         self.log_text.insert("end", f"[{ts}] {sym}  {msg}\n")
         self.log_text.see("end")
+        self._write_log_file_line(ts, tag, msg)
+
+    def _set_connected_state(self, connected, idn=""):
+        """Keep UI connection indicators consistent with transport state."""
+        if connected:
+            self.conn_btn.configure(text="Disconnect",
+                                    fg_color=C["red"],
+                                    hover_color="#dc2626")
+            self.status_lbl.configure(text="●  Connected",
+                                      text_color=C["green"])
+            self.idn_lbl.configure(text=idn)
+        else:
+            self.conn_btn.configure(text="Connect",
+                                    fg_color=C["primary"],
+                                    hover_color=C["primary_h"])
+            self.status_lbl.configure(text="●  Disconnected",
+                                      text_color=C["red"])
+            self.idn_lbl.configure(text="")
+
+    def _handle_comm_failure(self, context):
+        """Force UI+controller to disconnected state after transport failures."""
+        if not self.kepco.connected:
+            self._set_connected_state(False)
+            self.log(f"Connection lost during {context}: {self.kepco.last_error}",
+                     "err")
 
     # ──────────────────────────────────────────────────────────────────────
     #  Manual Override Tab
@@ -902,32 +1035,65 @@ class App:
             anchor="w", padx=14, pady=(0, 6))
 
         # Voltage
-        v_row = ctk.CTkFrame(left, fg_color="transparent")
-        v_row.pack(fill="x", padx=14, pady=(0, 4))
+        v_block = ctk.CTkFrame(left, fg_color="transparent")
+        v_block.pack(fill="x", padx=14, pady=(0, 6))
+
+        v_row = ctk.CTkFrame(v_block, fg_color="transparent")
+        v_row.pack(fill="x")
         ctk.CTkLabel(v_row, text="Voltage (V):",
                      font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_volt_entry = ctk.CTkEntry(v_row, width=110,
+        self.man_volt_entry = ctk.CTkEntry(v_row, width=92,
                                            placeholder_text="0.0")
         self.man_volt_entry.insert(0, "0.0")
         self.man_volt_entry.pack(side="left", padx=4)
-        ctk.CTkButton(v_row, text="Set", width=60,
+        ctk.CTkButton(v_row, text="Set", width=66,
                       command=self._man_set_voltage,
                       fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+                      hover_color="#4b5563").pack(side="left", padx=(2, 0))
+
+        v_nudge_row = ctk.CTkFrame(v_block, fg_color="transparent")
+        v_nudge_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(v_nudge_row, text="", width=104).pack(side="left")
+        ctk.CTkButton(v_nudge_row, text="-0.1 V", width=78,
+                      command=lambda: self._man_nudge_voltage(-0.1),
+                      fg_color="#1f4d7a",
+                      hover_color="#2563a6").pack(side="left", padx=(0, 4))
+        ctk.CTkButton(v_nudge_row, text="+0.1 V", width=78,
+                      command=lambda: self._man_nudge_voltage(0.1),
+                      fg_color="#14532d",
+                      hover_color="#166534").pack(side="left", padx=(0, 0))
+
+        ctk.CTkFrame(left, height=1, fg_color="transparent").pack(
+            fill="x", padx=14, pady=(2, 6))
 
         # Current
-        c_row = ctk.CTkFrame(left, fg_color="transparent")
-        c_row.pack(fill="x", padx=14, pady=(0, 4))
+        c_block = ctk.CTkFrame(left, fg_color="transparent")
+        c_block.pack(fill="x", padx=14, pady=(0, 4))
+
+        c_row = ctk.CTkFrame(c_block, fg_color="transparent")
+        c_row.pack(fill="x")
         ctk.CTkLabel(c_row, text="Current (A):",
                      font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_curr_entry = ctk.CTkEntry(c_row, width=110,
+        self.man_curr_entry = ctk.CTkEntry(c_row, width=92,
                                            placeholder_text="0.0")
         self.man_curr_entry.insert(0, "0.0")
         self.man_curr_entry.pack(side="left", padx=4)
-        ctk.CTkButton(c_row, text="Set", width=60,
+        ctk.CTkButton(c_row, text="Set", width=66,
                       command=self._man_set_current,
                       fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+                      hover_color="#4b5563").pack(side="left", padx=(2, 0))
+
+        c_nudge_row = ctk.CTkFrame(c_block, fg_color="transparent")
+        c_nudge_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(c_nudge_row, text="", width=104).pack(side="left")
+        ctk.CTkButton(c_nudge_row, text="-0.1 A", width=78,
+                      command=lambda: self._man_nudge_current(-0.1),
+                      fg_color="#1f4d7a",
+                      hover_color="#2563a6").pack(side="left", padx=(0, 4))
+        ctk.CTkButton(c_nudge_row, text="+0.1 A", width=78,
+                      command=lambda: self._man_nudge_current(0.1),
+                      fg_color="#14532d",
+                      hover_color="#166534").pack(side="left", padx=(0, 0))
 
         ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
             fill="x", padx=14, pady=8)
@@ -1104,6 +1270,12 @@ class App:
 
     def _man_toggle_output(self):
         if not self._man_require_conn():
+            if self.man_outp_var.get() == "ON":
+                self.man_outp_switch.deselect()
+                self.man_outp_var.set("OFF")
+            else:
+                self.man_outp_switch.select()
+                self.man_outp_var.set("ON")
             return
         state = self.man_outp_var.get()
         ok = self.kepco.send(f"OUTP {state}")
@@ -1113,7 +1285,14 @@ class App:
                 text=state, text_color=C["green"] if on else C["red"])
             self.log(f"Output → {state}", "ok")
         else:
+            if state == "ON":
+                self.man_outp_switch.deselect()
+                self.man_outp_var.set("OFF")
+            else:
+                self.man_outp_switch.select()
+                self.man_outp_var.set("ON")
             self.log("Failed to set output state", "err")
+            self._handle_comm_failure("output toggle")
 
     def _man_set_mode(self):
         if not self._man_require_conn():
@@ -1122,6 +1301,8 @@ class App:
         ok = self.kepco.send(f"FUNC:MODE {mode}")
         self.log(f"Mode → {mode}" if ok else "Failed to set mode",
                  "ok" if ok else "err")
+        if not ok:
+            self._handle_comm_failure("set mode")
 
     def _man_set_voltage(self):
         if not self._man_require_conn():
@@ -1134,6 +1315,11 @@ class App:
         ok = self.kepco.send(f"VOLT {val:.4f}")
         self.log(f"VOLT → {val:.4f} V" if ok else "Failed to set voltage",
                  "ok" if ok else "err")
+        if not ok:
+            self._handle_comm_failure("set voltage")
+
+    def _man_nudge_voltage(self, delta):
+        self._man_nudge_value(self.man_volt_entry, delta, "VOLT", "V")
 
     def _man_set_current(self):
         if not self._man_require_conn():
@@ -1146,6 +1332,35 @@ class App:
         ok = self.kepco.send(f"CURR {val:.4f}")
         self.log(f"CURR → {val:.4f} A" if ok else "Failed to set current",
                  "ok" if ok else "err")
+        if not ok:
+            self._handle_comm_failure("set current")
+
+    def _man_nudge_current(self, delta):
+        self._man_nudge_value(self.man_curr_entry, delta, "CURR", "A")
+
+    def _man_nudge_value(self, entry, delta, scpi_cmd, unit):
+        try:
+            current = float(entry.get())
+        except ValueError:
+            self.log(f"Invalid {scpi_cmd.lower()} value", "err")
+            return
+
+        # Round to keep clean 0.1-step values in the UI.
+        nudged = round(current + delta, 4)
+        entry.delete(0, "end")
+        entry.insert(0, f"{nudged:.4f}")
+
+        if not self.kepco.connected:
+            self.log(f"{scpi_cmd} nudge prepared: {nudged:.4f} {unit} (not connected)",
+                     "warn")
+            return
+
+        ok = self.kepco.send(f"{scpi_cmd} {nudged:.4f}")
+        self.log(f"{scpi_cmd} nudge → {nudged:.4f} {unit}"
+                 if ok else f"Failed to nudge {scpi_cmd.lower()}",
+                 "ok" if ok else "err")
+        if not ok:
+            self._handle_comm_failure(f"{scpi_cmd.lower()} nudge")
 
     def _man_set_range(self):
         if not self._man_require_conn():
@@ -1176,13 +1391,24 @@ class App:
             self.log("Device reset (*RST)", "ok")
         else:
             self.log("Reset failed", "err")
+            self._handle_comm_failure("reset")
 
     def _man_measure(self):
         if not self.kepco.connected:
             return
+        if self._meas_in_flight:
+            return
+        self._meas_in_flight = True
+        threading.Thread(target=self._man_measure_worker, daemon=True).start()
+
+    def _man_measure_worker(self):
         v = self.kepco.send("MEAS:VOLT?", query=True)
         c = self.kepco.send("MEAS:CURR?", query=True)
         m = self.kepco.send("FUNC:MODE?", query=True)
+        self.root.after(0, lambda: self._man_measure_done(v, c, m))
+
+    def _man_measure_done(self, v, c, m):
+        self._meas_in_flight = False
         try:
             v_str = f"{float(v):.4f}" if v else "— — —"
         except (ValueError, TypeError):
@@ -1194,6 +1420,8 @@ class App:
         self.meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
         self.meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
         self.meas_mode_lbl.configure(text=f"Mode:  {m or '— — —'}")
+        if any(x is None for x in (v, c, m)):
+            self._handle_comm_failure("measurement")
 
     def _man_toggle_auto_meas(self):
         if self.auto_meas_var.get():
@@ -1227,11 +1455,15 @@ class App:
             self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
             self.scpi_resp.insert("end",
                 f"[{ts}] < {resp or '(no response)'}\n")
+            if resp is None:
+                self._handle_comm_failure(f"SCPI query '{cmd}'")
         else:
             ok = self.kepco.send(cmd)
             self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
             self.scpi_resp.insert("end",
                 f"[{ts}] {'✓ OK' if ok else '✗ Failed'}\n")
+            if not ok:
+                self._handle_comm_failure(f"SCPI command '{cmd}'")
         self.scpi_resp.see("end")
         self.log(f"SCPI: {cmd}", "info")
 
@@ -1249,6 +1481,10 @@ class App:
     def _man_health_check(self):
         if not self._man_require_conn():
             return
+        threading.Thread(target=self._man_health_check_worker,
+                         daemon=True).start()
+
+    def _man_health_check_worker(self):
         checks = [
             "*IDN?",
             "FUNC:MODE?",
@@ -1259,14 +1495,22 @@ class App:
             "*ESR?",
         ]
         ts = time.strftime("%H:%M:%S")
+        results = [(cmd, self.kepco.send(cmd, query=True)) for cmd in checks]
+        self.root.after(0, lambda: self._man_health_check_done(ts, results))
+
+    def _man_health_check_done(self, ts, results):
         self.scpi_resp.insert("end", f"[{ts}] ==== Health Check ====\n")
-        for cmd in checks:
-            resp = self.kepco.send(cmd, query=True)
+        missing = False
+        for cmd, resp in results:
             self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
             self.scpi_resp.insert("end", f"[{ts}] < {resp or '(no response)'}\n")
+            if resp is None:
+                missing = True
         self.scpi_resp.insert("end", f"[{ts}] =====================\n")
         self.scpi_resp.see("end")
         self.log("Manual health check complete", "ok")
+        if missing:
+            self._handle_comm_failure("health check")
 
     # ──────────────────────────────────────────────────────────────────────
     #  Graph
@@ -1406,39 +1650,135 @@ class App:
         return True
 
     def _toggle_connect(self):
+        if self._connect_in_flight:
+            return
+
         if not self.kepco.connected:
             ip = self.ip_var.get().strip()
-            ok, msg = self.kepco.connect(ip)
-            if ok:
-                self.conn_btn.configure(text="Disconnect",
-                                        fg_color=C["red"],
-                                        hover_color="#dc2626")
-                self.status_lbl.configure(text="●  Connected",
-                                          text_color=C["green"])
-                idn = self.kepco.identity() or "Unknown device"
-                self.idn_lbl.configure(text=idn)
-                self.log(
-                    f"Connected to {ip} via {self.kepco.transport} "
-                    f"({self.kepco.port}):  {idn}", "ok")
-            else:
-                self.log(f"Connection failed: {msg}", "err")
+            self._connect_in_flight = True
+            self.conn_btn.configure(state="disabled", text="Connecting…")
+            threading.Thread(target=self._connect_worker,
+                             args=(ip,), daemon=True).start()
         else:
-            if not self._safe_disconnect_sequence():
+            if self.is_running:
+                messagebox.showwarning(
+                    "Waveform Running",
+                    "Stop the running waveform before disconnecting.")
                 return
+            self._connect_in_flight = True
+            self.conn_btn.configure(state="disabled", text="Disconnecting…")
+            threading.Thread(target=self._disconnect_worker, daemon=True).start()
+
+    def _connect_worker(self, ip):
+        ok, msg = self.kepco.connect(ip)
+        idn = None
+        if ok:
+            idn = self.kepco.identity()
+            if idn is None:
+                ok = False
+                msg = self.kepco.last_error or "Identity query failed"
+        self.root.after(0, lambda: self._connect_done(ok, msg, ip, idn))
+
+    def _connect_done(self, ok, msg, ip, idn):
+        self._connect_in_flight = False
+        self.conn_btn.configure(state="normal")
+        if ok:
+            idn = idn or "Unknown device"
+            self._set_connected_state(True, idn)
+            self.log(
+                f"Connected to {ip} via {self.kepco.transport} "
+                f"({self.kepco.port}):  {idn}", "ok")
+        else:
             self.kepco.disconnect()
-            self.conn_btn.configure(text="Connect",
-                                    fg_color=C["primary"],
-                                    hover_color=C["primary_h"])
-            self.status_lbl.configure(text="●  Disconnected",
-                                      text_color=C["red"])
-            self.idn_lbl.configure(text="")
-            self.log("Disconnected.")
+            self._set_connected_state(False)
+            self.log(f"Connection failed: {msg}", "err")
+
+    def _disconnect_worker(self):
+        ok, err_msg = self._safe_output_off_before_disconnect()
+        if ok:
+            self.kepco.disconnect()
+        self.root.after(0, lambda: self._disconnect_done(ok, err_msg))
+
+    def _safe_output_off_before_disconnect(self):
+        """Strict safety interlock: force OFF/0 and verify readback.
+
+        Returns (ok, err_msg).  ok=False means disconnect/close must be blocked.
+        """
+        if not self.kepco.connected:
+            return True, ""
+
+        def _parse_num(raw):
+            try:
+                return float(str(raw).strip())
+            except Exception:
+                return None
+
+        for attempt in range(2):
+            errors = []
+
+            # Exit list execution first so fixed commands are accepted.
+            ok_stop, stop_msg = self.kepco.stop()
+            if not ok_stop:
+                errors.append(f"stop failed ({stop_msg})")
+
+            for cmd, desc in [
+                ("VOLT 0", "set voltage to 0V"),
+                ("CURR 0", "set current to 0A"),
+                ("OUTP OFF", "turn output OFF"),
+            ]:
+                if not self.kepco.send(cmd):
+                    err = self.kepco.last_error or "send failed"
+                    errors.append(f"could not {desc} ({err})")
+
+            outp = (self.kepco.send("OUTP?", query=True) or "").strip().upper()
+            v = _parse_num(self.kepco.send("VOLT?", query=True))
+            c = _parse_num(self.kepco.send("CURR?", query=True))
+
+            outp_ok = outp in ("0", "OFF")
+            zero_ok = (v is not None and c is not None
+                       and abs(v) <= 0.05 and abs(c) <= 0.05)
+
+            if outp_ok and zero_ok:
+                return True, ""
+
+            errors.append(
+                f"verification failed (OUTP?='{outp}', VOLT?='{v}', CURR?='{c}')")
+            if attempt == 0:
+                time.sleep(0.1)
+            else:
+                return False, "; ".join(errors)
+
+        return False, "safety verification failed"
+
+    def _disconnect_done(self, ok, err_msg):
+        self._connect_in_flight = False
+        self.conn_btn.configure(state="normal")
+        if not ok:
+            self._set_connected_state(True, self.idn_lbl.cget("text"))
+            self.log(f"Disconnect blocked by safety interlock: {err_msg}", "err")
+            messagebox.showerror(
+                "Safety Interlock",
+                "Disconnect blocked.\n"
+                "Output could not be verified OFF at 0V/0A.\n"
+                f"Details: {err_msg}")
+            return
+
+        self._set_connected_state(False)
+        self.man_outp_var.set("OFF")
+        self.man_outp_switch.deselect()
+        self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
+        self.man_volt_entry.delete(0, "end")
+        self.man_volt_entry.insert(0, "0.0")
+        self.man_curr_entry.delete(0, "end")
+        self.man_curr_entry.insert(0, "0.0")
+        self.device_waveform_active = False
+        self.log("Disconnected.")
 
     # ──────────────────────────────────────────────────────────────────────
     #  CSV
     # ──────────────────────────────────────────────────────────────────────
     def _on_wave_change(self, _=None):
-        if self.wave_var.get() == "CSV Custom":
+        if self.wave_var.get() == "CSV Custom (untested)":
             self.csv_frame.pack(fill="x", padx=14, pady=(0, 6),
                                 after=self.wave_combo)
         else:
@@ -1494,7 +1834,7 @@ class App:
             messagebox.showerror("Error", "\n".join(warns))
             return None, None, None
 
-        if p["wave"] == "CSV Custom":
+        if p["wave"] == "CSV Custom (untested)":
             if not self.csv_points:
                 messagebox.showerror("Error", "Load a CSV file first.")
                 return None, None, None
@@ -1586,6 +1926,16 @@ class App:
         then verified with LIST:{mode}:POIN? and SYST:ERR? before running.
         """
         try:
+            # Always stop any previously running/uploaded waveform before a
+            # new Upload & Run, per test protocol requirement.
+            self._log_safe("Pre-run: stopping previous waveform/output…", "info")
+            ok, msg = self.kepco.stop()
+            if not ok:
+                self._log_safe(f"Pre-run stop failed: {msg}", "warn")
+            else:
+                self._log_safe(f"Pre-run stop: {msg}", "ok")
+            self.device_waveform_active = False
+
             chunks = [points[i:i + MAX_LIST_POINTS]
                       for i in range(0, len(points), MAX_LIST_POINTS)]
             nc = len(chunks)
@@ -1615,11 +1965,16 @@ class App:
                     chunks[0], dwell, mode, progress_cb=_progress_cb)
                 if not ok:
                     self._log_safe(f"Upload error: {msg}", "err")
+                    self.root.after(0, lambda: self._handle_comm_failure("upload"))
                     return
                 self._log_safe(f"Uploaded: {msg}", "ok")
 
                 ok, msg = self.kepco.run_list(mode, loops)
                 self._log_safe(f"Run: {msg}", "ok" if ok else "err")
+                if not ok:
+                    self.root.after(0, lambda: self._handle_comm_failure("run"))
+                    return
+                self.device_waveform_active = True
                 self._ui_chunk(-1, points)
                 self.root.after(0, lambda: self.progress.set(1.0))
                 self.root.after(0, lambda: self.prog_lbl.configure(
@@ -1649,6 +2004,8 @@ class App:
                         if not ok:
                             self._log_safe(
                                 f"Chunk {ci+1} upload failed: {msg}", "err")
+                            self.root.after(
+                                0, lambda: self._handle_comm_failure("chunk upload"))
                             return
                         self._log_safe(
                             f"Chunk {ci+1}/{nc}: {msg}", "ok")
@@ -1658,7 +2015,10 @@ class App:
                         if not ok:
                             self._log_safe(
                                 f"Chunk {ci+1} run failed: {msg}", "err")
+                            self.root.after(
+                                0, lambda: self._handle_comm_failure("chunk run"))
                             return
+                        self.device_waveform_active = True
 
                         # Wait for chunk to finish executing + margin
                         wait = len(ck) * dwell + 0.10
@@ -1698,9 +2058,6 @@ class App:
     # ──────────────────────────────────────────────────────────────────────
     def _stop(self):
         self.stop_event.set()
-        if self.kepco.connected:
-            ok, msg = self.kepco.stop()
-            self.log(f"Stop: {msg}", "ok" if ok else "err")
         self.is_running = False
         self.run_btn.configure(state="normal")
         self.prog_lbl.configure(text="Idle")
@@ -1708,6 +2065,35 @@ class App:
         self._resume_auto_measure()
         if self.current_points:
             self._update_graph(self.current_points)
+        if self.kepco.connected:
+            threading.Thread(target=self._stop_worker, daemon=True).start()
+        else:
+            self.device_waveform_active = False
+
+    def _stop_worker(self):
+        ok, msg = self.kepco.stop()
+        self._log_safe(f"Stop: {msg}", "ok" if ok else "err")
+        if ok:
+            self.device_waveform_active = False
+        if not ok:
+            self.root.after(0, lambda: self._handle_comm_failure("stop"))
+
+    def _on_close(self):
+        self.stop_event.set()
+        if self.kepco.connected:
+            ok, err_msg = self._safe_output_off_before_disconnect()
+            if not ok:
+                self.log(f"Close blocked by safety interlock: {err_msg}", "err")
+                messagebox.showerror(
+                    "Safety Interlock",
+                    "Close blocked.\n"
+                    "Output could not be verified OFF at 0V/0A.\n"
+                    f"Details: {err_msg}")
+                return
+            self.kepco.disconnect()
+        self.log("Application closed.", "info")
+        self._close_log_file()
+        self.root.destroy()
 
     # ──────────────────────────────────────────────────────────────────────
     def run(self):

@@ -7,6 +7,7 @@ A Material-style GUI to generate, preview and upload waveform LISTs to a Kepco B
 - Chunked LIST upload (≤ 1000 pts per chunk) with paced writes and verification
 - Robust SCPI over Telnet (IAC filtering) + socket fallback
 - Live waveform preview, manual SCPI console, auto-discovery on /24 subnets
+- Automatic session log files written to `logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log`
 - Built-in simulator (`kepco_simulator.py`) for development and testing
 - Safety interlocks (sets outputs to 0 and turns OFF before disconnect)
 
@@ -25,23 +26,50 @@ Hardware constraints (implemented)
 Quickstart — run locally
 1. Create and activate a virtualenv (recommended):
 
+   Unix/macOS:
+
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
+   Windows PowerShell:
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+
 2. (Optional) Start simulator for local testing:
+
+   Unix/macOS:
 
    ```bash
    python3 kepco_simulator.py
    # simulator listens on 0.0.0.0:5024 (Telnet) and :5025 (socket)
    ```
 
+   Windows PowerShell:
+
+   ```powershell
+   python kepco_simulator.py
+   # simulator listens on 0.0.0.0:5024 (Telnet) and :5025 (socket)
+   ```
+
 3. Start the UI:
+
+   Unix/macOS:
 
    ```bash
    python3 kepco_ui.py
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   python kepco_ui.py
    ```
 
 4. In the UI set the IP (use `127.0.0.1` for the local simulator or the device IP), Connect → Preview → Upload & Run.
@@ -54,6 +82,30 @@ Usage notes & safety
 - The app enforces device pacing (≈35 ms gap) and consumes Telnet echoes to avoid device deadlocks.
 - The app issues safety commands (VOLT 0 / CURR 0 / OUTP OFF) before disconnecting — do not bypass.
 - For multi-chunk waveforms, the UI uploads chunks sequentially and runs each chunk once (or loops if configured).
+- Every line shown in the in-app log panel is also persisted to a session log file under `logs/`.
+
+Command-level state flow
+```mermaid
+flowchart TD
+   A["Disconnected"] -->|"Connect<br/>open TCP 5024 (fallback 5025)<br/>*IDN?"| B["Connected / Idle"]
+   B -->|"Preview (local only)<br/>no SCPI sent"| B
+
+   B -->|"Upload & Run (single chunk)<br/>FUNC:MODE {mode}<br/>{mode}:RANG 1<br/>LIST:CLE -> *WAI<br/>LIST:{mode} ... (batched)<br/>LIST:DWEL {dwell}<br/>*WAI -> LIST:{mode}:POIN? -> SYST:ERR?"| C["Chunk Uploaded (Verified)"]
+   C -->|"Run<br/>LIST:COUN {count}<br/>OUTP ON<br/>{mode}:MODE LIST"| D["Running LIST"]
+
+   B -->|"Upload & Run (multi chunk loop)<br/>for each chunk: upload/verify/run once<br/>wait chunk duration + margin"| E["Running Sequenced Chunks"]
+   E -->|"all chunks complete (iteration)"| B
+   E -->|"loop configured"| E
+
+   D -->|"Stop<br/>VOLT:MODE FIX<br/>CURR:MODE FIX<br/>OUTP OFF<br/>FUNC:MODE VOLT"| F["Stopped / Safe Fixed State"]
+   E -->|"Stop (same command sequence)"| F
+   F --> B
+
+   B -->|"Disconnect (safety interlock)<br/>VOLT 0<br/>CURR 0<br/>OUTP OFF<br/>close socket"| A
+   F -->|"Disconnect (safety interlock + close socket)"| A
+
+   B -->|"Manual Override (in-place SCPI)<br/>OUTP, VOLT, CURR, FUNC:MODE,<br/>MEAS:VOLT?, MEAS:CURR?, SYST:ERR?, etc."| B
+```
 
 Troubleshooting
 - Connection failing? Check firewall and that the device answers on port 5024 (Telnet) or 5025 (SCPI socket).
