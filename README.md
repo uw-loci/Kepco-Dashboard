@@ -90,7 +90,7 @@ flowchart TD
    A["Disconnected"] -->|"Connect<br/>open TCP 5024 (fallback 5025)<br/>*IDN?"| B["Connected / Idle"]
    B -->|"Preview (local only)<br/>no SCPI sent"| B
 
-   B -->|"Upload & Run (single chunk)<br/>FUNC:MODE {mode}<br/>{mode}:RANG 1<br/>LIST:CLE -> *WAI -> LIST:DWEL {dwell}<br/>LIST:{mode} ... (batched)<br/>*WAI -> LIST:{mode}:POIN? -> SYST:ERR?"| C["Chunk Uploaded (Verified)"]
+   B -->|"Upload & Run (single chunk)<br/>FUNC:MODE {mode}<br/>{mode}:RANG 1<br/>LIST:CLE -> *WAI<br/>LIST:{mode} ... (batched)<br/>LIST:DWEL {dwell}<br/>*WAI -> LIST:{mode}:POIN? -> SYST:ERR?"| C["Chunk Uploaded (Verified)"]
    C -->|"Run<br/>LIST:COUN {count}<br/>OUTP ON<br/>{mode}:MODE LIST"| D["Running LIST"]
 
    B -->|"Upload & Run (multi chunk loop)<br/>for each chunk: upload/verify/run once<br/>wait chunk duration + margin"| E["Running Sequenced Chunks"]
