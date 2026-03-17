@@ -26,23 +26,50 @@ Hardware constraints (implemented)
 Quickstart — run locally
 1. Create and activate a virtualenv (recommended):
 
+   Unix/macOS:
+
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
+   Windows PowerShell:
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+
 2. (Optional) Start simulator for local testing:
+
+   Unix/macOS:
 
    ```bash
    python3 kepco_simulator.py
    # simulator listens on 0.0.0.0:5024 (Telnet) and :5025 (socket)
    ```
 
+   Windows PowerShell:
+
+   ```powershell
+   python kepco_simulator.py
+   # simulator listens on 0.0.0.0:5024 (Telnet) and :5025 (socket)
+   ```
+
 3. Start the UI:
+
+   Unix/macOS:
 
    ```bash
    python3 kepco_ui.py
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   python kepco_ui.py
    ```
 
 4. In the UI set the IP (use `127.0.0.1` for the local simulator or the device IP), Connect → Preview → Upload & Run.
