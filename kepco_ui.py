@@ -328,6 +328,8 @@ class KepcoController:
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 time.sleep(SCPI_CMD_GAP)
                 self._drain_echo()          # consume Telnet echo
+                # Any successful traffic means query timeouts are not consecutive.
+                self._query_timeout_count = 0
                 return True
             except Exception as e:
                 self.last_error = str(e)
