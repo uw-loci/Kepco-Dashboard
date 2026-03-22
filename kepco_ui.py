@@ -187,14 +187,17 @@ class KepcoController:
 
         This is intentionally very short — just long enough to pick up
         a single echo line that is already in-flight.
+
+        Returns True if any bytes were read from the device.
         """
         prev = self.sock.gettimeout()
         try:
             self.sock.settimeout(0.02)          # 20 ms
             try:
-                self.sock.recv(1024)
+                data = self.sock.recv(1024)
+                return bool(data)
             except (socket.timeout, OSError):
-                pass
+                return False
         finally:
             try:
                 self.sock.settimeout(prev)
@@ -327,9 +330,13 @@ class KepcoController:
             try:
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 time.sleep(SCPI_CMD_GAP)
-                self._drain_echo()          # consume Telnet echo
-                # Any successful traffic means query timeouts are not consecutive.
-                self._query_timeout_count = 0
+                got_device_bytes = False
+                if self.port == TELNET_PORT:
+                    got_device_bytes = self._drain_echo()  # consume Telnet echo
+                # Only reset timeout streak on confirmed communication, not
+                # on bare sendall() where the peer may be half-open.
+                if got_device_bytes:
+                    self._query_timeout_count = 0
                 return True
             except Exception as e:
                 self.last_error = str(e)
