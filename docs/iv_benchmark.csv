@@ -1,0 +1,10 @@
+current_a,voltage_v
+0.00,0.00
+0.25,0.80
+0.50,1.60
+1.00,3.20
+1.50,4.80
+2.00,6.40
+3.00,9.60
+4.00,12.80
+# Replace these template values with measured known-good data for your solenoid/load.

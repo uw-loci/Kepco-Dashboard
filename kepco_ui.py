@@ -20,6 +20,7 @@ import threading
 import time
 import ipaddress
 import queue as _queue
+from bisect import bisect_left
 from tkinter import messagebox, filedialog
 
 # ── GUI + plotting ──────────────────────────────────────────────────────────
@@ -43,6 +44,17 @@ CHUNK_CMD_LIMIT  = 200       # safe margin for 253-byte SCPI buffer
 SCPI_CMD_GAP     = 0.035     # > 25ms spec throughput (PAR 1.2.2)
 LIST_VALUES_PER_CMD = 10     # manual examples show max 11 (PAR B.45/B.31)
 RECV_TIMEOUT     = 3.0       # socket recv timeout for queries
+
+# ── I-V watchdog defaults (operator warning only; no hard interlock) ─────
+WATCHDOG_POLL_SEC = 0.5
+WATCHDOG_WARMUP_SEC = 1.5
+WATCHDOG_MIN_CURRENT_A = 0.2
+WATCHDOG_ABS_TOL_V = 0.75
+WATCHDOG_REL_TOL = 0.20
+WATCHDOG_EMA_ALPHA = 0.35
+WATCHDOG_SUSTAIN_SEC = 2.0
+WATCHDOG_RECOVER_SEC = 2.0
+WATCHDOG_DEFAULT_BENCHMARK = os.path.join("docs", "iv_benchmark.csv")
 
 # ── Material colour palette ─────────────────────────────────────────────────
 C = dict(
@@ -687,6 +699,179 @@ class WaveformGen:
         return pts
 
 
+class IVBenchmarkModel:
+    """Expected |V| as a function of |I|, loaded from a known-good CSV."""
+
+    def __init__(self, iv_points):
+        # iv_points is a sorted list of (abs_current_a, abs_voltage_v)
+        self.iv_points = iv_points
+        self.currents = [p[0] for p in iv_points]
+
+    @classmethod
+    def from_csv(cls, path):
+        """Load benchmark from CSV.
+
+        Accepted formats:
+          - Headered: columns containing 'current' and 'voltage'
+          - Plain two-column numeric rows: current, voltage
+        """
+        points = []
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            has_header = csv.Sniffer().has_header(sample)
+
+            if has_header:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    raise ValueError("Benchmark CSV has no header fields")
+
+                name_map = {n.strip().lower(): n for n in reader.fieldnames if n}
+                curr_key = None
+                volt_key = None
+                for key in name_map:
+                    if "current" in key or key in ("i", "amps", "a"):
+                        curr_key = name_map[key]
+                    if "voltage" in key or key in ("v", "volts"):
+                        volt_key = name_map[key]
+
+                if curr_key is None or volt_key is None:
+                    raise ValueError(
+                        "Benchmark CSV header must include current and voltage columns")
+
+                for row in reader:
+                    try:
+                        i = abs(float(str(row.get(curr_key, "")).strip()))
+                        v = abs(float(str(row.get(volt_key, "")).strip()))
+                    except (ValueError, TypeError):
+                        continue
+                    points.append((i, v))
+            else:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    try:
+                        i = abs(float(str(row[0]).strip()))
+                        v = abs(float(str(row[1]).strip()))
+                    except (ValueError, TypeError):
+                        continue
+                    points.append((i, v))
+
+        if len(points) < 4:
+            raise ValueError("Benchmark CSV needs at least 4 valid (I,V) rows")
+
+        # Keep the lowest voltage for duplicate currents to form a conservative envelope.
+        dedup = {}
+        for i, v in points:
+            prev = dedup.get(i)
+            dedup[i] = v if prev is None else min(prev, v)
+
+        sorted_points = sorted((i, v) for i, v in dedup.items())
+        if len(sorted_points) < 3:
+            raise ValueError("Benchmark CSV needs at least 3 distinct current values")
+
+        return cls(sorted_points)
+
+    def expected_voltage(self, abs_current_a):
+        """Piecewise-linear interpolation over |I| to estimate expected |V|."""
+        x = max(0.0, float(abs_current_a))
+        if x <= self.currents[0]:
+            return self.iv_points[0][1]
+        if x >= self.currents[-1]:
+            return self.iv_points[-1][1]
+
+        idx = bisect_left(self.currents, x)
+        i0, v0 = self.iv_points[idx - 1]
+        i1, v1 = self.iv_points[idx]
+        if i1 <= i0:
+            return v0
+        t = (x - i0) / (i1 - i0)
+        return v0 + t * (v1 - v0)
+
+
+class IVWatchdog:
+    """Sustained I-V mismatch detector with startup grace and smoothing."""
+
+    def __init__(self):
+        self.model = None
+        self.reset()
+
+    def set_model(self, model):
+        self.model = model
+        self.reset()
+
+    def reset(self):
+        self.last_ts = None
+        self.bad_duration = 0.0
+        self.good_duration = 0.0
+        self.filtered_ratio = None
+        self.start_ts = time.time()
+        self.alert_latched = False
+
+    def observe(self, voltage_v, current_a):
+        """Return alert payload dict when sustained mismatch is detected."""
+        if self.model is None:
+            return None
+
+        now = time.time()
+        if self.last_ts is None:
+            dt = WATCHDOG_POLL_SEC
+        else:
+            dt = max(0.05, min(2.0, now - self.last_ts))
+        self.last_ts = now
+
+        abs_i = abs(float(current_a))
+        abs_v = abs(float(voltage_v))
+
+        # Ignore very-low-current samples where V/I is noisy and uninformative.
+        if abs_i < WATCHDOG_MIN_CURRENT_A:
+            self.bad_duration = 0.0
+            self.good_duration += dt
+            return None
+
+        # Startup grace period avoids false positives on initial transients.
+        if (now - self.start_ts) < WATCHDOG_WARMUP_SEC:
+            return None
+
+        expected_v = self.model.expected_voltage(abs_i)
+        tol_v = max(WATCHDOG_ABS_TOL_V, expected_v * WATCHDOG_REL_TOL)
+        deviation_v = abs(abs_v - expected_v)
+        ratio = deviation_v / max(tol_v, 1e-6)
+
+        if self.filtered_ratio is None:
+            self.filtered_ratio = ratio
+        else:
+            a = WATCHDOG_EMA_ALPHA
+            self.filtered_ratio = a * ratio + (1.0 - a) * self.filtered_ratio
+
+        out_of_envelope = self.filtered_ratio > 1.0
+
+        if out_of_envelope:
+            self.bad_duration += dt
+            self.good_duration = 0.0
+        else:
+            self.good_duration += dt
+            if self.bad_duration > 0:
+                self.bad_duration = max(0.0, self.bad_duration - dt)
+
+        if (not self.alert_latched) and self.bad_duration >= WATCHDOG_SUSTAIN_SEC:
+            self.alert_latched = True
+            return {
+                "measured_v": abs_v,
+                "measured_i": abs_i,
+                "expected_v": expected_v,
+                "tol_v": tol_v,
+                "deviation_v": deviation_v,
+                "sustain_s": self.bad_duration,
+            }
+
+        if self.alert_latched and self.good_duration >= WATCHDOG_RECOVER_SEC:
+            self.alert_latched = False
+
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Application  (Material-themed, customtkinter)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -710,11 +895,19 @@ class App:
         self._meas_in_flight = False
         self.log_file_handle = None
         self.log_file_path = ""
+        self.iv_watchdog = IVWatchdog()
+        self.iv_benchmark_path = ""
+        self.watchdog_warn_count = 0
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = None
+        self._io_busy = False
 
         self._init_log_file()
 
         self._build_ui()
         self._update_graph()
+        self._load_default_iv_benchmark()
+        self._ensure_watchdog_thread()
         if self.log_file_path:
             self.log(f"Session log file: {self.log_file_path}", "info")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -849,6 +1042,40 @@ class App:
             font=ctk.CTkFont(size=11), wraplength=260, justify="left")
         self.timing_lbl.pack(fill="x", padx=14, pady=(4, 10))
 
+        wd = ctk.CTkFrame(cfg, fg_color=C["input_bg"], corner_radius=8)
+        wd.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkLabel(
+            wd,
+            text="I-V Watchdog (warning-only)",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=8, pady=(8, 2))
+        self.watchdog_enabled_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            wd,
+            text="Enable during active waveform drive",
+            variable=self.watchdog_enabled_var,
+            command=self._on_watchdog_toggle
+        ).pack(anchor="w", padx=8, pady=(0, 4))
+        row = ctk.CTkFrame(wd, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(0, 2))
+        ctk.CTkButton(
+            row,
+            text="Load I-V Benchmark CSV",
+            width=170,
+            command=self._load_iv_benchmark_dialog,
+            fg_color="#374151",
+            hover_color="#4b5563"
+        ).pack(side="left", padx=(0, 6), pady=(0, 6))
+        self.watchdog_status_lbl = ctk.CTkLabel(
+            wd,
+            text="Benchmark: not loaded",
+            text_color=C["text2"],
+            font=ctk.CTkFont(size=10),
+            wraplength=248,
+            justify="left"
+        )
+        self.watchdog_status_lbl.pack(anchor="w", padx=8, pady=(0, 8))
+
         # ── Right: graph ──
         graph_outer = ctk.CTkFrame(wf_inner, corner_radius=12)
         graph_outer.pack(side="left", fill="both", expand=True)
@@ -941,6 +1168,143 @@ class App:
             pass
         finally:
             self.log_file_handle = None
+
+    def _on_watchdog_toggle(self):
+        if not self.watchdog_enabled_var.get():
+            self.iv_watchdog.reset()
+            self.log("I-V watchdog disabled.", "info")
+        else:
+            self.iv_watchdog.reset()
+            self.log("I-V watchdog enabled (warning-only).", "info")
+
+    def _set_watchdog_status(self, text, tag="info"):
+        color = {
+            "ok": C["green"],
+            "warn": C["amber"],
+            "err": C["red"],
+            "info": C["text2"],
+        }.get(tag, C["text2"])
+        if hasattr(self, "watchdog_status_lbl"):
+            self.watchdog_status_lbl.configure(text=text, text_color=color)
+
+    def _load_default_iv_benchmark(self):
+        path = os.path.join(os.getcwd(), WATCHDOG_DEFAULT_BENCHMARK)
+        if os.path.exists(path):
+            self._load_iv_benchmark(path)
+        else:
+            self._set_watchdog_status(
+                "Benchmark: not loaded (load a known-good I-V CSV)",
+                "warn"
+            )
+            self.log(
+                "I-V watchdog benchmark not found at docs/iv_benchmark.csv; "
+                "load a known-good benchmark CSV to enable fault comparison.",
+                "warn"
+            )
+
+    def _load_iv_benchmark_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select known-good I-V benchmark CSV",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        self._load_iv_benchmark(path)
+
+    def _load_iv_benchmark(self, path):
+        try:
+            model = IVBenchmarkModel.from_csv(path)
+        except Exception as e:
+            self._set_watchdog_status("Benchmark: load failed", "err")
+            self.log(f"I-V watchdog benchmark load failed: {e}", "err")
+            messagebox.showerror(
+                "I-V Watchdog",
+                "Failed to load benchmark CSV.\n"
+                f"Details: {e}"
+            )
+            return
+
+        self.iv_watchdog.set_model(model)
+        self.iv_benchmark_path = path
+        name = os.path.basename(path)
+        self._set_watchdog_status(
+            f"Benchmark: {name} ({len(model.iv_points)} pts)",
+            "ok"
+        )
+        self.log(
+            f"I-V watchdog benchmark loaded: {name} "
+            f"({len(model.iv_points)} points)",
+            "ok"
+        )
+
+    def _watchdog_available(self):
+        return (
+            hasattr(self, "watchdog_enabled_var")
+            and self.watchdog_enabled_var.get()
+            and self.iv_watchdog.model is not None
+        )
+
+    def _ensure_watchdog_thread(self):
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True
+        )
+        self._watchdog_thread.start()
+
+    def _watchdog_stop_now(self):
+        self._watchdog_stop.set()
+
+    def _watchdog_loop(self):
+        while not self._watchdog_stop.is_set():
+            if (not self.kepco.connected
+                    or not self.device_waveform_active
+                    or self._io_busy
+                    or not self._watchdog_available()):
+                time.sleep(WATCHDOG_POLL_SEC)
+                continue
+
+            v_raw = self.kepco.send("MEAS:VOLT?", query=True)
+            c_raw = self.kepco.send("MEAS:CURR?", query=True)
+            if v_raw is None or c_raw is None:
+                self.root.after(0, lambda: self._handle_comm_failure("I-V watchdog"))
+                time.sleep(WATCHDOG_POLL_SEC)
+                continue
+
+            try:
+                v = float(v_raw)
+                c = float(c_raw)
+            except (ValueError, TypeError):
+                time.sleep(WATCHDOG_POLL_SEC)
+                continue
+
+            payload = self.iv_watchdog.observe(v, c)
+            if payload:
+                self.watchdog_warn_count += 1
+                self.root.after(0, lambda p=payload: self._watchdog_prompt_ui(p))
+
+            time.sleep(WATCHDOG_POLL_SEC)
+
+    def _watchdog_prompt_ui(self, payload):
+        msg = (
+            "I-V watchdog detected a sustained mismatch against the "
+            "known-good benchmark.\n\n"
+            f"Measured: {payload['measured_v']:.3f} V at {payload['measured_i']:.3f} A\n"
+            f"Expected: {payload['expected_v']:.3f} V ± {payload['tol_v']:.3f} V\n"
+            f"Deviation: {payload['deviation_v']:.3f} V "
+            f"for ~{payload['sustain_s']:.1f} s\n\n"
+            "Possible abnormal load change (for example, a developing short).\n"
+            "Inspect wiring/solenoid load before continuing.\n\n"
+            "This is a warning only; no automatic shutdown was applied."
+        )
+        self.log(
+            "I-V watchdog warning: sustained V-I envelope mismatch; "
+            "inspect solenoid/load before continuing.",
+            "warn"
+        )
+        messagebox.showwarning("I-V Watchdog Warning", msg)
 
     def log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
@@ -1772,6 +2136,7 @@ class App:
         self.man_curr_entry.delete(0, "end")
         self.man_curr_entry.insert(0, "0.0")
         self.device_waveform_active = False
+        self.iv_watchdog.reset()
         self.log("Disconnected.")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1911,6 +2276,9 @@ class App:
         self.current_points = pts
         self.stop_event.clear()
         self.is_running = True
+        self.device_waveform_active = False
+        self.iv_watchdog.reset()
+        self._ensure_watchdog_thread()
         self.run_btn.configure(state="disabled")
         self._pause_auto_measure()
 
@@ -1926,6 +2294,7 @@ class App:
         then verified with LIST:{mode}:POIN? and SYST:ERR? before running.
         """
         try:
+            self._io_busy = True
             # Always stop any previously running/uploaded waveform before a
             # new Upload & Run, per test protocol requirement.
             self._log_safe("Pre-run: stopping previous waveform/output…", "info")
@@ -1975,6 +2344,8 @@ class App:
                     self.root.after(0, lambda: self._handle_comm_failure("run"))
                     return
                 self.device_waveform_active = True
+                self.iv_watchdog.reset()
+                self._io_busy = False
                 self._ui_chunk(-1, points)
                 self.root.after(0, lambda: self.progress.set(1.0))
                 self.root.after(0, lambda: self.prog_lbl.configure(
@@ -2019,6 +2390,8 @@ class App:
                                 0, lambda: self._handle_comm_failure("chunk run"))
                             return
                         self.device_waveform_active = True
+                        self.iv_watchdog.reset()
+                        self._io_busy = False
 
                         # Wait for chunk to finish executing + margin
                         wait = len(ck) * dwell + 0.10
@@ -2029,11 +2402,14 @@ class App:
 
                         pct = (ci + 1) / nc
                         self.root.after(0, lambda p=pct: self.progress.set(p))
+                        self._io_busy = True
 
                     if not self.stop_event.is_set():
                         self._log_safe(f"Completed iteration {it}", "ok")
 
                 self._ui_chunk(-1, points)
+                self.device_waveform_active = False
+                self.iv_watchdog.reset()
 
             self.root.after(0, lambda: self.prog_lbl.configure(text="Done"))
             self.root.after(0, lambda: self.progress.set(1.0))
@@ -2042,6 +2418,7 @@ class App:
         except Exception as e:
             self._log_safe(f"Error: {e}", "err")
         finally:
+            self._io_busy = False
             self.is_running = False
             self.root.after(0, lambda: self.run_btn.configure(state="normal"))
             self.root.after(0, lambda: self._resume_auto_measure())
@@ -2059,6 +2436,8 @@ class App:
     def _stop(self):
         self.stop_event.set()
         self.is_running = False
+        self.device_waveform_active = False
+        self.iv_watchdog.reset()
         self.run_btn.configure(state="normal")
         self.prog_lbl.configure(text="Idle")
         self.progress.set(0)
@@ -2075,11 +2454,13 @@ class App:
         self._log_safe(f"Stop: {msg}", "ok" if ok else "err")
         if ok:
             self.device_waveform_active = False
+            self.iv_watchdog.reset()
         if not ok:
             self.root.after(0, lambda: self._handle_comm_failure("stop"))
 
     def _on_close(self):
         self.stop_event.set()
+        self._watchdog_stop_now()
         if self.kepco.connected:
             ok, err_msg = self._safe_output_off_before_disconnect()
             if not ok:

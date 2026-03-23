@@ -7,6 +7,7 @@ A Material-style GUI to generate, preview and upload waveform LISTs to a Kepco B
 - Chunked LIST upload (≤ 1000 pts per chunk) with paced writes and verification
 - Robust SCPI over Telnet (IAC filtering) + socket fallback
 - Live waveform preview, manual SCPI console, auto-discovery on /24 subnets
+- Passive I-V watchdog (warning-only) using known-good benchmark envelope
 - Automatic session log files written to `logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log`
 - Built-in simulator (`kepco_simulator.py`) for development and testing
 - Safety interlocks (sets outputs to 0 and turns OFF before disconnect)
@@ -77,6 +78,19 @@ Quickstart — run locally
 CSV format
 - Any CSV with numeric values is accepted. Values are flattened row-by-row and parsed as floats.
 - If a CSV has more points than allowed, it will be truncated to hardware limits (max 4000 total / 1000 per chunk).
+
+I-V watchdog benchmark format
+- Load from the Waveform tab: `Load I-V Benchmark CSV`.
+- Default auto-load path: `docs/iv_benchmark.csv` (template provided).
+- Accepted formats:
+   - Headered CSV with columns containing `current` and `voltage` names.
+   - Plain two-column numeric rows: current,voltage.
+- Benchmark should come from a known-good solenoid/load configuration.
+- Watchdog behavior:
+   - Active only while waveform drive is active.
+   - Compares measured |V| at measured |I| against interpolated benchmark envelope.
+   - Uses startup grace + smoothing + sustained mismatch timer to avoid transient false alarms.
+   - Warning only (operator prompt). No automatic shutdown/interlock action is taken.
 
 Usage notes & safety
 - The app enforces device pacing (≈35 ms gap) and consumes Telnet echoes to avoid device deadlocks.
