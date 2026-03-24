@@ -284,7 +284,32 @@ class KepcoController:
                 if tail:
                     line = tail
 
+            def _looks_like_scpi_command(text: str):
+                t = text.strip()
+                if not t:
+                    return False
+                up = t.upper()
+                # Keep common non-command responses.
+                if up in ("ON", "OFF", "LIST", "FIX", "VOLT", "CURR", "TRAN"):
+                    return False
+                if "NO ERROR" in up or ("," in up and '"' in up):
+                    return False
+                tok = up.split()[0]
+                if tok.endswith("?"):
+                    return True
+                if tok.startswith("*") or ":" in tok:
+                    return True
+                if tok in (
+                    "OUTP", "VOLT", "CURR", "FUNC", "LIST", "SYST",
+                    "MEAS", "INIT", "TRIG", "STAT", "FORM", "SOUR",
+                    "LOAD", "RANG",
+                ):
+                    return True
+                return False
+
             if echo and line == echo:
+                return None
+            if _looks_like_scpi_command(line):
                 return None
             return line or None
 
@@ -356,14 +381,8 @@ class KepcoController:
                 self._dbg("info", f"TX CMD: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 time.sleep(SCPI_CMD_GAP)
-                got_device_bytes = False
                 if self.port == TELNET_PORT:
-                    got_device_bytes = self._drain_echo()  # consume Telnet echo
-                # Only reset timeout streak on confirmed communication, not
-                # on bare sendall() where the peer may be half-open.
-                if got_device_bytes:
-                    self._query_timeout_count = 0
-                    self._dbg("info", "RX TELNET-ECHO bytes observed")
+                    self._drain_echo()  # consume Telnet echo
                 return True
             except Exception as e:
                 self.last_error = str(e)
@@ -392,9 +411,23 @@ class KepcoController:
                     self.last_error = f"No response to '{cmd}'"
                     self._dbg("warn", f"RX timeout for '{cmd}' (streak={self._query_timeout_count})")
                     if self._query_timeout_count >= 2:
+                        # One final confirmation query avoids disconnecting an
+                        # otherwise healthy session after mixed traffic.
+                        self._dbg("warn", f"Query timeout threshold hit; confirming link with one retry ({cmd})")
+                        self._drain_stale()
+                        self.sock.sendall((cmd + "\n").encode("ascii"))
+                        confirm = self._recv_response(
+                            sent_cmd=cmd,
+                            timeout=min(timeout or RECV_TIMEOUT, 1.0),
+                        )
+                        if confirm is not None:
+                            self._query_timeout_count = 0
+                            self.last_error = ""
+                            self._dbg("ok", f"RX RESP (confirm): {cmd} -> {confirm}")
+                            return confirm
                         self.last_error = (
                             f"No response to '{cmd}' (connection lost)")
-                        self._dbg("err", f"Query timeout threshold hit; disconnecting ({cmd})")
+                        self._dbg("err", f"Query timeout confirm failed; disconnecting ({cmd})")
                         self.disconnect()
                 else:
                     self._query_timeout_count = 0
@@ -424,12 +457,14 @@ class KepcoController:
         """
         return self.send_cmd("*WAI") is not None
 
-    def drain_errors(self):
+    def drain_errors(self, fail_on_timeout=False):
         """Read and return all queued SYST:ERR entries (stops at '0,…')."""
         errors = []
         for _ in range(20):
             resp = self.send_query("SYST:ERR?")
             if resp is None:
+                if fail_on_timeout:
+                    return None
                 break
             resp = resp.strip()
             if resp.startswith("0") or "No error" in resp:
@@ -548,7 +583,9 @@ class KepcoController:
                 except ValueError:
                     pass  # non-numeric, skip verify
 
-            errors = self.drain_errors()
+            errors = self.drain_errors(fail_on_timeout=True)
+            if errors is None:
+                return False, "SYST:ERR? timeout during verification"
             if errors:
                 return False, f"Device errors: {'; '.join(errors)}"
 
