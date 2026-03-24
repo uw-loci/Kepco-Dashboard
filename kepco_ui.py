@@ -781,7 +781,10 @@ class App:
         self.csv_points = None
         self.current_points = []
         self.is_running = False
+        self.is_uploading = False
         self.device_waveform_active = False
+        self.waveform_loaded = False
+        self.loaded_plan = None
         self.stop_event = threading.Event()
         self._connect_in_flight = False
         self._meas_in_flight = False
@@ -939,16 +942,10 @@ class App:
         bot.pack(fill="x", padx=12, pady=(4, 4))
 
         self.run_btn = ctk.CTkButton(
-            bot, text="▶  Upload & Run", width=170,
+            bot, text="▶  Upload", width=170,
             command=self._run, fg_color=C["green"], hover_color="#059669",
             text_color="#000", font=ctk.CTkFont(size=14, weight="bold"))
         self.run_btn.pack(side="left", padx=(14, 8), pady=10)
-
-        self.stop_btn = ctk.CTkButton(
-            bot, text="■  Stop", width=110,
-            command=self._stop, fg_color=C["red"], hover_color="#dc2626",
-            font=ctk.CTkFont(size=14, weight="bold"))
-        self.stop_btn.pack(side="left", padx=8, pady=10)
 
         self.prog_lbl = ctk.CTkLabel(bot, text="Idle",
                                      text_color=C["text2"],
@@ -1355,18 +1352,33 @@ class App:
         if self._output_ui_updating:
             return
         desired_on = self.outp_var.get() != "ON"
-        target_state = "ON" if desired_on else "OFF"
         if not self._man_require_conn():
             self._set_output_ui(False)
             return
-        ok = self.kepco.send(f"OUTP {target_state}")
-        if ok:
-            self._set_output_ui(desired_on)
-            self.log(f"Output → {target_state}", "ok")
-        else:
-            self._set_output_ui(not desired_on)
-            self.log("Failed to set output state", "err")
-            self._handle_comm_failure("output toggle")
+
+        if desired_on:
+            if self.is_uploading:
+                self.log("Upload in progress — wait before turning output ON.", "warn")
+                self._set_output_ui(False)
+                return
+            if not self.waveform_loaded or not self.loaded_plan:
+                self.log("No uploaded waveform. Press Upload first.", "warn")
+                self._set_output_ui(False)
+                return
+            if self.is_running:
+                self._set_output_ui(True)
+                return
+
+            self.stop_event.clear()
+            self.is_running = True
+            self._pause_auto_measure()
+            self._set_controls_busy()
+            self._set_output_ui(True)
+            threading.Thread(target=self._start_output_worker,
+                             daemon=True).start()
+            return
+
+        self._stop()
 
     def _on_mode_segment_change(self, selection):
         if self._mode_ui_updating:
@@ -1528,6 +1540,14 @@ class App:
             self.mode_segment.set("Voltage" if mode == "VOLT" else "Current")
             self._mode_ui_updating = False
 
+    def _set_controls_busy(self):
+        run_state = "disabled" if self.is_uploading or self.is_running else "normal"
+        mode_state = "disabled" if self.is_uploading or self.is_running else "normal"
+        outp_state = "disabled" if self.is_uploading else "normal"
+        self.run_btn.configure(state=run_state)
+        self.mode_segment.configure(state=mode_state)
+        self.outp_btn.configure(state=outp_state)
+
     def _schedule_state_sync(self):
         if self._state_sync_timer:
             self.root.after_cancel(self._state_sync_timer)
@@ -1535,7 +1555,7 @@ class App:
 
     def _state_sync_tick(self):
         self._state_sync_timer = None
-        if (self.kepco.connected and not self.is_running
+        if (self.kepco.connected and not self.is_running and not self.is_uploading
                 and not self._connect_in_flight
                 and not self._state_sync_in_flight):
             self._state_sync_in_flight = True
@@ -1804,7 +1824,7 @@ class App:
             if self.is_running:
                 messagebox.showwarning(
                     "Waveform Running",
-                    "Stop the running waveform before disconnecting.")
+                    "Turn Output OFF before disconnecting.")
                 return
             self.log("Disconnect requested", "info")
             self._connect_in_flight = True
@@ -2017,7 +2037,7 @@ class App:
                  f" {math.ceil(len(pts)/MAX_LIST_POINTS)} chunk(s)")
 
     # ──────────────────────────────────────────────────────────────────────
-    #  Upload & Run  (chunked, background thread)
+    #  Upload / Output-run behavior
     # ──────────────────────────────────────────────────────────────────────
     def _pause_auto_measure(self):
         """Pause auto-measure so it doesn't compete for the SCPI bus."""
@@ -2036,8 +2056,11 @@ class App:
 
     def _run(self):
         from tkinter import messagebox
+        if self.is_uploading:
+            self.log("Upload already in progress.", "warn")
+            return
         if self.is_running:
-            self.log("Already running.", "warn")
+            self.log("Output is running. Turn Output OFF before uploading.", "warn")
             return
         if not self.kepco.connected:
             messagebox.showerror("Error", "Connect to a device first.")
@@ -2051,9 +2074,10 @@ class App:
             return
 
         self.current_points = pts
-        self.stop_event.clear()
-        self.is_running = True
-        self.run_btn.configure(state="disabled")
+        self.is_uploading = True
+        self.waveform_loaded = False
+        self.loaded_plan = None
+        self._set_controls_busy()
         self._pause_auto_measure()
 
         threading.Thread(
@@ -2062,34 +2086,36 @@ class App:
             daemon=True).start()
 
     def _upload_thread(self, points, dwell, mode, loop_count):
-        """Upload waveform in ≤ 1000-point chunks, run each sequentially.
-
-        Each chunk is uploaded with paced writes (35 ms gap, no *OPC? spam),
-        then verified with LIST:{mode}:POIN? and SYST:ERR? before running.
-        """
+        """Prepare/upload waveform. Execution is started by Output ON."""
         try:
-            # Always stop any previously running/uploaded waveform before a
-            # new Upload & Run, per test protocol requirement.
-            self._log_safe("Pre-run: stopping previous waveform/output…", "info")
+            self._log_safe("Pre-upload: forcing safe OFF/FIX state…", "info")
             ok, msg = self.kepco.stop()
             if not ok:
-                self._log_safe(f"Pre-run stop failed: {msg}", "warn")
+                self._log_safe(f"Pre-upload stop failed: {msg}", "warn")
             else:
-                self._log_safe(f"Pre-run stop: {msg}", "ok")
+                self._log_safe(f"Pre-upload stop: {msg}", "ok")
                 self.root.after(0, lambda: self._set_output_ui(False))
                 self.root.after(0, lambda: self._set_mode_ui("VOLT"))
             self.device_waveform_active = False
+            self.stop_event.clear()
 
             chunks = [points[i:i + MAX_LIST_POINTS]
                       for i in range(0, len(points), MAX_LIST_POINTS)]
             nc = len(chunks)
-            loops = max(loop_count, 1) if loop_count > 0 else 0
-            forever = loops == 0
+
+            self.loaded_plan = {
+                "points": points,
+                "chunks": chunks,
+                "dwell": dwell,
+                "mode": mode,
+                "loop": loop_count,
+                "nc": nc,
+                "single_uploaded": False,
+            }
 
             self._log_safe(
                 f"Upload: {len(points)} pts → {nc} chunk(s), "
-                f"dwell={dwell*1000:.4f} ms, "
-                f"loops={'∞' if forever else loops}")
+                f"dwell={dwell*1000:.4f} ms, mode={mode}")
 
             def _progress_cb(sent, total):
                 """Called by upload_list_chunk after each value batch."""
@@ -2100,7 +2126,7 @@ class App:
                         text=f"Uploading… {s}/{t} pts"))
 
             if nc == 1:
-                # ── single chunk: upload → verify → run ──
+                # Single-list mode: upload now, run later when Output is ON.
                 self._ui_chunk(0, points)
                 self.root.after(0, lambda: self.prog_lbl.configure(
                     text="Uploading…"))
@@ -2112,86 +2138,121 @@ class App:
                     self.root.after(0, lambda: self._handle_comm_failure("upload"))
                     return
                 self._log_safe(f"Uploaded: {msg}", "ok")
-
-                ok, msg = self.kepco.run_list(mode, loops)
-                self._log_safe(f"Run: {msg}", "ok" if ok else "err")
-                if not ok:
-                    self.root.after(0, lambda: self._handle_comm_failure("run"))
-                    return
-                self.device_waveform_active = True
-                self.root.after(0, lambda: self._set_output_ui(True))
-                self.root.after(0, lambda m=mode: self._set_mode_ui(m))
+                self.loaded_plan["single_uploaded"] = True
                 self._ui_chunk(-1, points)
                 self.root.after(0, lambda: self.progress.set(1.0))
                 self.root.after(0, lambda: self.prog_lbl.configure(
-                    text="Running…"))
+                    text="Uploaded"))
             else:
-                # ── multi-chunk: upload→run→wait each, repeat ──
-                iters = loops if loops > 0 else 1
-                it = 0
-                while not self.stop_event.is_set():
-                    it += 1
-                    if not forever and it > iters:
-                        break
-
-                    for ci, ck in enumerate(chunks):
-                        if self.stop_event.is_set():
-                            break
-
-                        self._ui_chunk(ci, points)
-                        il = "∞" if forever else f"{it}/{iters}"
-                        self.root.after(0, lambda c=ci, n=nc, l=il:
-                            self.prog_lbl.configure(
-                                text=f"Chunk {c+1}/{n} — loop {l}"))
-
-                        # Upload this chunk (with per-batch progress)
-                        ok, msg = self.kepco.upload_list_chunk(
-                            ck, dwell, mode, progress_cb=_progress_cb)
-                        if not ok:
-                            self._log_safe(
-                                f"Chunk {ci+1} upload failed: {msg}", "err")
-                            self.root.after(
-                                0, lambda: self._handle_comm_failure("chunk upload"))
-                            return
-                        self._log_safe(
-                            f"Chunk {ci+1}/{nc}: {msg}", "ok")
-
-                        # Run this chunk once
-                        ok, msg = self.kepco.run_list(mode, count=1)
-                        if not ok:
-                            self._log_safe(
-                                f"Chunk {ci+1} run failed: {msg}", "err")
-                            self.root.after(
-                                0, lambda: self._handle_comm_failure("chunk run"))
-                            return
-                        self.device_waveform_active = True
-                        self.root.after(0, lambda: self._set_output_ui(True))
-                        self.root.after(0, lambda m=mode: self._set_mode_ui(m))
-
-                        # Wait for chunk to finish executing + margin
-                        wait = len(ck) * dwell + 0.10
-                        elapsed = 0.0
-                        while elapsed < wait and not self.stop_event.is_set():
-                            time.sleep(min(0.05, wait - elapsed))
-                            elapsed += 0.05
-
-                        pct = (ci + 1) / nc
-                        self.root.after(0, lambda p=pct: self.progress.set(p))
-
-                    if not self.stop_event.is_set():
-                        self._log_safe(f"Completed iteration {it}", "ok")
-
+                # Multi-chunk mode is streamed when Output is ON.
                 self._ui_chunk(-1, points)
+                self.root.after(0, lambda: self.progress.set(1.0))
+                self.root.after(0, lambda: self.prog_lbl.configure(
+                    text="Prepared (multi-chunk)"))
+                self._log_safe(
+                    "Prepared multi-chunk plan. Turn Output ON to stream chunks.",
+                    "info")
 
-            self.root.after(0, lambda: self.prog_lbl.configure(text="Done"))
-            self.root.after(0, lambda: self.progress.set(1.0))
-            self._log_safe("Waveform sequence complete.", "ok")
+            self.waveform_loaded = True
+            self._log_safe("Upload complete. Use Output ON to start waveform.", "ok")
 
         except Exception as e:
             self._log_safe(f"Error: {e}", "err")
+            self.waveform_loaded = False
+            self.loaded_plan = None
+        finally:
+            self.is_uploading = False
+            self.root.after(0, lambda: self._set_controls_busy())
+            self.root.after(0, lambda: self._resume_auto_measure())
+
+    def _start_output_worker(self):
+        """Start waveform execution from the most recently uploaded plan."""
+        try:
+            plan = self.loaded_plan or {}
+            points = plan.get("points") or []
+            chunks = plan.get("chunks") or []
+            dwell = float(plan.get("dwell", MIN_DWELL))
+            mode = plan.get("mode", "VOLT")
+            loop_count = int(plan.get("loop", 1))
+            nc = int(plan.get("nc", len(chunks) or 0))
+
+            if not points or not chunks:
+                self._log_safe("No uploaded waveform plan available.", "err")
+                self.root.after(0, lambda: self._set_output_ui(False))
+                return
+
+            self.root.after(0, lambda m=mode: self._set_mode_ui(m))
+
+            if nc == 1 and plan.get("single_uploaded"):
+                loops = max(loop_count, 1) if loop_count > 0 else 0
+                ok, msg = self.kepco.run_list(mode, loops)
+                self._log_safe(f"Run: {msg}", "ok" if ok else "err")
+                if not ok:
+                    self.root.after(0, lambda: self._set_output_ui(False))
+                    self.root.after(0, lambda: self._handle_comm_failure("run"))
+                    return
+                self.device_waveform_active = True
+                self.root.after(0, lambda: self.prog_lbl.configure(text="Running…"))
+                return
+
+            loops = max(loop_count, 1) if loop_count > 0 else 0
+            forever = loops == 0
+            iters = loops if loops > 0 else 1
+            it = 0
+
+            while not self.stop_event.is_set():
+                it += 1
+                if not forever and it > iters:
+                    break
+
+                for ci, ck in enumerate(chunks):
+                    if self.stop_event.is_set():
+                        break
+
+                    self._ui_chunk(ci, points)
+                    il = "∞" if forever else f"{it}/{iters}"
+                    self.root.after(0, lambda c=ci, n=nc, l=il:
+                        self.prog_lbl.configure(text=f"Chunk {c+1}/{n} — loop {l}"))
+
+                    ok, msg = self.kepco.upload_list_chunk(ck, dwell, mode)
+                    if not ok:
+                        self._log_safe(f"Chunk {ci+1} upload failed: {msg}", "err")
+                        self.root.after(0, lambda: self._set_output_ui(False))
+                        self.root.after(0, lambda: self._handle_comm_failure("chunk upload"))
+                        return
+
+                    ok, msg = self.kepco.run_list(mode, count=1)
+                    if not ok:
+                        self._log_safe(f"Chunk {ci+1} run failed: {msg}", "err")
+                        self.root.after(0, lambda: self._set_output_ui(False))
+                        self.root.after(0, lambda: self._handle_comm_failure("chunk run"))
+                        return
+
+                    self.device_waveform_active = True
+                    self.root.after(0, lambda: self._set_output_ui(True))
+
+                    wait = len(ck) * dwell + 0.10
+                    end_t = time.time() + wait
+                    while time.time() < end_t and not self.stop_event.is_set():
+                        time.sleep(0.05)
+
+                    pct = (ci + 1) / max(nc, 1)
+                    self.root.after(0, lambda p=pct: self.progress.set(p))
+
+                if not self.stop_event.is_set():
+                    self._log_safe(f"Completed iteration {it}", "ok")
+
+            if not self.stop_event.is_set() and not forever:
+                self._log_safe("Waveform sequence completed.", "ok")
+                self.root.after(0, lambda: self._set_output_ui(False))
+                self.root.after(0, lambda: self.prog_lbl.configure(text="Done"))
+
+        except Exception as e:
+            self._log_safe(f"Output run error: {e}", "err")
+            self.root.after(0, lambda: self._set_output_ui(False))
         finally:
             self.is_running = False
-            self.root.after(0, lambda: self.run_btn.configure(state="normal"))
+            self.root.after(0, lambda: self._set_controls_busy())
             self.root.after(0, lambda: self._resume_auto_measure())
 
     def _ui_chunk(self, idx, pts):
@@ -2207,7 +2268,8 @@ class App:
     def _stop(self):
         self.stop_event.set()
         self.is_running = False
-        self.run_btn.configure(state="normal")
+        self._set_output_ui(False)
+        self._set_controls_busy()
         self.prog_lbl.configure(text="Idle")
         self.progress.set(0)
         self._resume_auto_measure()
