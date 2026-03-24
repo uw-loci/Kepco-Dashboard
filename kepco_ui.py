@@ -785,6 +785,10 @@ class App:
         self.stop_event = threading.Event()
         self._connect_in_flight = False
         self._meas_in_flight = False
+        self._state_sync_in_flight = False
+        self._state_sync_timer = None
+        self._output_ui_updating = False
+        self._mode_ui_updating = False
         self.log_file_handle = None
         self.log_file_path = ""
 
@@ -793,6 +797,7 @@ class App:
 
         self._build_ui()
         self._update_graph()
+        self._schedule_state_sync()
         if self.log_file_path:
             self.log(f"Session log file: {self.log_file_path}", "info")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -903,17 +908,6 @@ class App:
         self.loop_entry.insert(0, "0")
         self.loop_entry.pack(fill="x", padx=14, pady=(0, 6))
 
-        self._lbl(cfg, "Output Mode")
-        mode_f = ctk.CTkFrame(cfg, fg_color="transparent")
-        mode_f.pack(fill="x", padx=14, pady=(0, 8))
-        self.mode_var = ctk.StringVar(value="VOLT")
-        ctk.CTkRadioButton(mode_f, text="Voltage",
-                           variable=self.mode_var, value="VOLT").pack(
-            side="left", padx=(0, 18))
-        ctk.CTkRadioButton(mode_f, text="Current",
-                           variable=self.mode_var, value="CURR").pack(
-            side="left")
-
         # Preview
         ctk.CTkButton(cfg, text="Preview Waveform",
                       command=self._preview,
@@ -964,6 +958,39 @@ class App:
         self.progress = ctk.CTkProgressBar(bot, width=220)
         self.progress.pack(side="left", padx=8, pady=10)
         self.progress.set(0)
+
+        shared = ctk.CTkFrame(bot, corner_radius=10, fg_color=C["card"])
+        shared.pack(side="left", padx=(18, 8), pady=8)
+
+        self.mode_var = ctk.StringVar(value="VOLT")
+        ctk.CTkLabel(shared, text="Mode",
+                     text_color=C["text2"],
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(10, 6))
+        self.mode_segment = ctk.CTkSegmentedButton(
+            shared,
+            values=["Voltage", "Current"],
+            command=self._on_mode_segment_change,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            width=160,
+            fg_color="#374151",
+            selected_color=C["primary"],
+            selected_hover_color=C["primary_h"],
+            unselected_color="#374151",
+            unselected_hover_color="#4b5563")
+        self.mode_segment.pack(side="left", padx=(0, 10), pady=6)
+        self.mode_segment.set("Voltage")
+
+        self.outp_var = ctk.StringVar(value="OFF")
+        self.outp_btn = ctk.CTkButton(
+            shared,
+            text="Output OFF",
+            width=120,
+            command=self._man_toggle_output,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            text_color=C["text"],
+            font=ctk.CTkFont(size=12, weight="bold"))
+        self.outp_btn.pack(side="left", padx=(0, 10), pady=6)
 
         # ═══ Log ═══
         log_wrap = ctk.CTkFrame(self.root, corner_radius=10)
@@ -1073,49 +1100,12 @@ class App:
         outer = ctk.CTkFrame(parent, fg_color="transparent")
         outer.pack(fill="both", expand=True)
 
-        # ── Left column: Output & Set Values ──
+        # ── Left column: Set Values ──
         left = ctk.CTkScrollableFrame(outer, width=310, corner_radius=12)
         left.pack(side="left", fill="y", padx=(0, 6), pady=0)
 
-        ctk.CTkLabel(left, text="Output Control",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(
-            padx=14, pady=(10, 8))
-
-        # Output ON / OFF
-        out_row = ctk.CTkFrame(left, fg_color="transparent")
-        out_row.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(out_row, text="Output:",
-                     font=ctk.CTkFont(size=13)).pack(side="left")
-        self.man_outp_var = ctk.StringVar(value="OFF")
-        self.man_outp_switch = ctk.CTkSwitch(
-            out_row, text="", variable=self.man_outp_var,
-            onvalue="ON", offvalue="OFF",
-            command=self._man_toggle_output,
-            progress_color=C["green"])
-        self.man_outp_switch.pack(side="left", padx=8)
-        self.man_outp_lbl = ctk.CTkLabel(
-            out_row, text="OFF", text_color=C["red"],
-            font=ctk.CTkFont(size=13, weight="bold"))
-        self.man_outp_lbl.pack(side="left")
-
-        # Operating Mode
-        self._lbl(left, "Operating Mode")
-        man_mode_row = ctk.CTkFrame(left, fg_color="transparent")
-        man_mode_row.pack(fill="x", padx=14, pady=(0, 8))
-        self.man_mode_var = ctk.StringVar(value="VOLT")
-        ctk.CTkRadioButton(man_mode_row, text="Voltage",
-                           variable=self.man_mode_var, value="VOLT").pack(
-            side="left", padx=(0, 12))
-        ctk.CTkRadioButton(man_mode_row, text="Current",
-                           variable=self.man_mode_var, value="CURR").pack(
-            side="left", padx=(0, 12))
-        ctk.CTkButton(man_mode_row, text="Set", width=60,
-                      command=self._man_set_mode,
-                      fg_color=C["primary"],
-                      hover_color=C["primary_h"]).pack(side="left")
-
         ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=8)
+            fill="x", padx=14, pady=(10, 8))
 
         # ── Set Values ──
         ctk.CTkLabel(left, text="Set Values",
@@ -1362,40 +1352,41 @@ class App:
         return True
 
     def _man_toggle_output(self):
-        if not self._man_require_conn():
-            if self.man_outp_var.get() == "ON":
-                self.man_outp_switch.deselect()
-                self.man_outp_var.set("OFF")
-            else:
-                self.man_outp_switch.select()
-                self.man_outp_var.set("ON")
+        if self._output_ui_updating:
             return
-        state = self.man_outp_var.get()
-        ok = self.kepco.send(f"OUTP {state}")
+        desired_on = self.outp_var.get() != "ON"
+        target_state = "ON" if desired_on else "OFF"
+        if not self._man_require_conn():
+            self._set_output_ui(False)
+            return
+        ok = self.kepco.send(f"OUTP {target_state}")
         if ok:
-            on = state == "ON"
-            self.man_outp_lbl.configure(
-                text=state, text_color=C["green"] if on else C["red"])
-            self.log(f"Output → {state}", "ok")
+            self._set_output_ui(desired_on)
+            self.log(f"Output → {target_state}", "ok")
         else:
-            if state == "ON":
-                self.man_outp_switch.deselect()
-                self.man_outp_var.set("OFF")
-            else:
-                self.man_outp_switch.select()
-                self.man_outp_var.set("ON")
+            self._set_output_ui(not desired_on)
             self.log("Failed to set output state", "err")
             self._handle_comm_failure("output toggle")
 
-    def _man_set_mode(self):
-        if not self._man_require_conn():
+    def _on_mode_segment_change(self, selection):
+        if self._mode_ui_updating:
             return
-        mode = self.man_mode_var.get()
+        mode = "VOLT" if selection == "Voltage" else "CURR"
+        self.mode_var.set(mode)
+        self._man_set_mode()
+
+    def _man_set_mode(self):
+        mode = self.mode_var.get()
+        if not self.kepco.connected:
+            self._set_mode_ui(mode)
+            return
         ok = self.kepco.send(f"FUNC:MODE {mode}")
         self.log(f"Mode → {mode}" if ok else "Failed to set mode",
                  "ok" if ok else "err")
         if not ok:
             self._handle_comm_failure("set mode")
+            return
+        self._set_mode_ui(mode)
 
     def _man_set_voltage(self):
         if not self._man_require_conn():
@@ -1459,7 +1450,7 @@ class App:
         if not self._man_require_conn():
             return
         choice = self.man_range_var.get()
-        mode = self.man_mode_var.get()
+        mode = self.mode_var.get()
         if choice == "Auto":
             self.kepco.send(f"{mode}:RANG:AUTO ON")
             self.log(f"{mode} range → Auto", "ok")
@@ -1477,10 +1468,8 @@ class App:
             return
         ok = self.kepco.send("*RST")
         if ok:
-            self.man_outp_var.set("OFF")
-            self.man_outp_switch.deselect()
-            self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
-            self.man_mode_var.set("VOLT")
+            self._set_output_ui(False)
+            self._set_mode_ui("VOLT")
             self.log("Device reset (*RST)", "ok")
         else:
             self.log("Reset failed", "err")
@@ -1513,8 +1502,65 @@ class App:
         self.meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
         self.meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
         self.meas_mode_lbl.configure(text=f"Mode:  {m or '— — —'}")
+        if isinstance(m, str):
+            um = m.strip().upper()
+            if um in ("VOLT", "CURR"):
+                self._set_mode_ui(um)
         if any(x is None for x in (v, c, m)):
             self._handle_comm_failure("measurement")
+
+    def _set_output_ui(self, is_on):
+        state = "ON" if is_on else "OFF"
+        self._output_ui_updating = True
+        self.outp_var.set(state)
+        self.outp_btn.configure(
+            text=f"Output {state}",
+            fg_color=C["green"] if is_on else "#374151",
+            hover_color="#059669" if is_on else "#4b5563",
+            text_color="#000" if is_on else C["text"])
+        self._output_ui_updating = False
+
+    def _set_mode_ui(self, mode):
+        mode = str(mode).strip().upper()
+        if mode in ("VOLT", "CURR"):
+            self.mode_var.set(mode)
+            self._mode_ui_updating = True
+            self.mode_segment.set("Voltage" if mode == "VOLT" else "Current")
+            self._mode_ui_updating = False
+
+    def _schedule_state_sync(self):
+        if self._state_sync_timer:
+            self.root.after_cancel(self._state_sync_timer)
+        self._state_sync_timer = self.root.after(1000, self._state_sync_tick)
+
+    def _state_sync_tick(self):
+        self._state_sync_timer = None
+        if (self.kepco.connected and not self.is_running
+                and not self._connect_in_flight
+                and not self._state_sync_in_flight):
+            self._state_sync_in_flight = True
+            threading.Thread(target=self._state_sync_worker, daemon=True).start()
+        self._schedule_state_sync()
+
+    def _state_sync_worker(self):
+        outp = self.kepco.send("OUTP?", query=True)
+        mode = self.kepco.send("FUNC:MODE?", query=True)
+        self.root.after(0, lambda: self._state_sync_done(outp, mode))
+
+    def _state_sync_done(self, outp, mode):
+        self._state_sync_in_flight = False
+
+        if isinstance(outp, str):
+            outp_u = outp.strip().upper()
+            if outp_u in ("1", "ON"):
+                self._set_output_ui(True)
+            elif outp_u in ("0", "OFF"):
+                self._set_output_ui(False)
+
+        if isinstance(mode, str):
+            mode_u = mode.strip().upper()
+            if mode_u in ("VOLT", "CURR"):
+                self._set_mode_ui(mode_u)
 
     def _man_toggle_auto_meas(self):
         if self.auto_meas_var.get():
@@ -1735,9 +1781,7 @@ class App:
                     "Check connection and retry.")
                 return False
 
-        self.man_outp_var.set("OFF")
-        self.man_outp_switch.deselect()
-        self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
+        self._set_output_ui(False)
         self.man_volt_entry.delete(0, "end")
         self.man_volt_entry.insert(0, "0.0")
         self.man_curr_entry.delete(0, "end")
@@ -1783,6 +1827,8 @@ class App:
         if ok:
             idn = idn or "Unknown device"
             self._set_connected_state(True, idn)
+            self._state_sync_in_flight = False
+            self._state_sync_tick()
             self.log(
                 f"Connected to {ip} via {self.kepco.transport} "
                 f"({self.kepco.port}):  {idn}", "ok")
@@ -1862,9 +1908,7 @@ class App:
             return
 
         self._set_connected_state(False)
-        self.man_outp_var.set("OFF")
-        self.man_outp_switch.deselect()
-        self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
+        self._set_output_ui(False)
         self.man_volt_entry.delete(0, "end")
         self.man_volt_entry.insert(0, "0.0")
         self.man_curr_entry.delete(0, "end")
@@ -2032,6 +2076,8 @@ class App:
                 self._log_safe(f"Pre-run stop failed: {msg}", "warn")
             else:
                 self._log_safe(f"Pre-run stop: {msg}", "ok")
+                self.root.after(0, lambda: self._set_output_ui(False))
+                self.root.after(0, lambda: self._set_mode_ui("VOLT"))
             self.device_waveform_active = False
 
             chunks = [points[i:i + MAX_LIST_POINTS]
@@ -2073,6 +2119,8 @@ class App:
                     self.root.after(0, lambda: self._handle_comm_failure("run"))
                     return
                 self.device_waveform_active = True
+                self.root.after(0, lambda: self._set_output_ui(True))
+                self.root.after(0, lambda m=mode: self._set_mode_ui(m))
                 self._ui_chunk(-1, points)
                 self.root.after(0, lambda: self.progress.set(1.0))
                 self.root.after(0, lambda: self.prog_lbl.configure(
@@ -2117,6 +2165,8 @@ class App:
                                 0, lambda: self._handle_comm_failure("chunk run"))
                             return
                         self.device_waveform_active = True
+                        self.root.after(0, lambda: self._set_output_ui(True))
+                        self.root.after(0, lambda m=mode: self._set_mode_ui(m))
 
                         # Wait for chunk to finish executing + margin
                         wait = len(ck) * dwell + 0.10
@@ -2173,11 +2223,16 @@ class App:
         self._log_safe(f"Stop: {msg}", "ok" if ok else "err")
         if ok:
             self.device_waveform_active = False
+            self.root.after(0, lambda: self._set_output_ui(False))
+            self.root.after(0, lambda: self._set_mode_ui("VOLT"))
         if not ok:
             self.root.after(0, lambda: self._handle_comm_failure("stop"))
 
     def _on_close(self):
         self.stop_event.set()
+        if self._state_sync_timer:
+            self.root.after_cancel(self._state_sync_timer)
+            self._state_sync_timer = None
         if self.kepco.connected:
             ok, err_msg = self._safe_output_off_before_disconnect()
             if not ok:
