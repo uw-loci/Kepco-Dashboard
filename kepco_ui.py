@@ -411,11 +411,9 @@ class KepcoController:
                     self.last_error = f"No response to '{cmd}'"
                     self._dbg("warn", f"RX timeout for '{cmd}' (streak={self._query_timeout_count})")
                     if self._query_timeout_count >= 2:
-                        # One final confirmation query avoids disconnecting an
-                        # otherwise healthy session after mixed traffic.
-                        self._dbg("warn", f"Query timeout threshold hit; confirming link with one retry ({cmd})")
-                        self._drain_stale()
-                        self.sock.sendall((cmd + "\n").encode("ascii"))
+                        # Do a receive-only confirmation wait (no re-send), so
+                        # stateful queries like SYST:ERR? are not consumed twice.
+                        self._dbg("warn", f"Query timeout threshold hit; confirming link without re-send ({cmd})")
                         confirm = self._recv_response(
                             sent_cmd=cmd,
                             timeout=min(timeout or RECV_TIMEOUT, 1.0),
