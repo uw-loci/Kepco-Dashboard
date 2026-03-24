@@ -87,6 +87,20 @@ class KepcoController:
         self.last_error = ""
         self._query_timeout_count = 0
         self._lock = threading.Lock()
+        self._debug_logger = None
+
+    def set_debug_logger(self, logger_cb):
+        """Register callback(level, message) for comm/network debug logs."""
+        self._debug_logger = logger_cb
+
+    def _dbg(self, level, msg):
+        cb = self._debug_logger
+        if not cb:
+            return
+        try:
+            cb(level, msg)
+        except Exception:
+            pass
 
     # ── connect / disconnect ───────────────────────────────────────────────
     def connect(self, ip, port=None):
@@ -98,6 +112,7 @@ class KepcoController:
         for target_port, transport in attempts:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
+                self._dbg("info", f"Connect attempt {ip}:{target_port} ({transport})")
                 s.settimeout(5)
                 s.connect((ip, target_port))
                 # Drain Telnet IAC negotiation the card sends on connect
@@ -117,18 +132,22 @@ class KepcoController:
                 self.connected = True
                 self.last_error = ""
                 self._query_timeout_count = 0
+                self._dbg("ok", f"Connected {ip}:{target_port} via {transport}")
                 return True, f"Connected via {transport} ({target_port})"
             except Exception as e:
                 last_err = str(e)
+                self._dbg("warn", f"Connect failed {ip}:{target_port} ({transport}): {last_err}")
                 try:
                     s.close()
                 except Exception:
                     pass
         self.connected = False
         self.last_error = last_err
+        self._dbg("err", f"All connect attempts failed for {ip}: {last_err}")
         return False, last_err
 
     def disconnect(self):
+        self._dbg("info", f"Disconnecting from {self.ip}:{self.port} ({self.transport})")
         if self.sock:
             try:
                 self.sock.close()
@@ -137,11 +156,17 @@ class KepcoController:
         self.sock = None
         self.connected = False
         self._query_timeout_count = 0
+        self._dbg("info", "Disconnected")
 
     def _safe_reconnect(self):
         if not self.ip:
             return False
+        self._dbg("warn", f"Attempting reconnect to {self.ip}:{self.port}")
         ok, _ = self.connect(self.ip, self.port)
+        if ok:
+            self._dbg("ok", f"Reconnect succeeded to {self.ip}:{self.port}")
+        else:
+            self._dbg("err", f"Reconnect failed to {self.ip}:{self.port}")
         return ok
 
     # ── Telnet IAC filtering ──────────────────────────────────────────────
@@ -328,6 +353,7 @@ class KepcoController:
             return None
         with self._lock:
             try:
+                self._dbg("info", f"TX CMD: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 time.sleep(SCPI_CMD_GAP)
                 got_device_bytes = False
@@ -337,9 +363,11 @@ class KepcoController:
                 # on bare sendall() where the peer may be half-open.
                 if got_device_bytes:
                     self._query_timeout_count = 0
+                    self._dbg("info", "RX TELNET-ECHO bytes observed")
                 return True
             except Exception as e:
                 self.last_error = str(e)
+                self._dbg("err", f"CMD failed '{cmd}': {self.last_error}")
                 self.disconnect()
                 return None
 
@@ -356,20 +384,25 @@ class KepcoController:
         with self._lock:
             try:
                 self._drain_stale()
+                self._dbg("info", f"TX QRY: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 resp = self._recv_response(sent_cmd=cmd, timeout=timeout)
                 if resp is None:
                     self._query_timeout_count += 1
                     self.last_error = f"No response to '{cmd}'"
+                    self._dbg("warn", f"RX timeout for '{cmd}' (streak={self._query_timeout_count})")
                     if self._query_timeout_count >= 2:
                         self.last_error = (
                             f"No response to '{cmd}' (connection lost)")
+                        self._dbg("err", f"Query timeout threshold hit; disconnecting ({cmd})")
                         self.disconnect()
                 else:
                     self._query_timeout_count = 0
+                    self._dbg("ok", f"RX RESP: {cmd} -> {resp}")
                 return resp
             except Exception as e:
                 self.last_error = str(e)
+                self._dbg("err", f"QRY failed '{cmd}': {self.last_error}")
                 self.disconnect()
                 return None
 
@@ -721,6 +754,7 @@ class App:
         self.log_file_path = ""
 
         self._init_log_file()
+        self.kepco.set_debug_logger(self._controller_debug_log)
 
         self._build_ui()
         self._update_graph()
@@ -957,6 +991,21 @@ class App:
         self.log_text.insert("end", f"[{ts}] {sym}  {msg}\n")
         self.log_text.see("end")
         self._write_log_file_line(ts, tag, msg)
+
+    def _controller_debug_log(self, level, msg):
+        """Route controller thread logs to the UI/file logger safely."""
+        tag = "info"
+        if level == "ok":
+            tag = "ok"
+        elif level == "warn":
+            tag = "warn"
+        elif level == "err":
+            tag = "err"
+
+        if threading.current_thread() is threading.main_thread():
+            self.log(f"[COMM] {msg}", tag)
+        else:
+            self.root.after(0, lambda: self.log(f"[COMM] {msg}", tag))
 
     def _set_connected_state(self, connected, idn=""):
         """Keep UI connection indicators consistent with transport state."""
@@ -1599,6 +1648,7 @@ class App:
             "(Telnet 5024 first, fallback 5025)…")
         ip = self.ip_var.get().strip()
         base = ".".join(ip.split(".")[:3]) + ".0" if ip else "192.168.50.0"
+        self.log(f"Network scan started on {base}/24", "info")
 
         def done(results):
             self.root.after(0, lambda: self._scan_done(results))
@@ -1616,9 +1666,11 @@ class App:
             ips = [r[0] for r in results]
             self.ip_combo.configure(values=ips)
             self.ip_var.set(ips[0])
+            self.log(f"Network scan complete: {len(results)} device(s) found", "ok")
             for ip, idn in results:
                 self.log(f"Found: {ip}  →  {idn}", "ok")
         else:
+            self.log("Network scan complete: 0 devices found", "warn")
             self.log("No Kepco devices found on subnet.", "warn")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1664,6 +1716,7 @@ class App:
 
         if not self.kepco.connected:
             ip = self.ip_var.get().strip()
+            self.log(f"Connect requested for {ip}", "info")
             self._connect_in_flight = True
             self.conn_btn.configure(state="disabled", text="Connecting…")
             threading.Thread(target=self._connect_worker,
@@ -1674,6 +1727,7 @@ class App:
                     "Waveform Running",
                     "Stop the running waveform before disconnecting.")
                 return
+            self.log("Disconnect requested", "info")
             self._connect_in_flight = True
             self.conn_btn.configure(state="disabled", text="Disconnecting…")
             threading.Thread(target=self._disconnect_worker, daemon=True).start()
