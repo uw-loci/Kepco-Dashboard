@@ -16,6 +16,7 @@ import socket
 import math
 import csv
 import os
+import queue
 import threading
 import time
 import ipaddress
@@ -802,11 +803,16 @@ class DashboardApp:
         self.log_file_handle = None
         self.log_file_path = ""
 
+        self.current_control_mode = "VOLT"
         self.control_mode_var = ctk.StringVar(value="VOLT")
+        self._ui_queue = queue.SimpleQueue()
+        self._ui_queue_job = None
+        self._ui_shutdown = False
 
         self._init_log_file()
         self.kepco.set_debug_logger(self._controller_debug_log)
         self._build_ui()
+        self._start_ui_dispatcher()
         self._reset_live_status()
         self._reset_uploaded_state()
         self._on_wave_change()
@@ -1442,6 +1448,46 @@ class DashboardApp:
         finally:
             self.log_file_handle = None
 
+    def _start_ui_dispatcher(self):
+        if self._ui_shutdown or self._ui_queue_job is not None:
+            return
+        self._ui_queue_job = self.root.after(20, self._drain_ui_queue)
+
+    def _drain_ui_queue(self):
+        self._ui_queue_job = None
+        if self._ui_shutdown:
+            return
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            callback()
+        self._start_ui_dispatcher()
+
+    def _stop_ui_dispatcher(self):
+        self._ui_shutdown = True
+        if self._ui_queue_job:
+            try:
+                self.root.after_cancel(self._ui_queue_job)
+            except Exception:
+                pass
+            self._ui_queue_job = None
+        while True:
+            try:
+                self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _call_on_ui(self, callback):
+        if self._ui_shutdown:
+            return False
+        if threading.current_thread() is threading.main_thread():
+            callback()
+            return True
+        self._ui_queue.put(callback)
+        return True
+
     def log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
         sym = {"info": "[i]", "ok": "[ok]", "warn": "[!]", "err": "[x]"}.get(tag, "[.]")
@@ -1461,10 +1507,10 @@ class DashboardApp:
         if threading.current_thread() is threading.main_thread():
             self.log(f"[COMM] {msg}", tag)
         else:
-            self.root.after(0, lambda: self.log(f"[COMM] {msg}", tag))
+            self._call_on_ui(lambda: self.log(f"[COMM] {msg}", tag))
 
     def _log_safe(self, msg, tag="info"):
-        self.root.after(0, lambda: self.log(msg, tag))
+        self._call_on_ui(lambda: self.log(msg, tag))
 
     def _set_connected_state(self, connected, idn=""):
         if connected:
@@ -1496,6 +1542,7 @@ class DashboardApp:
 
     def _reset_live_status(self):
         self.current_output_on = False
+        self.current_control_mode = "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
         self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
         self._set_status_output_display(False)
@@ -1653,15 +1700,14 @@ class DashboardApp:
         for mode, btn in self.mode_buttons.items():
             active = mode == active_mode
             btn.configure(
-                fg_color=C["primary"] if active else "#4b5563",
-                hover_color=C["primary_h"] if active else "#6b7280")
+                fg_color=C["green"] if active else "#4b5563",
+                hover_color="#059669" if active else "#6b7280")
 
     def _set_status_mode_display(self, mode):
         for key, label in self.status_mode_labels.items():
             active = key == mode
             label.configure(
-                fg_color=C["green"] if active and key == "CURR"
-                else (C["primary"] if active else C["card"]),
+                fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
 
     def _set_entry_enabled(self, entry, enabled):
@@ -1921,6 +1967,7 @@ class DashboardApp:
 
     def _select_control_mode(self, mode):
         mode = mode.upper()
+        self.current_control_mode = mode
         self.control_mode_var.set(mode)
         self._update_mode_buttons(mode)
         if not self.kepco.connected:
@@ -1977,6 +2024,7 @@ class DashboardApp:
             self.stop_event.set()
             self.sequence_active = False
             self.is_running = False
+            self.current_control_mode = "VOLT"
             self.control_mode_var.set("VOLT")
             self._update_mode_buttons("VOLT")
             self._reset_live_status()
@@ -2042,7 +2090,7 @@ class DashboardApp:
         ]
         ts = time.strftime("%H:%M:%S")
         results = [(cmd, self.kepco.send(cmd, query=True)) for cmd in checks]
-        self.root.after(0, lambda: self._man_health_check_done(ts, results))
+        self._call_on_ui(lambda: self._man_health_check_done(ts, results))
 
     def _man_health_check_done(self, ts, results):
         self.scpi_resp.insert("end", f"[{ts}] ==== Health Check ====\n")
@@ -2115,7 +2163,7 @@ class DashboardApp:
         c = self.kepco.send("MEAS:CURR?", query=True)
         outp = self.kepco.send("OUTP?", query=True)
         mode = self.kepco.send("FUNC:MODE?", query=True)
-        self.root.after(0, lambda: self._status_poll_done(v, c, outp, mode))
+        self._call_on_ui(lambda: self._status_poll_done(v, c, outp, mode))
 
     def _status_poll_done(self, v, c, outp, mode):
         self._status_poll_in_flight = False
@@ -2138,6 +2186,10 @@ class DashboardApp:
         out_text = str(outp).strip().upper()
         is_on = out_text in ("1", "ON")
         mode_text = str(mode).strip().upper()
+        if mode_text == "0":
+            mode_text = "VOLT"
+        elif mode_text == "1":
+            mode_text = "CURR"
         if mode_text not in ("VOLT", "CURR"):
             mode_text = None
 
@@ -2147,6 +2199,7 @@ class DashboardApp:
         self._set_status_mode_display(mode_text)
 
         if mode_text:
+            self.current_control_mode = mode_text
             self.control_mode_var.set(mode_text)
             self._update_mode_buttons(mode_text)
 
@@ -2195,10 +2248,10 @@ class DashboardApp:
         except Exception as exc:
             ok = False
             msg = str(exc)
-        self.root.after(0, lambda: self._upload_request_done(req, ok, msg, start_sequence))
+        self._call_on_ui(lambda: self._upload_request_done(req, ok, msg, start_sequence))
 
     def _apply_dc_request(self, req):
-        self.root.after(0, lambda: self.progress.set(0.5))
+        self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
         for cmd in [
@@ -2209,16 +2262,15 @@ class DashboardApp:
         ]:
             if not self.kepco.send(cmd):
                 return False, f"DC upload failed at '{cmd}': {self.kepco.last_error}"
-        self.root.after(0, lambda: self.progress.set(1.0))
+        self._call_on_ui(lambda: self.progress.set(1.0))
         unit = "V" if mode == "VOLT" else "A"
         return True, f"DC setpoint armed at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
         def progress_cb(sent, total):
             pct = sent / max(total, 1)
-            self.root.after(0, lambda p=pct: self.progress.set(p))
-            self.root.after(
-                0,
+            self._call_on_ui(lambda p=pct: self.progress.set(p))
+            self._call_on_ui(
                 lambda s=sent, t=total: self.prog_lbl.configure(
                     text=f"Uploading... {s}/{t} pts"))
 
@@ -2243,9 +2295,8 @@ class DashboardApp:
 
         def progress_cb(sent, total):
             pct = sent / max(total, 1)
-            self.root.after(0, lambda p=pct: self.progress.set(p))
-            self.root.after(
-                0,
+            self._call_on_ui(lambda p=pct: self.progress.set(p))
+            self._call_on_ui(
                 lambda s=sent, t=total: self.prog_lbl.configure(
                     text=f"Priming chunk 1/{len(chunks)}... {s}/{t} pts"))
 
@@ -2336,8 +2387,7 @@ class DashboardApp:
                         stopped = True
                         break
 
-                    self.root.after(
-                        0,
+                    self._call_on_ui(
                         lambda pts=req["plot_points"], idx=chunk_idx:
                             self._update_status_plot(pts, chunk_idx=idx))
 
@@ -2345,9 +2395,8 @@ class DashboardApp:
                     if need_upload:
                         def progress_cb(sent, total, ci=chunk_idx, nc=len(chunks)):
                             pct = sent / max(total, 1)
-                            self.root.after(0, lambda p=pct: self.progress.set(p))
-                            self.root.after(
-                                0,
+                            self._call_on_ui(lambda p=pct: self.progress.set(p))
+                            self._call_on_ui(
                                 lambda c=ci, n=nc, s=sent, t=total:
                                     self.prog_lbl.configure(
                                         text=f"Uploading chunk {c + 1}/{n}... {s}/{t} pts"))
@@ -2365,9 +2414,8 @@ class DashboardApp:
                         break
 
                     output_already_on = True
-                    self.root.after(0, lambda: self._set_output_ui_state(True))
-                    self.root.after(
-                        0,
+                    self._call_on_ui(lambda: self._set_output_ui_state(True))
+                    self._call_on_ui(
                         lambda c=chunk_idx, n=len(chunks), i=iteration:
                             self.prog_lbl.configure(
                                 text=f"Running chunk {c + 1}/{n} (loop {i})"))
@@ -2382,8 +2430,7 @@ class DashboardApp:
                     if stopped:
                         break
 
-                    self.root.after(
-                        0,
+                    self._call_on_ui(
                         lambda p=(chunk_idx + 1) / max(len(chunks), 1): self.progress.set(p))
 
                 skip_first_upload = False
@@ -2404,8 +2451,7 @@ class DashboardApp:
             if not stop_ok:
                 ok = False
                 final_msg = stop_msg
-        self.root.after(
-            0,
+        self._call_on_ui(
             lambda: self._sequence_done(req, ok, final_msg, stopped, stop_ok))
 
     def _sequence_done(self, req, ok, msg, stopped, stop_ok):
@@ -2472,7 +2518,7 @@ class DashboardApp:
 
     def _output_toggle_worker(self, target_on, req):
         try:
-            mode = (req or {}).get("mode", self.control_mode_var.get())
+            mode = (req or {}).get("mode") or self.current_control_mode
             if target_on:
                 if req["kind"] == "DC":
                     ok = bool(self.kepco.send("OUTP ON"))
@@ -2489,7 +2535,7 @@ class DashboardApp:
         except Exception as exc:
             ok = False
             msg = str(exc)
-        self.root.after(0, lambda: self._output_toggle_done(target_on, ok, msg))
+        self._call_on_ui(lambda: self._output_toggle_done(target_on, ok, msg))
 
     def _output_toggle_done(self, target_on, ok, msg):
         self._output_toggle_in_flight = False
@@ -2522,10 +2568,10 @@ class DashboardApp:
         base = ".".join(ip.split(".")[:3]) + ".0" if ip else "192.168.50.0"
 
         def done(results):
-            self.root.after(0, lambda: self._scan_done(results))
+            self._call_on_ui(lambda: self._scan_done(results))
 
         def progress(done_count, total_count):
-            self.root.after(0, lambda: self.progress.set(done_count / total_count))
+            self._call_on_ui(lambda: self.progress.set(done_count / total_count))
 
         threading.Thread(
             target=Discovery.scan_subnet,
@@ -2574,7 +2620,7 @@ class DashboardApp:
             if idn is None:
                 ok = False
                 msg = self.kepco.last_error or "Identity query failed"
-        self.root.after(0, lambda: self._connect_done(ok, msg, ip, idn))
+        self._call_on_ui(lambda: self._connect_done(ok, msg, ip, idn))
 
     def _connect_done(self, ok, msg, ip, idn):
         self._connect_in_flight = False
@@ -2599,7 +2645,7 @@ class DashboardApp:
         ok, err_msg = self._safe_output_off_before_disconnect()
         if ok:
             self.kepco.disconnect()
-        self.root.after(0, lambda: self._disconnect_done(ok, err_msg))
+        self._call_on_ui(lambda: self._disconnect_done(ok, err_msg))
 
     def _safe_output_off_before_disconnect(self):
         if not self.kepco.connected:
@@ -2613,7 +2659,7 @@ class DashboardApp:
 
         base_mode = (
             self.uploaded_request["mode"]
-            if self.uploaded_request else self.control_mode_var.get()
+            if self.uploaded_request else self.current_control_mode
         )
 
         for attempt in range(2):
@@ -2690,6 +2736,7 @@ class DashboardApp:
         self._stop_status_polling()
         self.log("Application closed.", "info")
         self._close_log_file()
+        self._stop_ui_dispatcher()
         self.root.destroy()
 
     def run(self):
