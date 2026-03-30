@@ -473,17 +473,42 @@ class KepcoController:
     def identity(self):
         return self.send_query("*IDN?")
 
+    def disarm_list_modes(self, base_mode="VOLT"):
+        """Return the source to FIX mode without changing output state.
+
+        Consecutive live AC uploads can leave the active source in LIST mode.
+        Some BIT 802E firmware revisions reject LIST:CLE / LIST:{mode} updates
+        in that state with repeated -221 "Settings conflict" errors.  Force
+        both source subsystems back to FIX, wait for the transition to settle,
+        then restore the requested FUNC:MODE so the next upload starts from a
+        predictable state while OUTP remains unchanged.
+        """
+        base_mode = (base_mode or "VOLT").upper()
+        try:
+            for cmd in [
+                "VOLT:MODE FIX",
+                "CURR:MODE FIX",
+                "*WAI",
+                f"FUNC:MODE {base_mode}",
+            ]:
+                if self.send_cmd(cmd) is None:
+                    return False, f"Disarm '{cmd}' failed: {self.last_error}"
+            return True, "LIST modes disarmed"
+        except Exception as e:
+            return False, str(e)
+
     # -- List upload (single chunk <= 1000 pts) -----------------------------
     def upload_list_chunk(self, points, dwell, mode="VOLT",
                           progress_cb=None):
         """Upload one chunk (<= 1000 points) with paced writes + verification.
 
                 Strategy:
-                    1. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
-          2. Values: send LIST:{mode} batches of <= 20 values each,
+                    1. Disarm: switch any active LIST program back to FIX
+                    2. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
+          3. Values: send LIST:{mode} batches of <= 20 values each,
              each followed only by the mandatory 35 ms gap
-                    3. Dwell: send LIST:DWEL once after values
-                    4. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
+                    4. Dwell: send LIST:DWEL once after values
+                    5. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
 
         Key change from previous revision: *OPC? is NOT used anywhere
         in the upload path.  The manual (PAR A.17) recommends *WAI for
@@ -504,16 +529,24 @@ class KepcoController:
             # reported as a fresh upload failure.
             self.drain_errors()
 
-            # -- Phase 1: Setup --
+            # -- Phase 1: Disarm any active LIST mode --
+            # Live waveform replacement keeps OUTP ON, so the previous
+            # waveform may still have the source armed in LIST mode.  Real
+            # hardware can reject the next LIST:CLE / LIST:{mode} sequence in
+            # that state, so always unwind to FIX first without toggling OUTP.
+            ok, msg = self.disarm_list_modes(base_mode=mode)
+            if not ok:
+                return False, msg
+
+            # -- Phase 2: Setup --
             # Real hardware behavior: some BIT firmware revisions reject
             # LIST:DWEL-before-values with -221 Settings conflict.
-            #   FUNC:MODE -> RANG -> LIST:CLE -> *WAI
+            #   disarm -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
             # NOTE: *CLS is intentionally NOT sent here - the manual
             # examples never use it for list operations, and it forces
             # the card to "operation complete idle" which can confuse
             # subsequent synchronisation on some firmware revisions.
             setup_cmds = [
-                f"FUNC:MODE {mode}",
                 f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
                 "LIST:CLE",
                 "*WAI",                   # wait for LIST:CLE (PAR A.17)
@@ -522,7 +555,7 @@ class KepcoController:
                 if self.send_cmd(cmd) is None:
                     return False, f"Setup '{cmd}' failed: {self.last_error}"
 
-            # -- Phase 2: Send list values --
+            # -- Phase 3: Send list values --
             prefix = f"LIST:{mode} "
             total = len(points)
             sent = 0
@@ -560,11 +593,11 @@ class KepcoController:
                 if progress_cb:
                     progress_cb(sent, total)
 
-            # Phase 3: Set dwell after values
+            # Phase 4: Set dwell after values
             if self.send_cmd(f"LIST:DWEL {dwell:.6f}") is None:
                 return False, f"Dwell send failed: {self.last_error}"
 
-            #  Phase 4: Verify 
+            # Phase 5: Verify
             # *WAI ensures all LIST:{mode} values are ingested before
             # the verification query is processed (PAR A.17).
             if not self.sync():
@@ -1292,13 +1325,12 @@ class DashboardApp:
             anchor="w", padx=18, pady=(18, 8))
         out_row = ctk.CTkFrame(info_card, fg_color="transparent")
         out_row.pack(fill="x", padx=18, pady=(0, 20))
-        self.status_output_dot = ctk.CTkLabel(
-            out_row, text="o", font=ctk.CTkFont(size=28, weight="bold"),
-            text_color=C["red"])
-        self.status_output_dot.pack(side="left")
-        self.status_output_text = ctk.CTkLabel(
-            out_row, text="OFF", font=ctk.CTkFont(size=14, weight="bold"))
-        self.status_output_text.pack(side="left", padx=(10, 0))
+        self.status_output_pill = ctk.CTkLabel(
+            out_row, text="OFF", width=72, height=34,
+            corner_radius=6, fg_color=C["red"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=13, weight="bold"))
+        self.status_output_pill.pack(side="left")
 
         ctk.CTkLabel(
             info_card, text="Control Mode",
@@ -1606,8 +1638,10 @@ class DashboardApp:
         self._set_status_output_display(is_on)
 
     def _set_status_output_display(self, is_on):
-        self.status_output_dot.configure(text_color=C["green"] if is_on else C["red"])
-        self.status_output_text.configure(text="ON" if is_on else "OFF")
+        self.status_output_pill.configure(
+            text="ON" if is_on else "OFF",
+            fg_color=C["green"] if is_on else C["red"],
+            text_color="#ffffff")
 
     def _refresh_output_toggle_button(self, can_toggle=None):
         if can_toggle is None:
@@ -2079,17 +2113,24 @@ class DashboardApp:
         threading.Thread(target=self._man_health_check_worker, daemon=True).start()
 
     def _man_health_check_worker(self):
-        checks = [
-            "*IDN?",
-            "FUNC:MODE?",
-            "OUTP?",
-            "LIST:VOLT:POIN?",
-            "LIST:CURR:POIN?",
-            "SYST:ERR?",
-            "*ESR?",
-        ]
         ts = time.strftime("%H:%M:%S")
-        results = [(cmd, self.kepco.send(cmd, query=True)) for cmd in checks]
+        results = []
+
+        def run_query(cmd):
+            resp = self.kepco.send(cmd, query=True)
+            results.append((cmd, resp))
+            return resp
+
+        run_query("*IDN?")
+        mode_resp = run_query("FUNC:MODE?")
+        run_query("OUTP?")
+
+        mode_text = str(mode_resp or "").strip().upper()
+        active_mode = "CURR" if mode_text in ("1", "CURR") else "VOLT"
+        run_query(f"LIST:{active_mode}:POIN?")
+        run_query("SYST:ERR?")
+        run_query("*ESR?")
+
         self._call_on_ui(lambda: self._man_health_check_done(ts, results))
 
     def _man_health_check_done(self, ts, results):
