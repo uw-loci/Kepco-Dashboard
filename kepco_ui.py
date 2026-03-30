@@ -473,27 +473,43 @@ class KepcoController:
     def identity(self):
         return self.send_query("*IDN?")
 
-    def disarm_list_modes(self, base_mode="VOLT"):
-        """Return the source to FIX mode without changing output state.
+    @staticmethod
+    def _normalize_func_mode(mode_resp):
+        text = str(mode_resp or "").strip().upper()
+        if text == "0":
+            return "VOLT"
+        if text == "1":
+            return "CURR"
+        if text in ("VOLT", "CURR"):
+            return text
+        return None
 
-        Consecutive live AC uploads can leave the active source in LIST mode.
-        Some BIT 802E firmware revisions reject LIST:CLE / LIST:{mode} updates
-        in that state with repeated -221 "Settings conflict" errors.  Force
-        both source subsystems back to FIX, wait for the transition to settle,
-        then restore the requested FUNC:MODE so the next upload starts from a
-        predictable state while OUTP remains unchanged.
+    def disarm_active_list_mode(self):
+        """Return the active source to FIX only when it is in LIST mode.
+
+        Sending both VOLT:MODE FIX and CURR:MODE FIX on this hardware can
+        itself enqueue -221 "Settings conflict" errors.  Query the currently
+        active FUNC:MODE instead, inspect only that source's mode, and disarm
+        it only when a live LIST program is actually armed.
         """
-        base_mode = (base_mode or "VOLT").upper()
         try:
-            for cmd in [
-                "VOLT:MODE FIX",
-                "CURR:MODE FIX",
-                "*WAI",
-                f"FUNC:MODE {base_mode}",
-            ]:
+            active_mode = self._normalize_func_mode(self.send_query("FUNC:MODE?"))
+            if not active_mode:
+                return False, "Could not determine active FUNC:MODE"
+
+            mode_state = self.send_query(f"{active_mode}:MODE?")
+            if mode_state is None:
+                return False, (
+                    f"Could not query {active_mode}:MODE?: {self.last_error}")
+
+            mode_text = str(mode_state).strip().upper()
+            if "LIST" not in mode_text:
+                return True, "Active mode already fixed"
+
+            for cmd in [f"{active_mode}:MODE FIX", "*WAI"]:
                 if self.send_cmd(cmd) is None:
                     return False, f"Disarm '{cmd}' failed: {self.last_error}"
-            return True, "LIST modes disarmed"
+            return True, f"{active_mode} LIST mode disarmed"
         except Exception as e:
             return False, str(e)
 
@@ -503,7 +519,7 @@ class KepcoController:
         """Upload one chunk (<= 1000 points) with paced writes + verification.
 
                 Strategy:
-                    1. Disarm: switch any active LIST program back to FIX
+                    1. Disarm: switch the active LIST program back to FIX
                     2. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
           3. Values: send LIST:{mode} batches of <= 20 values each,
              each followed only by the mandatory 35 ms gap
@@ -531,22 +547,24 @@ class KepcoController:
 
             # -- Phase 1: Disarm any active LIST mode --
             # Live waveform replacement keeps OUTP ON, so the previous
-            # waveform may still have the source armed in LIST mode.  Real
-            # hardware can reject the next LIST:CLE / LIST:{mode} sequence in
-            # that state, so always unwind to FIX first without toggling OUTP.
-            ok, msg = self.disarm_list_modes(base_mode=mode)
+            # waveform may still have the active source armed in LIST mode.
+            # Real hardware can reject the next LIST:CLE / LIST:{mode}
+            # sequence in that state, so unwind only the currently active
+            # LIST program first without toggling OUTP.
+            ok, msg = self.disarm_active_list_mode()
             if not ok:
                 return False, msg
 
             # -- Phase 2: Setup --
             # Real hardware behavior: some BIT firmware revisions reject
             # LIST:DWEL-before-values with -221 Settings conflict.
-            #   disarm -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
+            #   disarm-active-list -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
             # NOTE: *CLS is intentionally NOT sent here - the manual
             # examples never use it for list operations, and it forces
             # the card to "operation complete idle" which can confuse
             # subsequent synchronisation on some firmware revisions.
             setup_cmds = [
+                f"FUNC:MODE {mode}",
                 f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
                 "LIST:CLE",
                 "*WAI",                   # wait for LIST:CLE (PAR A.17)
