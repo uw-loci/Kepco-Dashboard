@@ -85,8 +85,11 @@ class KepcoController:
         self.transport = "TELNET"
         self.connected = False
         self.last_error = ""
+        self.last_identity = ""
         self._query_timeout_count = 0
-        self._lock = threading.Lock()
+        # Re-entrant so higher-level upload/run/stop transactions can hold the
+        # device lock while individual send_cmd/send_query helpers re-enter it.
+        self._lock = threading.RLock()
         self._debug_logger = None
 
     def set_debug_logger(self, logger_cb):
@@ -103,12 +106,13 @@ class KepcoController:
             pass
 
     # -- connect / disconnect -----------------------------------------------
-    def connect(self, ip, port=None):
+    def connect(self, ip, port=None, validate_identity=False):
         attempts = [(port, "CUSTOM")] if port is not None else [
             (TELNET_PORT, "TELNET"),
             (SCPI_SOCKET_PORT, "SOCKET"),
         ]
         last_err = ""
+        self.last_identity = ""
         for target_port, transport in attempts:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
@@ -133,6 +137,17 @@ class KepcoController:
                 self.last_error = ""
                 self._query_timeout_count = 0
                 self._dbg("ok", f"Connected {ip}:{target_port} via {transport}")
+                if validate_identity:
+                    idn = self.identity()
+                    if idn is None:
+                        last_err = self.last_error or "No response to '*IDN?'"
+                        self._dbg(
+                            "warn",
+                            f"Identity check failed {ip}:{target_port} ({transport}): {last_err}",
+                        )
+                        self.disconnect()
+                        continue
+                    self.last_identity = idn
                 return True, f"Connected via {transport} ({target_port})"
             except Exception as e:
                 last_err = str(e)
@@ -161,12 +176,12 @@ class KepcoController:
     def _safe_reconnect(self):
         if not self.ip:
             return False
-        self._dbg("warn", f"Attempting reconnect to {self.ip}:{self.port}")
-        ok, _ = self.connect(self.ip, self.port)
+        self._dbg("warn", f"Attempting reconnect to {self.ip} (all transports)")
+        ok, _ = self.connect(self.ip, validate_identity=True)
         if ok:
             self._dbg("ok", f"Reconnect succeeded to {self.ip}:{self.port}")
         else:
-            self._dbg("err", f"Reconnect failed to {self.ip}:{self.port}")
+            self._dbg("err", f"Reconnect failed to {self.ip}")
         return ok
 
     # -- Telnet IAC filtering ----------------------------------------------
@@ -533,65 +548,77 @@ class KepcoController:
 
         progress_cb(sent, total) is called after each batch if provided.
         """
-        if not self.connected and not self._safe_reconnect():
-            return False, "Not connected"
-        if not points:
-            return False, "Empty point list"
-        if len(points) > MAX_LIST_POINTS:
-            return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
+        with self._lock:
+            if not self.connected and not self._safe_reconnect():
+                return False, "Not connected"
+            if not points:
+                return False, "Empty point list"
+            if len(points) > MAX_LIST_POINTS:
+                return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
 
-        try:
-            # Clear stale error queue first so prior test noise is not
-            # reported as a fresh upload failure.
-            self.drain_errors()
+            try:
+                # Clear stale error queue first so prior test noise is not
+                # reported as a fresh upload failure.
+                self.drain_errors()
 
-            # -- Phase 1: Disarm any active LIST mode --
-            # Live waveform replacement keeps OUTP ON, so the previous
-            # waveform may still have the active source armed in LIST mode.
-            # Real hardware can reject the next LIST:CLE / LIST:{mode}
-            # sequence in that state, so unwind only the currently active
-            # LIST program first without toggling OUTP.
-            ok, msg = self.disarm_active_list_mode()
-            if not ok:
-                return False, msg
+                # -- Phase 1: Disarm any active LIST mode --
+                # Live waveform replacement keeps OUTP ON, so the previous
+                # waveform may still have the active source armed in LIST mode.
+                # Real hardware can reject the next LIST:CLE / LIST:{mode}
+                # sequence in that state, so unwind only the currently active
+                # LIST program first without toggling OUTP.
+                ok, msg = self.disarm_active_list_mode()
+                if not ok:
+                    return False, msg
 
-            # -- Phase 2: Setup --
-            # Real hardware behavior: some BIT firmware revisions reject
-            # LIST:DWEL-before-values with -221 Settings conflict.
-            #   disarm-active-list -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
-            # NOTE: *CLS is intentionally NOT sent here - the manual
-            # examples never use it for list operations, and it forces
-            # the card to "operation complete idle" which can confuse
-            # subsequent synchronisation on some firmware revisions.
-            setup_cmds = [
-                f"FUNC:MODE {mode}",
-                f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
-                "LIST:CLE",
-                "*WAI",                   # wait for LIST:CLE (PAR A.17)
-            ]
-            for cmd in setup_cmds:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Setup '{cmd}' failed: {self.last_error}"
+                # -- Phase 2: Setup --
+                # Real hardware behavior: some BIT firmware revisions reject
+                # LIST:DWEL-before-values with -221 Settings conflict.
+                #   disarm-active-list -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
+                # NOTE: *CLS is intentionally NOT sent here - the manual
+                # examples never use it for list operations, and it forces
+                # the card to "operation complete idle" which can confuse
+                # subsequent synchronisation on some firmware revisions.
+                setup_cmds = [
+                    f"FUNC:MODE {mode}",
+                    f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
+                    "LIST:CLE",
+                    "*WAI",                   # wait for LIST:CLE (PAR A.17)
+                ]
+                for cmd in setup_cmds:
+                    if self.send_cmd(cmd) is None:
+                        return False, f"Setup '{cmd}' failed: {self.last_error}"
 
-            # -- Phase 3: Send list values --
-            prefix = f"LIST:{mode} "
-            total = len(points)
-            sent = 0
-            buf = []
+                # -- Phase 3: Send list values --
+                prefix = f"LIST:{mode} "
+                total = len(points)
+                sent = 0
+                buf = []
 
-            def _fmt(v):
-                """Compact value format - matches manual's integer style."""
-                s = f"{v:.4f}"
-                if '.' in s:
-                    s = s.rstrip('0').rstrip('.')
-                return s
+                def _fmt(v):
+                    """Compact value format - matches manual's integer style."""
+                    s = f"{v:.4f}"
+                    if '.' in s:
+                        s = s.rstrip('0').rstrip('.')
+                    return s
 
-            for pt in points:
-                v = _fmt(pt)
-                trial = buf + [v]
-                trial_len = len(prefix) + len(",".join(trial))
-                if (trial_len > CHUNK_CMD_LIMIT
-                        or len(trial) > LIST_VALUES_PER_CMD) and buf:
+                for pt in points:
+                    v = _fmt(pt)
+                    trial = buf + [v]
+                    trial_len = len(prefix) + len(",".join(trial))
+                    if (trial_len > CHUNK_CMD_LIMIT
+                            or len(trial) > LIST_VALUES_PER_CMD) and buf:
+                        if self.send_cmd(prefix + ",".join(buf)) is None:
+                            return False, (
+                                f"List send failed at pt {sent}/{total}: "
+                                f"{self.last_error}")
+                        sent += len(buf)
+                        if progress_cb:
+                            progress_cb(sent, total)
+                        buf = []
+                    buf.append(v)
+
+                if buf:
                     if self.send_cmd(prefix + ",".join(buf)) is None:
                         return False, (
                             f"List send failed at pt {sent}/{total}: "
@@ -599,50 +626,39 @@ class KepcoController:
                     sent += len(buf)
                     if progress_cb:
                         progress_cb(sent, total)
-                    buf = []
-                buf.append(v)
 
-            if buf:
-                if self.send_cmd(prefix + ",".join(buf)) is None:
-                    return False, (
-                        f"List send failed at pt {sent}/{total}: "
-                        f"{self.last_error}")
-                sent += len(buf)
-                if progress_cb:
-                    progress_cb(sent, total)
+                # Phase 4: Set dwell after values
+                if self.send_cmd(f"LIST:DWEL {dwell:.6f}") is None:
+                    return False, f"Dwell send failed: {self.last_error}"
 
-            # Phase 4: Set dwell after values
-            if self.send_cmd(f"LIST:DWEL {dwell:.6f}") is None:
-                return False, f"Dwell send failed: {self.last_error}"
+                # Phase 5: Verify
+                # *WAI ensures all LIST:{mode} values are ingested before
+                # the verification query is processed (PAR A.17).
+                if not self.sync():
+                    return False, f"Post-upload *WAI failed: {self.last_error}"
 
-            # Phase 5: Verify
-            # *WAI ensures all LIST:{mode} values are ingested before
-            # the verification query is processed (PAR A.17).
-            if not self.sync():
-                return False, f"Post-upload *WAI failed: {self.last_error}"
+                pcount_str = self.send_query(f"LIST:{mode}:POIN?")
+                if pcount_str is not None:
+                    try:
+                        actual_count = int(pcount_str.strip())
+                        if actual_count != total:
+                            return False, (
+                                f"Point count mismatch: sent {total}, "
+                                f"device reports {actual_count}")
+                    except ValueError:
+                        pass  # non-numeric, skip verify
 
-            pcount_str = self.send_query(f"LIST:{mode}:POIN?")
-            if pcount_str is not None:
-                try:
-                    actual_count = int(pcount_str.strip())
-                    if actual_count != total:
-                        return False, (
-                            f"Point count mismatch: sent {total}, "
-                            f"device reports {actual_count}")
-                except ValueError:
-                    pass  # non-numeric, skip verify
+                errors = self.drain_errors(fail_on_timeout=True)
+                if errors is None:
+                    return False, "SYST:ERR? timeout during verification"
+                if errors:
+                    return False, f"Device errors: {'; '.join(errors)}"
 
-            errors = self.drain_errors(fail_on_timeout=True)
-            if errors is None:
-                return False, "SYST:ERR? timeout during verification"
-            if errors:
-                return False, f"Device errors: {'; '.join(errors)}"
+                return True, (
+                    f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
 
-            return True, (
-                f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
-
-        except Exception as e:
-            return False, str(e)
+            except Exception as e:
+                return False, str(e)
 
     # Run / Stop 
     def run_list(self, mode="VOLT", count=1, enable_output=True):
@@ -654,42 +670,44 @@ class KepcoController:
         When enable_output is False the current output state is preserved and
         only the LIST count/mode are armed.
         """
-        try:
-            cmds = [f"LIST:COUN {count}"]
-            if enable_output:
-                cmds.append("OUTP ON")
-            cmds.append(f"{mode}:MODE LIST")
+        with self._lock:
+            try:
+                cmds = [f"LIST:COUN {count}"]
+                if enable_output:
+                    cmds.append("OUTP ON")
+                cmds.append(f"{mode}:MODE LIST")
 
-            for cmd in cmds:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Run '{cmd}' failed: {self.last_error}"
+                for cmd in cmds:
+                    if self.send_cmd(cmd) is None:
+                        return False, f"Run '{cmd}' failed: {self.last_error}"
 
-            outp = (self.send_query("OUTP?") or "").strip().upper()
-            mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
-            if enable_output and outp not in ("1", "ON"):
-                return False, "Run verification failed: output not enabled"
-            if mode_state and "LIST" not in mode_state:
-                return False, (
-                    f"Run verification failed: {mode}:MODE is '{mode_state}'")
-            return True, "Running"
-        except Exception as e:
-            return False, str(e)
+                outp = (self.send_query("OUTP?") or "").strip().upper()
+                mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
+                if enable_output and outp not in ("1", "ON"):
+                    return False, "Run verification failed: output not enabled"
+                if mode_state and "LIST" not in mode_state:
+                    return False, (
+                        f"Run verification failed: {mode}:MODE is '{mode_state}'")
+                return True, "Running"
+            except Exception as e:
+                return False, str(e)
 
     def stop(self, base_mode="VOLT"):
         """Stop LIST, return to safe fixed-output state."""
         base_mode = (base_mode or "VOLT").upper()
-        try:
-            for cmd in [
-                "VOLT:MODE FIX",
-                "CURR:MODE FIX",
-                "OUTP OFF",
-                f"FUNC:MODE {base_mode}",
-            ]:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Stop '{cmd}' failed: {self.last_error}"
-            return True, "Stopped"
-        except Exception as e:
-            return False, str(e)
+        with self._lock:
+            try:
+                for cmd in [
+                    "VOLT:MODE FIX",
+                    "CURR:MODE FIX",
+                    "OUTP OFF",
+                    f"FUNC:MODE {base_mode}",
+                ]:
+                    if self.send_cmd(cmd) is None:
+                        return False, f"Stop '{cmd}' failed: {self.last_error}"
+                return True, "Stopped"
+            except Exception as e:
+                return False, str(e)
 
 #  Network Discovery
 class Discovery:
@@ -2207,6 +2225,13 @@ class DashboardApp:
         if self._status_poll_enabled:
             self._schedule_status_poll(100)
 
+    def _wait_for_status_poll_idle(self, timeout=2.0):
+        """Block worker threads until an in-flight poll cycle fully unwinds."""
+        deadline = time.time() + timeout
+        while self._status_poll_in_flight and time.time() < deadline:
+            time.sleep(0.05)
+        return not self._status_poll_in_flight
+
     def _status_poll_tick(self):
         self._status_poll_timer = None
         if not self._status_poll_enabled or self._status_poll_paused or not self.kepco.connected:
@@ -2298,6 +2323,7 @@ class DashboardApp:
     def _upload_request_worker(self, req):
         start_sequence = False
         try:
+            self._wait_for_status_poll_idle()
             if req["kind"] == "DC":
                 ok, msg = self._apply_dc_request(req)
             elif req["point_count"] <= MAX_LIST_POINTS:
@@ -2430,6 +2456,7 @@ class DashboardApp:
         forever = req["loop"] == 0
         iteration = 0
         try:
+            self._wait_for_status_poll_idle()
             chunks = [
                 req["points"][i:i + MAX_LIST_POINTS]
                 for i in range(0, len(req["points"]), MAX_LIST_POINTS)
@@ -2577,6 +2604,7 @@ class DashboardApp:
 
     def _output_toggle_worker(self, target_on, req):
         try:
+            self._wait_for_status_poll_idle()
             mode = (req or {}).get("mode") or self.current_control_mode
             if target_on:
                 if req["kind"] == "DC":
@@ -2672,13 +2700,8 @@ class DashboardApp:
             threading.Thread(target=self._disconnect_worker, daemon=True).start()
 
     def _connect_worker(self, ip):
-        ok, msg = self.kepco.connect(ip)
-        idn = None
-        if ok:
-            idn = self.kepco.identity()
-            if idn is None:
-                ok = False
-                msg = self.kepco.last_error or "Identity query failed"
+        ok, msg = self.kepco.connect(ip, validate_identity=True)
+        idn = self.kepco.last_identity or None
         self._call_on_ui(lambda: self._connect_done(ok, msg, ip, idn))
 
     def _connect_done(self, ok, msg, ip, idn):
@@ -2701,6 +2724,7 @@ class DashboardApp:
             self.log(f"Connection failed: {msg}", "err")
 
     def _disconnect_worker(self):
+        self._wait_for_status_poll_idle()
         ok, err_msg = self._safe_output_off_before_disconnect()
         if ok:
             self.kepco.disconnect()
