@@ -2464,6 +2464,7 @@ class DashboardApp:
             if (
                 self.current_output_on
                 and prev_req.get("kind") == "DC"
+                and prev_req.get("mode") == req["mode"]
                 and req["kind"] == "LIST"
                 and req.get("offset") is not None
             ):
