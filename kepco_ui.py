@@ -2339,16 +2339,34 @@ class DashboardApp:
         self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
-        for cmd in [
-            "VOLT:MODE FIX",
-            "CURR:MODE FIX",
-            f"FUNC:MODE {mode}",
-            f"{mode} {value:.4f}",
-        ]:
+        prev_req = self.uploaded_request or {}
+        live_dc_update = (
+            self.current_output_on
+            and prev_req.get("kind") == "DC"
+            and prev_req.get("mode") == mode
+        )
+
+        # When a DC setpoint is already live in this mode, write the new
+        # value directly so the output can rise/fall from its current level
+        # instead of momentarily dropping through the full re-arm sequence.
+        cmds = (
+            [f"{mode} {value:.4f}"]
+            if live_dc_update else
+            [
+                "VOLT:MODE FIX",
+                "CURR:MODE FIX",
+                f"FUNC:MODE {mode}",
+                f"{mode} {value:.4f}",
+            ]
+        )
+
+        for cmd in cmds:
             if not self.kepco.send(cmd):
                 return False, f"DC upload failed at '{cmd}': {self.kepco.last_error}"
         self._call_on_ui(lambda: self.progress.set(1.0))
         unit = "V" if mode == "VOLT" else "A"
+        if live_dc_update:
+            return True, f"DC setpoint updated live to {value:.4f} {unit}"
         return True, f"DC setpoint armed at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
