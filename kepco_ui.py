@@ -868,6 +868,7 @@ class DashboardApp:
         self._status_poll_paused = False
         self._status_poll_in_flight = False
         self._status_poll_timer = None
+        self._measurement_guard = None
 
         self.log_file_handle = None
         self.log_file_path = ""
@@ -1609,6 +1610,7 @@ class DashboardApp:
         self.log(f"Connection lost during {context}: {self.kepco.last_error}", "err")
 
     def _reset_live_status(self):
+        self._measurement_guard = None
         self.current_output_on = False
         self.current_control_mode = "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
@@ -1779,6 +1781,21 @@ class DashboardApp:
             label.configure(
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
+
+    @staticmethod
+    def _as_float(value):
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _set_live_measurement_axis(self, mode, value):
+        numeric = self._as_float(value)
+        text = f"{numeric:.4f}" if numeric is not None else "---.----"
+        if mode == "VOLT":
+            self.status_meas_volt_lbl.configure(text=f"Voltage:  {text}  V")
+        elif mode == "CURR":
+            self.status_meas_curr_lbl.configure(text=f"Current:  {text}  A")
 
     def _set_entry_enabled(self, entry, enabled):
         entry.configure(
@@ -2254,6 +2271,31 @@ class DashboardApp:
         if any(item is None for item in (v, c, outp, mode)):
             self._handle_comm_failure("status polling")
             return
+
+        poll_mode = str(mode).strip().upper()
+        if poll_mode == "0":
+            poll_mode = "VOLT"
+        elif poll_mode == "1":
+            poll_mode = "CURR"
+
+        guard = self._measurement_guard
+        if guard:
+            measured = self._as_float(v if guard["mode"] == "VOLT" else c)
+            out_text = str(outp).strip().upper()
+            # After a live DC -> AC handoff the first polled sample can still
+            # mirror the prior fixed setpoint, so prefer the new waveform center once.
+            if (
+                poll_mode == guard["mode"]
+                and out_text in ("1", "ON")
+                and measured is not None
+                and abs(measured - guard["previous_value"]) <= 5e-4
+            ):
+                if guard["mode"] == "VOLT":
+                    v = guard["expected_value"]
+                else:
+                    c = guard["expected_value"]
+            self._measurement_guard = None
+
         self._apply_live_status(v, c, outp, mode)
         if self._status_poll_enabled and not self._status_poll_paused:
             self._schedule_status_poll(1000)
@@ -2339,16 +2381,34 @@ class DashboardApp:
         self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
-        for cmd in [
-            "VOLT:MODE FIX",
-            "CURR:MODE FIX",
-            f"FUNC:MODE {mode}",
-            f"{mode} {value:.4f}",
-        ]:
+        prev_req = self.uploaded_request or {}
+        live_dc_update = (
+            self.current_output_on
+            and prev_req.get("kind") == "DC"
+            and prev_req.get("mode") == mode
+        )
+
+        # When a DC setpoint is already live in this mode, write the new
+        # value directly so the output can rise/fall from its current level
+        # instead of momentarily dropping through the full re-arm sequence.
+        cmds = (
+            [f"{mode} {value:.4f}"]
+            if live_dc_update else
+            [
+                "VOLT:MODE FIX",
+                "CURR:MODE FIX",
+                f"FUNC:MODE {mode}",
+                f"{mode} {value:.4f}",
+            ]
+        )
+
+        for cmd in cmds:
             if not self.kepco.send(cmd):
                 return False, f"DC upload failed at '{cmd}': {self.kepco.last_error}"
         self._call_on_ui(lambda: self.progress.set(1.0))
         unit = "V" if mode == "VOLT" else "A"
+        if live_dc_update:
+            return True, f"DC setpoint updated live to {value:.4f} {unit}"
         return True, f"DC setpoint armed at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
@@ -2396,10 +2456,24 @@ class DashboardApp:
 
     def _upload_request_done(self, req, ok, msg, start_sequence):
         self._upload_in_flight = False
+        prev_req = self.uploaded_request or {}
         self.uploaded_request = req if ok else self.uploaded_request
         if ok:
             self.uploaded_waveform_ready = True
             self._refresh_uploaded_status_panel()
+            if (
+                self.current_output_on
+                and prev_req.get("kind") == "DC"
+                and prev_req.get("mode") == req["mode"]
+                and req["kind"] == "LIST"
+                and req.get("offset") is not None
+            ):
+                self._measurement_guard = {
+                    "mode": req["mode"],
+                    "previous_value": float(prev_req.get("amplitude", 0.0)),
+                    "expected_value": float(req["offset"]),
+                }
+                self._set_live_measurement_axis(req["mode"], req["offset"])
             self.log(msg, "ok")
             if start_sequence:
                 started, start_msg = self._begin_uploaded_sequence(
