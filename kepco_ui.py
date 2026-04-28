@@ -869,6 +869,8 @@ class DashboardApp:
         self._status_poll_in_flight = False
         self._status_poll_timer = None
         self._measurement_guard = None
+        self._live_meas_warning_job = None
+        self._live_meas_warning_visible = True
 
         self.log_file_handle = None
         self.log_file_path = ""
@@ -1353,6 +1355,16 @@ class DashboardApp:
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#34d399")
         self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
+        self.status_meas_warn_lbl = ctk.CTkLabel(
+            meas_card,
+            text="",
+            height=30,
+            justify="left",
+            anchor="w",
+            wraplength=340,
+            text_color=C["amber"],
+            font=ctk.CTkFont(size=11, weight="bold"))
+        self.status_meas_warn_lbl.pack(fill="x", padx=20, pady=(0, 14))
 
         info_card = ctk.CTkFrame(content, corner_radius=12)
         info_card.grid(row=1, column=1, sticky="nsew")
@@ -1621,6 +1633,7 @@ class DashboardApp:
         if hasattr(self, "mode_buttons"):
             self._update_mode_buttons("VOLT")
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
 
     def _reset_uploaded_state(self):
         self.uploaded_request = None
@@ -1632,6 +1645,7 @@ class DashboardApp:
         self.prog_lbl.configure(text="No upload yet")
         self.progress.set(0)
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _refresh_uploaded_status_panel(self):
@@ -1674,6 +1688,7 @@ class DashboardApp:
         self.current_output_on = bool(is_on)
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
+        self._refresh_live_measurement_warning()
 
     def _set_status_output_display(self, is_on):
         self.status_output_pill.configure(
@@ -1781,6 +1796,55 @@ class DashboardApp:
             label.configure(
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
+
+    def _cancel_live_measurement_warning_timer(self):
+        if self._live_meas_warning_job:
+            try:
+                self.root.after_cancel(self._live_meas_warning_job)
+            except Exception:
+                pass
+            self._live_meas_warning_job = None
+
+    def _is_live_measurement_warning_active(self):
+        req = self.uploaded_request or {}
+        return bool(
+            self.kepco.connected
+            and self.current_output_on
+            and req.get("kind") == "LIST"
+            and req.get("wave") not in ("", None, "DC")
+        )
+
+    def _set_live_measurement_warning_visible(self, visible):
+        text = ""
+        if visible and self._is_live_measurement_warning_active():
+            text = (
+                "Warning: BIT 802E readback may be inaccurate while "
+                "LIST-driven AC output is active."
+            )
+        self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
+
+    def _toggle_live_measurement_warning(self):
+        self._live_meas_warning_job = None
+        if not self._is_live_measurement_warning_active() or self._ui_shutdown:
+            self._refresh_live_measurement_warning()
+            return
+        self._live_meas_warning_visible = not self._live_meas_warning_visible
+        self._set_live_measurement_warning_visible(self._live_meas_warning_visible)
+        self._live_meas_warning_job = self.root.after(
+            500, self._toggle_live_measurement_warning)
+
+    def _refresh_live_measurement_warning(self):
+        if not hasattr(self, "status_meas_warn_lbl"):
+            return
+        if not self._is_live_measurement_warning_active():
+            self._cancel_live_measurement_warning_timer()
+            self._live_meas_warning_visible = True
+            self._set_live_measurement_warning_visible(False)
+            return
+        self._set_live_measurement_warning_visible(self._live_meas_warning_visible)
+        if self._live_meas_warning_job is None:
+            self._live_meas_warning_job = self.root.after(
+                500, self._toggle_live_measurement_warning)
 
     @staticmethod
     def _as_float(value):
@@ -2335,6 +2399,7 @@ class DashboardApp:
             self.current_output_on = is_on
             self._set_status_output_display(is_on)
 
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _upload_waveform(self):
@@ -2460,6 +2525,7 @@ class DashboardApp:
         self.uploaded_request = req if ok else self.uploaded_request
         if ok:
             self.uploaded_waveform_ready = True
+            self._refresh_live_measurement_warning()
             self._refresh_uploaded_status_panel()
             if (
                 self.current_output_on
@@ -2891,6 +2957,7 @@ class DashboardApp:
                 return
             self.kepco.disconnect()
         self._stop_status_polling()
+        self._cancel_live_measurement_warning_timer()
         self.log("Application closed.", "info")
         self._close_log_file()
         self._stop_ui_dispatcher()
