@@ -2141,16 +2141,6 @@ class DashboardApp:
             return
         unit = "V" if mode == "VOLT" else "A"
         pos_limit, neg_limit = limits[mode]
-        active_mode = self.control_mode_var.get().upper()
-        is_complementary = (
-            (active_mode == "CURR" and mode == "VOLT")
-            or (active_mode == "VOLT" and mode == "CURR")
-        )
-        cmds = (
-            KepcoController.signed_limit_cmds(mode, limits[mode])
-            if is_complementary else
-            []
-        )
         if not self._man_require_conn():
             self.log(
                 f"{mode} limits staged locally at "
@@ -2158,12 +2148,34 @@ class DashboardApp:
                 "connect to send it to the device.",
                 "warn")
             return
+
+        mode_resp = self.kepco.send("FUNC:MODE?", query=True)
+        active_mode = KepcoController._normalize_func_mode(mode_resp)
+        if not active_mode:
+            self.log(
+                "Limit command not sent; could not confirm device control mode.",
+                "err")
+            if not self.kepco.connected:
+                self._handle_comm_failure("query control mode for limit set")
+            return
+
+        if active_mode != self.control_mode_var.get().upper():
+            self.current_control_mode = active_mode
+            self.control_mode_var.set(active_mode)
+            self._update_mode_buttons(active_mode)
+
+        is_complementary = (
+            (active_mode == "CURR" and mode == "VOLT")
+            or (active_mode == "VOLT" and mode == "CURR")
+        )
         if not is_complementary:
             self.log(
                 f"{mode} is the active output channel in {active_mode} mode; "
                 "this field is staged as a UI/software limit only.",
                 "warn")
             return
+
+        cmds = KepcoController.signed_limit_cmds(mode, limits[mode])
         self.log(f"Sending device limit command(s): {'; '.join(cmds)}", "info")
         ok, msg = self.kepco.send_sequence(
             cmds, label=f"{mode} device limit command(s)")
