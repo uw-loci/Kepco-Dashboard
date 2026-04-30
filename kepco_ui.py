@@ -9,7 +9,7 @@ Hardware Constraints (BIT 802E manual):
   - Max 1000 list points per upload (1002 technically)
   - Dwell time: 0.0005 s (500 us) to 10 s
   - For >1000 points: sequential multi-list upload required
-  - Use VOLT:RANG 1 / CURR:RANG 1 to avoid quarter-scale transients
+  - Use the active mode's RANG 1 to avoid quarter-scale transients
 """
 
 import socket
@@ -43,6 +43,14 @@ CHUNK_CMD_LIMIT  = 200       # safe margin for 253-byte SCPI buffer
 SCPI_CMD_GAP     = 0.035     # > 25ms spec throughput (PAR 1.2.2)
 LIST_VALUES_PER_CMD = 10     # manual examples show max 11 (PAR B.45/B.31)
 RECV_TIMEOUT     = 3.0       # socket recv timeout for queries
+BOP_MAX_VOLTAGE  = 100.0     # BOP 100-2ML voltage rating
+BOP_MAX_CURRENT  = 2.0       # BOP 100-2ML current rating
+DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE = 20.0
+DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE = -20.0
+DEFAULT_POSITIVE_CURRENT_LIMIT = 2.0
+DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
+DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
+DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -458,6 +466,96 @@ class KepcoController:
             return self.send_query(cmd)
         return self.send_cmd(cmd)
 
+    @staticmethod
+    def format_scpi_value(value):
+        return f"{float(value):.6g}"
+
+    @classmethod
+    def limit_pair(cls, values, default_positive, default_negative):
+        if values is None:
+            return float(default_positive), float(default_negative)
+        if isinstance(values, dict):
+            pos = values.get("positive", values.get("pos", default_positive))
+            neg = values.get("negative", values.get("neg", default_negative))
+            return float(pos), float(neg)
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            return float(values[0]), float(values[1])
+        magnitude = abs(float(values))
+        return magnitude, -magnitude
+
+    @classmethod
+    def signed_limit_cmds(cls, channel, limits, negative_limit=None):
+        if negative_limit is None:
+            if isinstance(limits, dict):
+                pos, neg = cls.limit_pair(limits, 0.0, 0.0)
+            elif isinstance(limits, (list, tuple)) and len(limits) >= 2:
+                pos, neg = cls.limit_pair(limits, limits[0], limits[1])
+            else:
+                magnitude = abs(float(limits))
+                pos, neg = magnitude, -magnitude
+        else:
+            pos, neg = float(limits), float(negative_limit)
+        return [
+            f"{channel} {cls.format_scpi_value(pos)}",
+            f"{channel} {cls.format_scpi_value(neg)}",
+        ]
+
+    @classmethod
+    def bipolar_limit_cmds(cls, channel, magnitude):
+        magnitude = abs(float(magnitude))
+        return cls.signed_limit_cmds(channel, (magnitude, -magnitude))
+
+    @classmethod
+    def default_voltage_limits(cls):
+        return (
+            DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
+            DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE,
+        )
+
+    @classmethod
+    def default_current_limits(cls):
+        return (
+            DEFAULT_POSITIVE_CURRENT_LIMIT,
+            DEFAULT_NEGATIVE_CURRENT_LIMIT,
+        )
+
+    def _log_sequence(self, label, cmds):
+        self._dbg("info", f"{label}: {'; '.join(cmds)}")
+
+    def send_sequence(self, cmds, label="SCPI sequence"):
+        cmds = [cmd for cmd in cmds if cmd]
+        if not self.connected and not self._safe_reconnect():
+            return False, "Not connected"
+        with self._lock:
+            self._log_sequence(label, cmds)
+            for cmd in cmds:
+                if self.send_cmd(cmd) is None:
+                    return False, f"{label} failed at '{cmd}': {self.last_error}"
+            return True, "OK"
+
+    def _limit_setup_cmds(self, mode, voltage_compliance=None,
+                          current_limit=None):
+        mode = (mode or "VOLT").upper()
+        if mode not in ("VOLT", "CURR"):
+            raise ValueError(f"Unsupported FUNC:MODE '{mode}'")
+        voltage_compliance = (
+            self.default_voltage_limits()
+            if voltage_compliance is None else voltage_compliance
+        )
+        current_limit = (
+            self.default_current_limits()
+            if current_limit is None else current_limit
+        )
+        cmds = [
+            f"FUNC:MODE {mode}",
+            f"{mode}:RANG 1",
+        ]
+        if mode == "CURR":
+            cmds.extend(self.signed_limit_cmds("VOLT", voltage_compliance))
+        else:
+            cmds.extend(self.signed_limit_cmds("CURR", current_limit))
+        return cmds
+
     # -- synchronization helpers --------------------------------------------
     def sync(self):
         """Ensure all pending operations complete before next command.
@@ -521,7 +619,7 @@ class KepcoController:
             if "LIST" not in mode_text:
                 return True, "Active mode already fixed"
 
-            for cmd in [f"{active_mode}:MODE FIX", "*WAI"]:
+            for cmd in [f"{active_mode} 0", f"{active_mode}:MODE FIX", "*WAI"]:
                 if self.send_cmd(cmd) is None:
                     return False, f"Disarm '{cmd}' failed: {self.last_error}"
             return True, f"{active_mode} LIST mode disarmed"
@@ -530,7 +628,8 @@ class KepcoController:
 
     # -- List upload (single chunk <= 1000 pts) -----------------------------
     def upload_list_chunk(self, points, dwell, mode="VOLT",
-                          progress_cb=None):
+                          progress_cb=None, voltage_compliance=None,
+                          current_limit=None):
         """Upload one chunk (<= 1000 points) with paced writes + verification.
 
                 Strategy:
@@ -555,6 +654,9 @@ class KepcoController:
                 return False, "Empty point list"
             if len(points) > MAX_LIST_POINTS:
                 return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
+            mode = (mode or "VOLT").upper()
+            if mode not in ("VOLT", "CURR"):
+                return False, f"Unsupported list mode '{mode}'"
 
             try:
                 # Clear stale error queue first so prior test noise is not
@@ -579,15 +681,16 @@ class KepcoController:
                 # examples never use it for list operations, and it forces
                 # the card to "operation complete idle" which can confuse
                 # subsequent synchronisation on some firmware revisions.
-                setup_cmds = [
-                    f"FUNC:MODE {mode}",
-                    f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
+                setup_cmds = self._limit_setup_cmds(
+                    mode, voltage_compliance, current_limit)
+                setup_cmds.extend([
                     "LIST:CLE",
                     "*WAI",                   # wait for LIST:CLE (PAR A.17)
-                ]
-                for cmd in setup_cmds:
-                    if self.send_cmd(cmd) is None:
-                        return False, f"Setup '{cmd}' failed: {self.last_error}"
+                ])
+                ok, setup_msg = self.send_sequence(
+                    setup_cmds, label=f"LIST upload setup ({mode})")
+                if not ok:
+                    return False, setup_msg
 
                 # -- Phase 3: Send list values --
                 prefix = f"LIST:{mode} "
@@ -661,25 +764,41 @@ class KepcoController:
                 return False, str(e)
 
     # Run / Stop 
-    def run_list(self, mode="VOLT", count=1, enable_output=True):
+    def run_list(self, mode="VOLT", count=1, enable_output=True,
+                 voltage_compliance=None, current_limit=None,
+                 apply_limit_setup=True):
         """Start LIST execution.
 
         When enable_output is True the standard sequence is:
-          COUNT -> OUTP ON -> {mode}:MODE LIST
+          setup limits -> zero fixed source -> COUNT -> OUTP ON -> {mode}:MODE LIST
 
-        When enable_output is False the current output state is preserved and
-        only the LIST count/mode are armed.
+        When enable_output is False the current output state is preserved.  The
+        upload path has already applied limits, so live re-arms can skip the
+        fixed-source setup that can disturb an active AC waveform.
         """
+        mode = (mode or "VOLT").upper()
+        if mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported list mode '{mode}'"
         with self._lock:
             try:
-                cmds = [f"LIST:COUN {count}"]
+                cmds = []
+                if apply_limit_setup:
+                    cmds.extend(self._limit_setup_cmds(
+                        mode, voltage_compliance, current_limit))
+                if enable_output:
+                    cmds.append(f"{mode} 0")
+                cmds.append(f"LIST:COUN {count}")
                 if enable_output:
                     cmds.append("OUTP ON")
                 cmds.append(f"{mode}:MODE LIST")
 
-                for cmd in cmds:
-                    if self.send_cmd(cmd) is None:
-                        return False, f"Run '{cmd}' failed: {self.last_error}"
+                ok, run_msg = self.send_sequence(
+                    cmds,
+                    label=(
+                        f"LIST run setup ({mode})"
+                        if apply_limit_setup else f"LIST run arm ({mode})"))
+                if not ok:
+                    return False, run_msg
 
                 outp = (self.send_query("OUTP?") or "").strip().upper()
                 mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
@@ -872,6 +991,12 @@ class DashboardApp:
 
         self.log_file_handle = None
         self.log_file_path = ""
+        self.data_collection_file_handle = None
+        self.data_collection_file_path = ""
+        self.data_collection_writer = None
+        self.data_collection_started_at = None
+        self.data_collection_enabled = False
+        self._data_collection_switch_updating = False
 
         self.current_control_mode = "VOLT"
         self.control_mode_var = ctk.StringVar(value="VOLT")
@@ -1060,6 +1185,7 @@ class DashboardApp:
         left_controls = ctk.CTkFrame(footer, fg_color="transparent")
         left_controls.grid(row=0, column=0, sticky="ew", padx=(14, 12), pady=12)
         left_controls.grid_columnconfigure(1, weight=1)
+
         self.upload_btn = ctk.CTkButton(
             left_controls, text="Upload", width=150, height=42,
             command=self._upload_waveform,
@@ -1073,6 +1199,14 @@ class DashboardApp:
         self.progress = ctk.CTkProgressBar(left_controls, height=14)
         self.progress.grid(row=1, column=1, sticky="ew")
         self.progress.set(0)
+        self.data_collection_switch = ctk.CTkSwitch(
+            left_controls, text="Collect data", width=150,
+            command=self._toggle_data_collection,
+            switch_width=34, switch_height=18,
+            progress_color=C["amber"], text_color=C["text2"],
+            font=ctk.CTkFont(size=11))
+        self.data_collection_switch.grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         switch_card = ctk.CTkFrame(footer, width=290, height=144, corner_radius=12)
         switch_card.grid(row=0, column=1, sticky="ns", padx=(0, 14), pady=10)
@@ -1224,25 +1358,43 @@ class DashboardApp:
 
         v_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         v_row.pack(fill="x", padx=14, pady=(0, 6))
-        ctk.CTkLabel(v_row, text="Overvoltage Limit (V):",
-                     width=140, anchor="w").pack(side="left")
-        self.soft_volt_limit_entry = ctk.CTkEntry(v_row, width=90)
-        self.soft_volt_limit_entry.insert(0, "1000.0")
-        self.soft_volt_limit_entry.pack(side="left", padx=4)
+        ctk.CTkLabel(v_row, text="Voltage limit (V):",
+                     anchor="w", wraplength=220).pack(fill="x")
+        v_ctrl = ctk.CTkFrame(v_row, fg_color="transparent")
+        v_ctrl.pack(fill="x", pady=(3, 0))
+        ctk.CTkLabel(v_ctrl, text="+", width=14).pack(side="left")
+        self.soft_volt_pos_limit_entry = ctk.CTkEntry(v_ctrl, width=68)
+        self.soft_volt_pos_limit_entry.insert(
+            0, str(DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE))
+        self.soft_volt_pos_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(v_ctrl, text="-", width=14).pack(side="left")
+        self.soft_volt_neg_limit_entry = ctk.CTkEntry(v_ctrl, width=68)
+        self.soft_volt_neg_limit_entry.insert(
+            0, str(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE))
+        self.soft_volt_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            v_row, text="Set", width=54,
+            v_ctrl, text="Set", width=54,
             command=lambda: self._set_software_limit("VOLT"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
         c_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         c_row.pack(fill="x", padx=14, pady=(0, 12))
-        ctk.CTkLabel(c_row, text="Overcurrent Limit (A):",
-                     width=140, anchor="w").pack(side="left")
-        self.soft_curr_limit_entry = ctk.CTkEntry(c_row, width=90)
-        self.soft_curr_limit_entry.insert(0, "20.0")
-        self.soft_curr_limit_entry.pack(side="left", padx=4)
+        ctk.CTkLabel(c_row, text="Current limit (A):",
+                     anchor="w", wraplength=220).pack(fill="x")
+        c_ctrl = ctk.CTkFrame(c_row, fg_color="transparent")
+        c_ctrl.pack(fill="x", pady=(3, 0))
+        ctk.CTkLabel(c_ctrl, text="+", width=14).pack(side="left")
+        self.soft_curr_pos_limit_entry = ctk.CTkEntry(c_ctrl, width=68)
+        self.soft_curr_pos_limit_entry.insert(
+            0, str(DEFAULT_POSITIVE_CURRENT_LIMIT))
+        self.soft_curr_pos_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(c_ctrl, text="-", width=14).pack(side="left")
+        self.soft_curr_neg_limit_entry = ctk.CTkEntry(c_ctrl, width=68)
+        self.soft_curr_neg_limit_entry.insert(
+            0, str(DEFAULT_NEGATIVE_CURRENT_LIMIT))
+        self.soft_curr_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            c_row, text="Set", width=54,
+            c_ctrl, text="Set", width=54,
             command=lambda: self._set_software_limit("CURR"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
@@ -1353,6 +1505,16 @@ class DashboardApp:
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#34d399")
         self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
+        self.status_meas_warn_lbl = ctk.CTkLabel(
+            meas_card,
+            text="",
+            height=30,
+            justify="left",
+            anchor="w",
+            wraplength=340,
+            text_color=C["amber"],
+            font=ctk.CTkFont(size=11, weight="bold"))
+        self.status_meas_warn_lbl.pack(fill="x", padx=20, pady=(0, 14))
 
         info_card = ctk.CTkFrame(content, corner_radius=12)
         info_card.grid(row=1, column=1, sticky="nsew")
@@ -1517,6 +1679,132 @@ class DashboardApp:
         finally:
             self.log_file_handle = None
 
+    def _toggle_data_collection(self):
+        if self._data_collection_switch_updating:
+            return
+
+        if self.data_collection_switch.get():
+            if not self._start_data_collection():
+                self._set_data_collection_switch(False)
+        else:
+            self._stop_data_collection()
+
+    def _set_data_collection_switch(self, selected):
+        if not hasattr(self, "data_collection_switch"):
+            return
+        self._data_collection_switch_updating = True
+        try:
+            if selected:
+                self.data_collection_switch.select()
+            else:
+                self.data_collection_switch.deselect()
+        finally:
+            self._data_collection_switch_updating = False
+
+    def _start_data_collection(self):
+        if self.data_collection_file_handle:
+            self.data_collection_enabled = True
+            return True
+
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.data_collection_file_path = os.path.join(
+                log_dir, f"kepco_readback_collection_date_{stamp}.csv")
+            self.data_collection_file_handle = open(
+                self.data_collection_file_path, "a",
+                encoding="utf-8", newline="")
+            self.data_collection_writer = csv.writer(
+                self.data_collection_file_handle)
+            self.data_collection_writer.writerow([
+                "timestamp",
+                "elapsed_s",
+                "readback_voltage_v",
+                "readback_current_a",
+                "output_state",
+                "mode",
+            ])
+            self.data_collection_file_handle.flush()
+            self.data_collection_started_at = time.time()
+            self.data_collection_enabled = True
+            self.log(
+                f"Data collection enabled: {self.data_collection_file_path}",
+                "ok")
+            return True
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self.log(f"Data collection failed: {exc}", "err")
+            messagebox.showerror(
+                "Data Collection",
+                f"Could not start data collection.\n{exc}")
+            return False
+
+    def _stop_data_collection(self, log_message=True):
+        was_enabled = (
+            self.data_collection_enabled
+            or self.data_collection_file_handle is not None
+        )
+        path = self.data_collection_file_path
+        self.data_collection_enabled = False
+        self._close_data_collection_file()
+        if log_message and was_enabled and path:
+            self.log(f"Data collection disabled: {path}", "info")
+
+    def _close_data_collection_file(self):
+        try:
+            if self.data_collection_file_handle:
+                self.data_collection_file_handle.flush()
+                self.data_collection_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.data_collection_file_handle = None
+            self.data_collection_file_path = ""
+            self.data_collection_writer = None
+            self.data_collection_started_at = None
+
+    def _record_data_collection_sample(self, v, c, outp, mode):
+        if (
+            not self.data_collection_enabled
+            or not self.data_collection_writer
+            or not self.data_collection_file_handle
+        ):
+            return
+
+        try:
+            now = time.time()
+            started_at = self.data_collection_started_at or now
+            voltage = self._as_float(v)
+            current = self._as_float(c)
+            output_text = str(outp).strip().upper()
+            if output_text in ("1", "ON"):
+                output_text = "ON"
+            elif output_text in ("0", "OFF"):
+                output_text = "OFF"
+
+            mode_text = str(mode).strip().upper()
+            if mode_text == "0":
+                mode_text = "VOLT"
+            elif mode_text == "1":
+                mode_text = "CURR"
+
+            self.data_collection_writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{now - started_at:.3f}",
+                voltage if voltage is not None else str(v).strip(),
+                current if current is not None else str(c).strip(),
+                output_text,
+                mode_text,
+            ])
+            self.data_collection_file_handle.flush()
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self._set_data_collection_switch(False)
+            self.log(f"Data collection stopped: {exc}", "err")
+
     def _start_ui_dispatcher(self):
         if self._ui_shutdown or self._ui_queue_job is not None:
             return
@@ -1621,6 +1909,7 @@ class DashboardApp:
         if hasattr(self, "mode_buttons"):
             self._update_mode_buttons("VOLT")
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
 
     def _reset_uploaded_state(self):
         self.uploaded_request = None
@@ -1632,6 +1921,7 @@ class DashboardApp:
         self.prog_lbl.configure(text="No upload yet")
         self.progress.set(0)
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _refresh_uploaded_status_panel(self):
@@ -1650,7 +1940,7 @@ class DashboardApp:
             wave_name = f"CSV ({req['csv_name']})"
 
         if req["wave"] == "DC":
-            device_state = "Fixed setpoint armed"
+            device_state = "Fixed setpoint staged"
         elif req["point_count"] <= MAX_LIST_POINTS:
             device_state = "LIST uploaded"
         else:
@@ -1674,6 +1964,7 @@ class DashboardApp:
         self.current_output_on = bool(is_on)
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
+        self._refresh_live_measurement_warning()
 
     def _set_status_output_display(self, is_on):
         self.status_output_pill.configure(
@@ -1782,6 +2073,30 @@ class DashboardApp:
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
 
+    def _is_live_measurement_warning_active(self):
+        req = self.uploaded_request or {}
+        return bool(
+            self.kepco.connected
+            and self.current_output_on
+            and req.get("kind") == "LIST"
+            and req.get("wave") not in ("", None, "DC")
+        )
+
+    def _set_live_measurement_warning_visible(self, visible):
+        text = ""
+        if visible and self._is_live_measurement_warning_active():
+            text = (
+                "Warning: BIT 802E readback may be inaccurate while "
+                "LIST-driven AC output is active."
+            )
+        self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
+
+    def _refresh_live_measurement_warning(self):
+        if not hasattr(self, "status_meas_warn_lbl"):
+            return
+        self._set_live_measurement_warning_visible(
+            self._is_live_measurement_warning_active())
+
     @staticmethod
     def _as_float(value):
         try:
@@ -1888,40 +2203,201 @@ class DashboardApp:
             messagebox.showerror("Input Error", f"Invalid {name}.")
             return None
 
-    def _get_software_limits(self, show_error=False):
+    def _normalize_limit_entry_text(self, entry, value):
+        if threading.current_thread() is not threading.main_thread():
+            return
+        entry.delete(0, "end")
+        entry.insert(0, KepcoController.format_scpi_value(value))
+
+    def _read_signed_limit_pair(self, pos_entry, neg_entry, name, max_abs):
+        pos = abs(float(pos_entry.get().strip()))
+        neg = -abs(float(neg_entry.get().strip()))
+        if pos <= 0 or neg >= 0:
+            raise ValueError(f"{name} limits must be nonzero.")
+        if pos > max_abs or abs(neg) > max_abs:
+            raise ValueError(f"{name} limits must be within +/-{max_abs:.1f}.")
+        self._normalize_limit_entry_text(pos_entry, pos)
+        self._normalize_limit_entry_text(neg_entry, neg)
+        return pos, neg
+
+    def _get_device_limits_from_ui(self, show_error=False):
         try:
-            v_limit = abs(float(self.soft_volt_limit_entry.get().strip()))
-            c_limit = abs(float(self.soft_curr_limit_entry.get().strip()))
-            if v_limit <= 0 or c_limit <= 0:
-                raise ValueError
-            return {"VOLT": v_limit, "CURR": c_limit}
-        except Exception:
+            voltage_limits = self._read_signed_limit_pair(
+                self.soft_volt_pos_limit_entry,
+                self.soft_volt_neg_limit_entry,
+                "Voltage compliance / limit",
+                BOP_MAX_VOLTAGE)
+            current_limits = self._read_signed_limit_pair(
+                self.soft_curr_pos_limit_entry,
+                self.soft_curr_neg_limit_entry,
+                "Current limit",
+                BOP_MAX_CURRENT)
+            return voltage_limits, current_limits
+        except Exception as exc:
             if show_error:
                 messagebox.showerror(
-                    "Software Interlock",
-                    "Voltage and current software limits must be valid positive numbers.")
+                    "Device Limits",
+                    str(exc) if str(exc) else
+                    "Voltage and current limits must be valid signed numbers.")
             return None
+
+    def _get_request_limits(self, req):
+        req = req or {}
+        voltage_limits = req.get(
+            "voltage_limits",
+            req.get("voltage_compliance", KepcoController.default_voltage_limits()))
+        current_limits = req.get(
+            "current_limits",
+            req.get("current_limit", KepcoController.default_current_limits()))
+        return (
+            KepcoController.limit_pair(
+                voltage_limits,
+                DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
+                DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE),
+            KepcoController.limit_pair(
+                current_limits,
+                DEFAULT_POSITIVE_CURRENT_LIMIT,
+                DEFAULT_NEGATIVE_CURRENT_LIMIT),
+        )
+
+    def _request_with_latest_ui_limits(self, req):
+        if not req:
+            return None
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return None
+        context = (
+            "Uploaded DC setpoint"
+            if req.get("kind") == "DC" else "Uploaded waveform")
+        if not self._check_points_within_limits(
+                req["mode"], req["points"], context, limits):
+            return None
+        limited_req = dict(req)
+        limited_req["voltage_limits"] = limits["VOLT"]
+        limited_req["current_limits"] = limits["CURR"]
+        return limited_req
+
+    def _log_scpi_sequence(self, label, cmds):
+        self._log_safe(f"{label}: {'; '.join(cmds)}", "info")
+
+    def _apply_device_limits(self, mode, voltage_compliance, current_limit):
+        mode = (mode or "VOLT").upper()
+        try:
+            cmds = self.kepco._limit_setup_cmds(
+                mode, voltage_compliance, current_limit)
+        except ValueError as exc:
+            return False, str(exc)
+        self._log_scpi_sequence(
+            f"Applying {mode} complementary limit setup", cmds)
+        return self.kepco.send_sequence(
+            cmds, label=f"{mode} complementary limit setup")
+
+    def _safe_prepare_output(self, mode, initial_setpoint=0.0,
+                             voltage_compliance=None, current_limit=None,
+                             label="Safe output prepare"):
+        mode = (mode or "VOLT").upper()
+        if voltage_compliance is None:
+            voltage_compliance = KepcoController.default_voltage_limits()
+        if current_limit is None:
+            current_limit = KepcoController.default_current_limits()
+        if mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported FUNC:MODE '{mode}'"
+
+        cmds = [
+            "VOLT:MODE FIX",
+            "CURR:MODE FIX",
+            f"FUNC:MODE {mode}",
+            f"{mode}:RANG 1",
+        ]
+        initial = KepcoController.format_scpi_value(initial_setpoint)
+        if mode == "CURR":
+            cmds.extend(KepcoController.signed_limit_cmds(
+                "VOLT", voltage_compliance))
+            cmds.append(f"CURR {initial}")
+        else:
+            cmds.extend(KepcoController.signed_limit_cmds(
+                "CURR", current_limit))
+            cmds.append(f"VOLT {initial}")
+        self._log_scpi_sequence(label, cmds)
+        return self.kepco.send_sequence(cmds, label=label)
+
+    def _get_software_limits(self, show_error=False):
+        limits = self._get_device_limits_from_ui(show_error=show_error)
+        if not limits:
+            return None
+        voltage_limits, current_limits = limits
+        return {"VOLT": voltage_limits, "CURR": current_limits}
 
     def _set_software_limit(self, mode):
         limits = self._get_software_limits(show_error=True)
         if not limits:
             return
         unit = "V" if mode == "VOLT" else "A"
-        self.log(f"{mode} software limit set to {limits[mode]:.4f} {unit}", "ok")
+        pos_limit, neg_limit = limits[mode]
+        if not self._man_require_conn():
+            self.log(
+                f"{mode} limits staged locally at "
+                f"{neg_limit:.4f} to {pos_limit:.4f} {unit}; "
+                "connect to send it to the device.",
+                "warn")
+            return
+
+        mode_resp = self.kepco.send("FUNC:MODE?", query=True)
+        active_mode = KepcoController._normalize_func_mode(mode_resp)
+        if not active_mode:
+            self.log(
+                "Limit command not sent; could not confirm device control mode.",
+                "err")
+            if not self.kepco.connected:
+                self._handle_comm_failure("query control mode for limit set")
+            return
+
+        if active_mode != self.control_mode_var.get().upper():
+            self.current_control_mode = active_mode
+            self.control_mode_var.set(active_mode)
+            self._update_mode_buttons(active_mode)
+
+        is_complementary = (
+            (active_mode == "CURR" and mode == "VOLT")
+            or (active_mode == "VOLT" and mode == "CURR")
+        )
+        if not is_complementary:
+            self.log(
+                f"{mode} is the active output channel in {active_mode} mode; "
+                "this field is staged as a UI/software limit only.",
+                "warn")
+            return
+
+        cmds = KepcoController.signed_limit_cmds(mode, limits[mode])
+        self.log(f"Sending device limit command(s): {'; '.join(cmds)}", "info")
+        ok, msg = self.kepco.send_sequence(
+            cmds, label=f"{mode} device limit command(s)")
+        self.log(
+            f"{mode} device limit set to {neg_limit:.4f} to {pos_limit:.4f} {unit}"
+            if ok else f"Failed to send {mode} limit command(s): {msg}",
+            "ok" if ok else "err")
+        if ok:
+            self._schedule_status_poll(100)
+        else:
+            self._handle_comm_failure(f"set {mode} limit")
 
     def _check_interlock(self, mode, points, context):
         limits = self._get_software_limits(show_error=True)
         if not limits:
             return False
-        limit = limits[mode]
-        peak = max(abs(float(point)) for point in points)
+        return self._check_points_within_limits(mode, points, context, limits)
+
+    def _check_points_within_limits(self, mode, points, context, limits):
+        pos_limit, neg_limit = limits[mode]
+        high = max(float(point) for point in points)
+        low = min(float(point) for point in points)
         unit = "V" if mode == "VOLT" else "A"
-        if peak > limit + 1e-12:
+        if high > pos_limit + 1e-12 or low < neg_limit - 1e-12:
             messagebox.showerror(
                 "Software Interlock",
                 f"{context} exceeds the configured {mode.lower()} limit.\n\n"
-                f"Peak requested: {peak:.4f} {unit}\n"
-                f"Limit: {limit:.4f} {unit}")
+                f"Requested range: {low:.4f} to {high:.4f} {unit}\n"
+                f"Limit range: {neg_limit:.4f} to {pos_limit:.4f} {unit}")
             return False
         return True
 
@@ -2030,10 +2506,19 @@ class DashboardApp:
         mode = self.control_mode_var.get().upper()
         wave = self.wave_var.get()
         if wave == "DC":
-            return self._build_dc_request(mode)
-        if wave == "CSV Custom (untested)":
-            return self._build_csv_request(mode)
-        return self._build_standard_request(mode)
+            req = self._build_dc_request(mode)
+        elif wave == "CSV Custom (untested)":
+            req = self._build_csv_request(mode)
+        else:
+            req = self._build_standard_request(mode)
+        if not req:
+            return None
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return None
+        req["voltage_limits"] = limits["VOLT"]
+        req["current_limits"] = limits["CURR"]
+        return req
 
     def _preview(self):
         req = self._read_waveform_request()
@@ -2060,9 +2545,21 @@ class DashboardApp:
         if not self.kepco.connected:
             self.log(f"Control mode preset to {mode}", "info")
             return
-        ok = self.kepco.send(f"FUNC:MODE {mode}")
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return
+        if self.current_output_on:
+            ok, msg = self._safe_prepare_output(
+                mode,
+                initial_setpoint=0.0,
+                voltage_compliance=limits["VOLT"],
+                current_limit=limits["CURR"],
+                label=f"Manual {mode} mode safe prepare")
+        else:
+            ok, msg = self._apply_device_limits(
+                mode, limits["VOLT"], limits["CURR"])
         self.log(
-            f"Control mode -> {mode}" if ok else "Failed to set control mode",
+            f"Control mode -> {mode}" if ok else f"Failed to set control mode: {msg}",
             "ok" if ok else "err")
         if ok:
             self._schedule_status_poll(100)
@@ -2272,6 +2769,8 @@ class DashboardApp:
             self._handle_comm_failure("status polling")
             return
 
+        self._record_data_collection_sample(v, c, outp, mode)
+
         poll_mode = str(mode).strip().upper()
         if poll_mode == "0":
             poll_mode = "VOLT"
@@ -2335,6 +2834,7 @@ class DashboardApp:
             self.current_output_on = is_on
             self._set_status_output_display(is_on)
 
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _upload_waveform(self):
@@ -2381,6 +2881,7 @@ class DashboardApp:
         self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
+        voltage_compliance, current_limit = self._get_request_limits(req)
         prev_req = self.uploaded_request or {}
         live_dc_update = (
             self.current_output_on
@@ -2388,30 +2889,47 @@ class DashboardApp:
             and prev_req.get("mode") == mode
         )
 
-        # When a DC setpoint is already live in this mode, write the new
-        # value directly so the output can rise/fall from its current level
-        # instead of momentarily dropping through the full re-arm sequence.
-        cmds = (
-            [f"{mode} {value:.4f}"]
-            if live_dc_update else
-            [
-                "VOLT:MODE FIX",
-                "CURR:MODE FIX",
-                f"FUNC:MODE {mode}",
-                f"{mode} {value:.4f}",
-            ]
-        )
+        setpoint_cmd = (
+            f"{mode} {KepcoController.format_scpi_value(value)}")
 
-        for cmd in cmds:
-            if not self.kepco.send(cmd):
-                return False, f"DC upload failed at '{cmd}': {self.kepco.last_error}"
+        if live_dc_update:
+            ok, msg = self._apply_device_limits(
+                mode, voltage_compliance, current_limit)
+            if not ok:
+                return False, f"DC limit setup failed: {msg}"
+            self._log_scpi_sequence("DC live setpoint update", [setpoint_cmd])
+            ok, msg = self.kepco.send_sequence(
+                [setpoint_cmd], label="DC live setpoint update")
+            if not ok:
+                return False, msg
+        else:
+            ok, msg = self._safe_prepare_output(
+                mode,
+                initial_setpoint=0.0,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                label="DC fixed-output safe prepare")
+            if not ok:
+                return False, msg
+            if self.current_output_on:
+                self._log_scpi_sequence(
+                    "DC live handoff setpoint update", [setpoint_cmd])
+                ok, msg = self.kepco.send_sequence(
+                    [setpoint_cmd], label="DC live handoff setpoint update")
+                if not ok:
+                    return False, msg
+
         self._call_on_ui(lambda: self.progress.set(1.0))
         unit = "V" if mode == "VOLT" else "A"
         if live_dc_update:
             return True, f"DC setpoint updated live to {value:.4f} {unit}"
-        return True, f"DC setpoint armed at {value:.4f} {unit}"
+        if self.current_output_on:
+            return True, f"DC setpoint applied live at {value:.4f} {unit}"
+        return True, f"DC setpoint staged at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
+        voltage_compliance, current_limit = self._get_request_limits(req)
+
         def progress_cb(sent, total):
             pct = sent / max(total, 1)
             self._call_on_ui(lambda p=pct: self.progress.set(p))
@@ -2420,19 +2938,28 @@ class DashboardApp:
                     text=f"Uploading... {s}/{t} pts"))
 
         ok, msg = self.kepco.upload_list_chunk(
-            req["points"], req["dwell"], req["mode"], progress_cb=progress_cb)
+            req["points"], req["dwell"], req["mode"],
+            progress_cb=progress_cb,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit)
         if not ok:
             return False, msg
         if self.current_output_on:
             count = 0 if req["loop"] == 0 else max(req["loop"], 1)
             ok, run_msg = self.kepco.run_list(
-                req["mode"], count=count, enable_output=False)
+                req["mode"],
+                count=count,
+                enable_output=False,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                apply_limit_setup=False)
             if not ok:
                 return False, f"Upload succeeded but live re-arm failed: {run_msg}"
             return True, f"{msg}; applied without toggling output"
         return True, msg
 
     def _prime_multi_chunk_request(self, req):
+        voltage_compliance, current_limit = self._get_request_limits(req)
         chunks = [
             req["points"][i:i + MAX_LIST_POINTS]
             for i in range(0, len(req["points"]), MAX_LIST_POINTS)
@@ -2446,7 +2973,10 @@ class DashboardApp:
                     text=f"Priming chunk 1/{len(chunks)}... {s}/{t} pts"))
 
         ok, msg = self.kepco.upload_list_chunk(
-            chunks[0], req["dwell"], req["mode"], progress_cb=progress_cb)
+            chunks[0], req["dwell"], req["mode"],
+            progress_cb=progress_cb,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit)
         if not ok:
             return False, msg, False
         req["first_chunk_primed"] = True
@@ -2460,6 +2990,7 @@ class DashboardApp:
         self.uploaded_request = req if ok else self.uploaded_request
         if ok:
             self.uploaded_waveform_ready = True
+            self._refresh_live_measurement_warning()
             self._refresh_uploaded_status_panel()
             if (
                 self.current_output_on
@@ -2486,7 +3017,7 @@ class DashboardApp:
                     return
                 self.log(start_msg, "err")
             self.prog_lbl.configure(
-                text="Setpoint armed" if req["kind"] == "DC" else "Uploaded")
+                text="Setpoint staged" if req["kind"] == "DC" else "Uploaded")
             self.progress.set(1.0)
         else:
             self.log(f"Upload failed: {msg}", "err")
@@ -2536,6 +3067,7 @@ class DashboardApp:
                 for i in range(0, len(req["points"]), MAX_LIST_POINTS)
             ]
             mode = req["mode"]
+            voltage_compliance, current_limit = self._get_request_limits(req)
 
             while not self.stop_event.is_set():
                 iteration += 1
@@ -2562,13 +3094,22 @@ class DashboardApp:
                                         text=f"Uploading chunk {c + 1}/{n}... {s}/{t} pts"))
 
                         ok, msg = self.kepco.upload_list_chunk(
-                            chunk, req["dwell"], mode, progress_cb=progress_cb)
+                            chunk, req["dwell"], mode,
+                            progress_cb=progress_cb,
+                            voltage_compliance=voltage_compliance,
+                            current_limit=current_limit)
                         if not ok:
                             final_msg = f"Chunk {chunk_idx + 1} upload failed: {msg}"
                             break
 
                     enable_output = not output_already_on
-                    ok, msg = self.kepco.run_list(mode, count=1, enable_output=enable_output)
+                    ok, msg = self.kepco.run_list(
+                        mode,
+                        count=1,
+                        enable_output=enable_output,
+                        voltage_compliance=voltage_compliance,
+                        current_limit=current_limit,
+                        apply_limit_setup=enable_output)
                     if not ok:
                         final_msg = f"Chunk {chunk_idx + 1} run failed: {msg}"
                         break
@@ -2651,6 +3192,11 @@ class DashboardApp:
             self._set_output_ui_state(False)
             self.log("Upload a waveform before enabling output.", "warn")
             return
+        if target_on:
+            req = self._request_with_latest_ui_limits(req)
+            if not req:
+                self._set_output_ui_state(False)
+                return
         if not target_on and self.sequence_active:
             self._output_toggle_in_flight = True
             self.output_toggle_btn.configure(state="disabled")
@@ -2676,17 +3222,46 @@ class DashboardApp:
             args=(target_on, req),
             daemon=True).start()
 
+    def _enable_dc_output(self, req):
+        mode = req["mode"]
+        value = req["amplitude"]
+        voltage_compliance, current_limit = self._get_request_limits(req)
+        ok, msg = self._safe_prepare_output(
+            mode,
+            initial_setpoint=0.0,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            label="DC safe setup before OUTP ON")
+        if not ok:
+            return False, msg
+
+        setpoint_cmd = (
+            f"{mode} {KepcoController.format_scpi_value(value)}")
+        cmds = ["OUTP ON", setpoint_cmd]
+        self._log_scpi_sequence("DC enable and apply setpoint", cmds)
+        ok, msg = self.kepco.send_sequence(
+            cmds, label="DC enable and apply setpoint")
+        if not ok:
+            return False, msg
+        unit = "V" if mode == "VOLT" else "A"
+        return True, f"Output ON; {mode} setpoint {value:.4f} {unit}"
+
     def _output_toggle_worker(self, target_on, req):
         try:
             self._wait_for_status_poll_idle()
             mode = (req or {}).get("mode") or self.current_control_mode
             if target_on:
                 if req["kind"] == "DC":
-                    ok = bool(self.kepco.send("OUTP ON"))
-                    msg = "Output ON" if ok else "Failed to turn output ON"
+                    ok, msg = self._enable_dc_output(req)
                 else:
                     count = 0 if req["loop"] == 0 else max(req["loop"], 1)
-                    ok, msg = self.kepco.run_list(mode, count=count, enable_output=True)
+                    voltage_compliance, current_limit = self._get_request_limits(req)
+                    ok, msg = self.kepco.run_list(
+                        mode,
+                        count=count,
+                        enable_output=True,
+                        voltage_compliance=voltage_compliance,
+                        current_limit=current_limit)
             else:
                 if req and req["kind"] == "LIST":
                     ok, msg = self.kepco.stop(base_mode=mode)
@@ -2891,6 +3466,7 @@ class DashboardApp:
                 return
             self.kepco.disconnect()
         self._stop_status_polling()
+        self._stop_data_collection()
         self.log("Application closed.", "info")
         self._close_log_file()
         self._stop_ui_dispatcher()
