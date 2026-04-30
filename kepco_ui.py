@@ -9,7 +9,7 @@ Hardware Constraints (BIT 802E manual):
   - Max 1000 list points per upload (1002 technically)
   - Dwell time: 0.0005 s (500 us) to 10 s
   - For >1000 points: sequential multi-list upload required
-  - Use VOLT:RANG 1 / CURR:RANG 1 to avoid quarter-scale transients
+  - Use the active mode's RANG 1 to avoid quarter-scale transients
 """
 
 import socket
@@ -548,8 +548,7 @@ class KepcoController:
         )
         cmds = [
             f"FUNC:MODE {mode}",
-            "VOLT:RANG 1",
-            "CURR:RANG 1",
+            f"{mode}:RANG 1",
         ]
         if mode == "CURR":
             cmds.extend(self.signed_limit_cmds("VOLT", voltage_compliance))
@@ -2130,8 +2129,7 @@ class DashboardApp:
             "VOLT:MODE FIX",
             "CURR:MODE FIX",
             f"FUNC:MODE {mode}",
-            "VOLT:RANG 1",
-            "CURR:RANG 1",
+            f"{mode}:RANG 1",
         ]
         initial = KepcoController.format_scpi_value(initial_setpoint)
         if mode == "CURR":
