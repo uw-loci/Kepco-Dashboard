@@ -2083,6 +2083,23 @@ class DashboardApp:
                 DEFAULT_NEGATIVE_CURRENT_LIMIT),
         )
 
+    def _request_with_latest_ui_limits(self, req):
+        if not req:
+            return None
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return None
+        context = (
+            "Uploaded DC setpoint"
+            if req.get("kind") == "DC" else "Uploaded waveform")
+        if not self._check_points_within_limits(
+                req["mode"], req["points"], context, limits):
+            return None
+        limited_req = dict(req)
+        limited_req["voltage_limits"] = limits["VOLT"]
+        limited_req["current_limits"] = limits["CURR"]
+        return limited_req
+
     def _log_scpi_sequence(self, label, cmds):
         self._log_safe(f"{label}: {'; '.join(cmds)}", "info")
 
@@ -2192,6 +2209,9 @@ class DashboardApp:
         limits = self._get_software_limits(show_error=True)
         if not limits:
             return False
+        return self._check_points_within_limits(mode, points, context, limits)
+
+    def _check_points_within_limits(self, mode, points, context, limits):
         pos_limit, neg_limit = limits[mode]
         high = max(float(point) for point in points)
         low = min(float(point) for point in points)
@@ -2992,6 +3012,11 @@ class DashboardApp:
             self._set_output_ui_state(False)
             self.log("Upload a waveform before enabling output.", "warn")
             return
+        if target_on:
+            req = self._request_with_latest_ui_limits(req)
+            if not req:
+                self._set_output_ui_state(False)
+                return
         if not target_on and self.sequence_active:
             self._output_toggle_in_flight = True
             self.output_toggle_btn.configure(state="disabled")
