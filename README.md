@@ -212,9 +212,6 @@ flowchart TD
 ## Known Limitations
 
 - The repository does not currently include automated tests.
-- The GUI is desktop-only and not intended for headless control.
 - CSV mode is labeled `untested` in the UI and should be validated on target hardware.
-
-## Contributing
-
-Use feature branches, keep safety behavior intact, and verify waveform upload behavior against the simulator or target hardware before merging.
+- During AC waveform uploads using the LIST command, Live Measurement readback values are inaccurate due to limitations of the 802E BIT LAN card.
+- Higher frequency waveforms are limited by the number of points that can be sent due to a dwell time minimum of 0.0005 seconds. This produces a larger step difference between each point.
