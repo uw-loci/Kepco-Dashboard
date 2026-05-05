@@ -988,8 +988,6 @@ class DashboardApp:
         self._status_poll_in_flight = False
         self._status_poll_timer = None
         self._measurement_guard = None
-        self._live_meas_warning_job = None
-        self._live_meas_warning_visible = True
 
         self.log_file_handle = None
         self.log_file_path = ""
@@ -2075,14 +2073,6 @@ class DashboardApp:
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
 
-    def _cancel_live_measurement_warning_timer(self):
-        if self._live_meas_warning_job:
-            try:
-                self.root.after_cancel(self._live_meas_warning_job)
-            except Exception:
-                pass
-            self._live_meas_warning_job = None
-
     def _is_live_measurement_warning_active(self):
         req = self.uploaded_request or {}
         return bool(
@@ -2101,28 +2091,11 @@ class DashboardApp:
             )
         self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
 
-    def _toggle_live_measurement_warning(self):
-        self._live_meas_warning_job = None
-        if not self._is_live_measurement_warning_active() or self._ui_shutdown:
-            self._refresh_live_measurement_warning()
-            return
-        self._live_meas_warning_visible = not self._live_meas_warning_visible
-        self._set_live_measurement_warning_visible(self._live_meas_warning_visible)
-        self._live_meas_warning_job = self.root.after(
-            500, self._toggle_live_measurement_warning)
-
     def _refresh_live_measurement_warning(self):
         if not hasattr(self, "status_meas_warn_lbl"):
             return
-        if not self._is_live_measurement_warning_active():
-            self._cancel_live_measurement_warning_timer()
-            self._live_meas_warning_visible = True
-            self._set_live_measurement_warning_visible(False)
-            return
-        self._set_live_measurement_warning_visible(self._live_meas_warning_visible)
-        if self._live_meas_warning_job is None:
-            self._live_meas_warning_job = self.root.after(
-                500, self._toggle_live_measurement_warning)
+        self._set_live_measurement_warning_visible(
+            self._is_live_measurement_warning_active())
 
     @staticmethod
     def _as_float(value):
@@ -3493,7 +3466,6 @@ class DashboardApp:
                 return
             self.kepco.disconnect()
         self._stop_status_polling()
-        self._cancel_live_measurement_warning_timer()
         self._stop_data_collection()
         self.log("Application closed.", "info")
         self._close_log_file()
