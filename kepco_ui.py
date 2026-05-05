@@ -991,6 +991,12 @@ class DashboardApp:
 
         self.log_file_handle = None
         self.log_file_path = ""
+        self.data_collection_file_handle = None
+        self.data_collection_file_path = ""
+        self.data_collection_writer = None
+        self.data_collection_started_at = None
+        self.data_collection_enabled = False
+        self._data_collection_switch_updating = False
 
         self.current_control_mode = "VOLT"
         self.control_mode_var = ctk.StringVar(value="VOLT")
@@ -1179,6 +1185,7 @@ class DashboardApp:
         left_controls = ctk.CTkFrame(footer, fg_color="transparent")
         left_controls.grid(row=0, column=0, sticky="ew", padx=(14, 12), pady=12)
         left_controls.grid_columnconfigure(1, weight=1)
+
         self.upload_btn = ctk.CTkButton(
             left_controls, text="Upload", width=150, height=42,
             command=self._upload_waveform,
@@ -1192,6 +1199,14 @@ class DashboardApp:
         self.progress = ctk.CTkProgressBar(left_controls, height=14)
         self.progress.grid(row=1, column=1, sticky="ew")
         self.progress.set(0)
+        self.data_collection_switch = ctk.CTkSwitch(
+            left_controls, text="Collect data", width=150,
+            command=self._toggle_data_collection,
+            switch_width=34, switch_height=18,
+            progress_color=C["amber"], text_color=C["text2"],
+            font=ctk.CTkFont(size=11))
+        self.data_collection_switch.grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         switch_card = ctk.CTkFrame(footer, width=290, height=144, corner_radius=12)
         switch_card.grid(row=0, column=1, sticky="ns", padx=(0, 14), pady=10)
@@ -1490,6 +1505,16 @@ class DashboardApp:
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#34d399")
         self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
+        self.status_meas_warn_lbl = ctk.CTkLabel(
+            meas_card,
+            text="",
+            height=30,
+            justify="left",
+            anchor="w",
+            wraplength=340,
+            text_color=C["amber"],
+            font=ctk.CTkFont(size=11, weight="bold"))
+        self.status_meas_warn_lbl.pack(fill="x", padx=20, pady=(0, 14))
 
         info_card = ctk.CTkFrame(content, corner_radius=12)
         info_card.grid(row=1, column=1, sticky="nsew")
@@ -1654,6 +1679,132 @@ class DashboardApp:
         finally:
             self.log_file_handle = None
 
+    def _toggle_data_collection(self):
+        if self._data_collection_switch_updating:
+            return
+
+        if self.data_collection_switch.get():
+            if not self._start_data_collection():
+                self._set_data_collection_switch(False)
+        else:
+            self._stop_data_collection()
+
+    def _set_data_collection_switch(self, selected):
+        if not hasattr(self, "data_collection_switch"):
+            return
+        self._data_collection_switch_updating = True
+        try:
+            if selected:
+                self.data_collection_switch.select()
+            else:
+                self.data_collection_switch.deselect()
+        finally:
+            self._data_collection_switch_updating = False
+
+    def _start_data_collection(self):
+        if self.data_collection_file_handle:
+            self.data_collection_enabled = True
+            return True
+
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.data_collection_file_path = os.path.join(
+                log_dir, f"kepco_readback_collection_date_{stamp}.csv")
+            self.data_collection_file_handle = open(
+                self.data_collection_file_path, "a",
+                encoding="utf-8", newline="")
+            self.data_collection_writer = csv.writer(
+                self.data_collection_file_handle)
+            self.data_collection_writer.writerow([
+                "timestamp",
+                "elapsed_s",
+                "readback_voltage_v",
+                "readback_current_a",
+                "output_state",
+                "mode",
+            ])
+            self.data_collection_file_handle.flush()
+            self.data_collection_started_at = time.time()
+            self.data_collection_enabled = True
+            self.log(
+                f"Data collection enabled: {self.data_collection_file_path}",
+                "ok")
+            return True
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self.log(f"Data collection failed: {exc}", "err")
+            messagebox.showerror(
+                "Data Collection",
+                f"Could not start data collection.\n{exc}")
+            return False
+
+    def _stop_data_collection(self, log_message=True):
+        was_enabled = (
+            self.data_collection_enabled
+            or self.data_collection_file_handle is not None
+        )
+        path = self.data_collection_file_path
+        self.data_collection_enabled = False
+        self._close_data_collection_file()
+        if log_message and was_enabled and path:
+            self.log(f"Data collection disabled: {path}", "info")
+
+    def _close_data_collection_file(self):
+        try:
+            if self.data_collection_file_handle:
+                self.data_collection_file_handle.flush()
+                self.data_collection_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.data_collection_file_handle = None
+            self.data_collection_file_path = ""
+            self.data_collection_writer = None
+            self.data_collection_started_at = None
+
+    def _record_data_collection_sample(self, v, c, outp, mode):
+        if (
+            not self.data_collection_enabled
+            or not self.data_collection_writer
+            or not self.data_collection_file_handle
+        ):
+            return
+
+        try:
+            now = time.time()
+            started_at = self.data_collection_started_at or now
+            voltage = self._as_float(v)
+            current = self._as_float(c)
+            output_text = str(outp).strip().upper()
+            if output_text in ("1", "ON"):
+                output_text = "ON"
+            elif output_text in ("0", "OFF"):
+                output_text = "OFF"
+
+            mode_text = str(mode).strip().upper()
+            if mode_text == "0":
+                mode_text = "VOLT"
+            elif mode_text == "1":
+                mode_text = "CURR"
+
+            self.data_collection_writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{now - started_at:.3f}",
+                voltage if voltage is not None else str(v).strip(),
+                current if current is not None else str(c).strip(),
+                output_text,
+                mode_text,
+            ])
+            self.data_collection_file_handle.flush()
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self._set_data_collection_switch(False)
+            self.log(f"Data collection stopped: {exc}", "err")
+
     def _start_ui_dispatcher(self):
         if self._ui_shutdown or self._ui_queue_job is not None:
             return
@@ -1758,6 +1909,7 @@ class DashboardApp:
         if hasattr(self, "mode_buttons"):
             self._update_mode_buttons("VOLT")
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
 
     def _reset_uploaded_state(self):
         self.uploaded_request = None
@@ -1769,6 +1921,7 @@ class DashboardApp:
         self.prog_lbl.configure(text="No upload yet")
         self.progress.set(0)
         self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _refresh_uploaded_status_panel(self):
@@ -1811,6 +1964,7 @@ class DashboardApp:
         self.current_output_on = bool(is_on)
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
+        self._refresh_live_measurement_warning()
 
     def _set_status_output_display(self, is_on):
         self.status_output_pill.configure(
@@ -1918,6 +2072,30 @@ class DashboardApp:
             label.configure(
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
+
+    def _is_live_measurement_warning_active(self):
+        req = self.uploaded_request or {}
+        return bool(
+            self.kepco.connected
+            and self.current_output_on
+            and req.get("kind") == "LIST"
+            and req.get("wave") not in ("", None, "DC")
+        )
+
+    def _set_live_measurement_warning_visible(self, visible):
+        text = ""
+        if visible and self._is_live_measurement_warning_active():
+            text = (
+                "Warning: BIT 802E readback may be inaccurate while "
+                "LIST-driven AC output is active."
+            )
+        self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
+
+    def _refresh_live_measurement_warning(self):
+        if not hasattr(self, "status_meas_warn_lbl"):
+            return
+        self._set_live_measurement_warning_visible(
+            self._is_live_measurement_warning_active())
 
     @staticmethod
     def _as_float(value):
@@ -2591,6 +2769,8 @@ class DashboardApp:
             self._handle_comm_failure("status polling")
             return
 
+        self._record_data_collection_sample(v, c, outp, mode)
+
         poll_mode = str(mode).strip().upper()
         if poll_mode == "0":
             poll_mode = "VOLT"
@@ -2654,6 +2834,7 @@ class DashboardApp:
             self.current_output_on = is_on
             self._set_status_output_display(is_on)
 
+        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     def _upload_waveform(self):
@@ -2809,6 +2990,7 @@ class DashboardApp:
         self.uploaded_request = req if ok else self.uploaded_request
         if ok:
             self.uploaded_waveform_ready = True
+            self._refresh_live_measurement_warning()
             self._refresh_uploaded_status_panel()
             if (
                 self.current_output_on
@@ -3284,6 +3466,7 @@ class DashboardApp:
                 return
             self.kepco.disconnect()
         self._stop_status_polling()
+        self._stop_data_collection()
         self.log("Application closed.", "info")
         self._close_log_file()
         self._stop_ui_dispatcher()
