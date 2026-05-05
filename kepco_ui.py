@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Kepco BIT 802E Waveform Generator — High Performance Edition
+Kepco BIT 802E Waveform Generator - High Performance Edition
 
 Material-design UI with real-time waveform preview, chunk-send
 indication, auto-discovery, and optimized multi-list upload.
 
 Hardware Constraints (BIT 802E manual):
   - Max 1000 list points per upload (1002 technically)
-  - Dwell time: 0.0005 s (500 µs) to 10 s
+  - Dwell time: 0.0005 s (500 us) to 10 s
   - For >1000 points: sequential multi-list upload required
-  - Use VOLT:RANG 1 / CURR:RANG 1 to avoid quarter-scale transients
+  - Use the active mode's RANG 1 to avoid quarter-scale transients
 """
 
 import socket
 import math
 import csv
+import os
+import queue
 import threading
 import time
 import ipaddress
-import queue as _queue
 from tkinter import messagebox, filedialog
 
-# ── GUI + plotting ──────────────────────────────────────────────────────────
+# -- GUI + plotting ----------------------------------------------------------
 import customtkinter as ctk
 
 import matplotlib
@@ -30,11 +31,11 @@ import matplotlib.lines as mlines
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# ── Constants ───────────────────────────────────────────────────────────────
-MIN_DWELL        = 0.0005    # 500 µs – hardware minimum
+# -- Constants ---------------------------------------------------------------
+MIN_DWELL        = 0.0005    # 500 us - hardware minimum
 MAX_DWELL        = 10.0      # hardware maximum
 MAX_LIST_POINTS  = 1000      # per single LIST upload
-MAX_TOTAL_POINTS = 4000      # 4 × 1000 chunks
+MAX_TOTAL_POINTS = 4000      # 4 x 1000 chunks
 TELNET_PORT      = 5024      # manual 2.4.2 / 4.5: Telnet first
 SCPI_SOCKET_PORT = 5025      # alternate direct socket endpoint
 DISCOVERY_TIMEOUT = 0.25
@@ -42,8 +43,16 @@ CHUNK_CMD_LIMIT  = 200       # safe margin for 253-byte SCPI buffer
 SCPI_CMD_GAP     = 0.035     # > 25ms spec throughput (PAR 1.2.2)
 LIST_VALUES_PER_CMD = 10     # manual examples show max 11 (PAR B.45/B.31)
 RECV_TIMEOUT     = 3.0       # socket recv timeout for queries
+BOP_MAX_VOLTAGE  = 100.0     # BOP 100-2ML voltage rating
+BOP_MAX_CURRENT  = 2.0       # BOP 100-2ML current rating
+DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE = 20.0
+DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE = -20.0
+DEFAULT_POSITIVE_CURRENT_LIMIT = 2.0
+DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
+DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
+DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 
-# ── Material colour palette ─────────────────────────────────────────────────
+# -- Material colour palette -------------------------------------------------
 C = dict(
     bg="#121212", surface="#1e1e2e", card="#2a2a3c",
     primary="#7c3aed", primary_h="#6d28d9",
@@ -55,9 +64,9 @@ C = dict(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 #  SCPI Controller  (hardened for real BIT 802E hardware)
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 class KepcoController:
     """Thread-safe SCPI control for a Kepco BIT 802E.
 
@@ -66,13 +75,13 @@ class KepcoController:
       - PAR 1.2.2: connection throughput ~25 ms per command
       - PAR 4.5.2: *WAI / *OPC? to ensure command completion
       - 253-byte input buffer limit per SCPI message
-      - List: max 1002 steps, dwell 500 µs … 10 s
+      - List: max 1002 steps, dwell 500 us ... 10 s
 
     Design:
       - Every non-query command sleeps SCPI_CMD_GAP (35 ms) *inside* the
         lock so no other thread can violate the pacing constraint.
       - *OPC? sync is used only at key checkpoints (after LIST:CLE, after
-        all values sent, after DWEL) — NOT after every single LIST:VOLT.
+        all values sent, after DWEL) - NOT after every single LIST:VOLT.
       - Post-upload, LIST:{mode}:POIN? verifies the card accepted all
         points, and SYST:ERR? drains any queued errors.
     """
@@ -84,18 +93,38 @@ class KepcoController:
         self.transport = "TELNET"
         self.connected = False
         self.last_error = ""
-        self._lock = threading.Lock()
+        self.last_identity = ""
+        self._query_timeout_count = 0
+        # Re-entrant so higher-level upload/run/stop transactions can hold the
+        # device lock while individual send_cmd/send_query helpers re-enter it.
+        self._lock = threading.RLock()
+        self._debug_logger = None
 
-    # ── connect / disconnect ───────────────────────────────────────────────
-    def connect(self, ip, port=None):
+    def set_debug_logger(self, logger_cb):
+        """Register callback(level, message) for comm/network debug logs."""
+        self._debug_logger = logger_cb
+
+    def _dbg(self, level, msg):
+        cb = self._debug_logger
+        if not cb:
+            return
+        try:
+            cb(level, msg)
+        except Exception:
+            pass
+
+    # -- connect / disconnect -----------------------------------------------
+    def connect(self, ip, port=None, validate_identity=False):
         attempts = [(port, "CUSTOM")] if port is not None else [
             (TELNET_PORT, "TELNET"),
             (SCPI_SOCKET_PORT, "SOCKET"),
         ]
         last_err = ""
+        self.last_identity = ""
         for target_port, transport in attempts:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
+                self._dbg("info", f"Connect attempt {ip}:{target_port} ({transport})")
                 s.settimeout(5)
                 s.connect((ip, target_port))
                 # Drain Telnet IAC negotiation the card sends on connect
@@ -114,18 +143,34 @@ class KepcoController:
                 self.transport = transport
                 self.connected = True
                 self.last_error = ""
+                self._query_timeout_count = 0
+                self._dbg("ok", f"Connected {ip}:{target_port} via {transport}")
+                if validate_identity:
+                    idn = self.identity()
+                    if idn is None:
+                        last_err = self.last_error or "No response to '*IDN?'"
+                        self._dbg(
+                            "warn",
+                            f"Identity check failed {ip}:{target_port} ({transport}): {last_err}",
+                        )
+                        self.disconnect()
+                        continue
+                    self.last_identity = idn
                 return True, f"Connected via {transport} ({target_port})"
             except Exception as e:
                 last_err = str(e)
+                self._dbg("warn", f"Connect failed {ip}:{target_port} ({transport}): {last_err}")
                 try:
                     s.close()
                 except Exception:
                     pass
         self.connected = False
         self.last_error = last_err
+        self._dbg("err", f"All connect attempts failed for {ip}: {last_err}")
         return False, last_err
 
     def disconnect(self):
+        self._dbg("info", f"Disconnecting from {self.ip}:{self.port} ({self.transport})")
         if self.sock:
             try:
                 self.sock.close()
@@ -133,14 +178,21 @@ class KepcoController:
                 pass
         self.sock = None
         self.connected = False
+        self._query_timeout_count = 0
+        self._dbg("info", "Disconnected")
 
     def _safe_reconnect(self):
         if not self.ip:
             return False
-        ok, _ = self.connect(self.ip, self.port)
+        self._dbg("warn", f"Attempting reconnect to {self.ip} (all transports)")
+        ok, _ = self.connect(self.ip, validate_identity=True)
+        if ok:
+            self._dbg("ok", f"Reconnect succeeded to {self.ip}:{self.port}")
+        else:
+            self._dbg("err", f"Reconnect failed to {self.ip}")
         return ok
 
-    # ── Telnet IAC filtering ──────────────────────────────────────────────
+    # -- Telnet IAC filtering ----------------------------------------------
     @staticmethod
     def _strip_iac(data: bytes) -> bytes:
         """Remove Telnet IAC (0xFF) negotiation sequences from raw bytes."""
@@ -171,7 +223,7 @@ class KepcoController:
             i += 1
         return bytes(out)
 
-    # ── socket helpers ─────────────────────────────────────────────────────
+    # -- socket helpers -----------------------------------------------------
     def _drain_echo(self):
         """Quick non-blocking drain of Telnet echo after every send_cmd.
 
@@ -179,18 +231,21 @@ class KepcoController:
         If these echo bytes are never read they accumulate in the card's
         tiny TCP send buffer (~253 bytes, PAR B.2).  When that buffer
         fills the card blocks trying to echo and can no longer read new
-        commands → deadlock / freeze.
+        commands -> deadlock / freeze.
 
-        This is intentionally very short — just long enough to pick up
+        This is intentionally very short - just long enough to pick up
         a single echo line that is already in-flight.
+
+        Returns True if any bytes were read from the device.
         """
         prev = self.sock.gettimeout()
         try:
             self.sock.settimeout(0.02)          # 20 ms
             try:
-                self.sock.recv(1024)
+                data = self.sock.recv(1024)
+                return bool(data)
             except (socket.timeout, OSError):
-                pass
+                return False
         finally:
             try:
                 self.sock.settimeout(prev)
@@ -234,6 +289,53 @@ class KepcoController:
         echo = sent_cmd.strip() if sent_cmd else None
         prev = self.sock.gettimeout()
         self.sock.settimeout(timeout)
+
+        def _clean_line(line: str):
+            """Normalize one line by removing Telnet prompt noise.
+
+            Real BIT Telnet responses can include shell-style prompt prefixes
+            like 'KEPCO ... >CMD?' or 'KEPCO ... >0,"No error"'.
+            """
+            line = line.strip()
+            if not line:
+                return None
+
+            # If a device prompt prefix exists, keep only the payload
+            # right of the last prompt marker.
+            if ">" in line:
+                tail = line.rsplit(">", 1)[1].strip()
+                if tail:
+                    line = tail
+
+            def _looks_like_scpi_command(text: str):
+                t = text.strip()
+                if not t:
+                    return False
+                up = t.upper()
+                # Keep common non-command responses.
+                if up in ("ON", "OFF", "LIST", "FIX", "VOLT", "CURR", "TRAN"):
+                    return False
+                if "NO ERROR" in up or ("," in up and '"' in up):
+                    return False
+                tok = up.split()[0]
+                if tok.endswith("?"):
+                    return True
+                if tok.startswith("*") or ":" in tok:
+                    return True
+                if tok in (
+                    "OUTP", "VOLT", "CURR", "FUNC", "LIST", "SYST",
+                    "MEAS", "INIT", "TRIG", "STAT", "FORM", "SOUR",
+                    "LOAD", "RANG",
+                ):
+                    return True
+                return False
+
+            if echo and line == echo:
+                return None
+            if _looks_like_scpi_command(line):
+                return None
+            return line or None
+
         try:
             raw = b""
             deadline = time.time() + timeout
@@ -258,21 +360,20 @@ class KepcoController:
                 trailing = parts[-1]
                 complete = parts[:-1]
                 for line in complete:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if echo and line == echo:
-                        continue          # discard echo
-                    return line
-                # Only echo / empty lines so far — keep the tail
+                    line = _clean_line(line)
+                    if line is not None:
+                        return line
+                # Only echo / empty lines so far - keep the tail
                 raw = trailing.encode("ascii", errors="ignore")
                 if len(raw) > 8192:
                     break
-            # Timeout — check anything left in buffer
+            # Timeout - check anything left in buffer
             if raw:
-                text = raw.decode("ascii", errors="ignore").strip()
-                if text and not (echo and text == echo):
-                    return text
+                text = raw.decode("ascii", errors="ignore")
+                for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                    cleaned = _clean_line(line)
+                    if cleaned is not None:
+                        return cleaned
             return None
         except ConnectionError:
             raise
@@ -286,7 +387,7 @@ class KepcoController:
             except Exception:
                 pass
 
-    # ── SCPI primitive: command (no response) ──────────────────────────────
+    # -- SCPI primitive: command (no response) ------------------------------
     def send_cmd(self, cmd):
         """Send a non-query SCPI command with mandatory pacing.
 
@@ -300,16 +401,19 @@ class KepcoController:
             return None
         with self._lock:
             try:
+                self._dbg("info", f"TX CMD: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 time.sleep(SCPI_CMD_GAP)
-                self._drain_echo()          # consume Telnet echo
+                if self.port == TELNET_PORT:
+                    self._drain_echo()  # consume Telnet echo
                 return True
             except Exception as e:
                 self.last_error = str(e)
+                self._dbg("err", f"CMD failed '{cmd}': {self.last_error}")
                 self.disconnect()
                 return None
 
-    # ── SCPI primitive: query (expects response) ──────────────────────────
+    # -- SCPI primitive: query (expects response) --------------------------
     def send_query(self, cmd, timeout=None):
         """Send a SCPI query and return the response string (or None).
 
@@ -322,40 +426,156 @@ class KepcoController:
         with self._lock:
             try:
                 self._drain_stale()
+                self._dbg("info", f"TX QRY: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 resp = self._recv_response(sent_cmd=cmd, timeout=timeout)
                 if resp is None:
+                    self._query_timeout_count += 1
                     self.last_error = f"No response to '{cmd}'"
+                    self._dbg("warn", f"RX timeout for '{cmd}' (streak={self._query_timeout_count})")
+                    if self._query_timeout_count >= 2:
+                        # Do a receive-only confirmation wait (no re-send), so
+                        # stateful queries like SYST:ERR? are not consumed twice.
+                        self._dbg("warn", f"Query timeout threshold hit; confirming link without re-send ({cmd})")
+                        confirm = self._recv_response(
+                            sent_cmd=cmd,
+                            timeout=min(timeout or RECV_TIMEOUT, 1.0),
+                        )
+                        if confirm is not None:
+                            self._query_timeout_count = 0
+                            self.last_error = ""
+                            self._dbg("ok", f"RX RESP (confirm): {cmd} -> {confirm}")
+                            return confirm
+                        self.last_error = (
+                            f"No response to '{cmd}' (connection lost)")
+                        self._dbg("err", f"Query timeout confirm failed; disconnecting ({cmd})")
+                        self.disconnect()
+                else:
+                    self._query_timeout_count = 0
+                    self._dbg("ok", f"RX RESP: {cmd} -> {resp}")
                 return resp
             except Exception as e:
                 self.last_error = str(e)
+                self._dbg("err", f"QRY failed '{cmd}': {self.last_error}")
                 self.disconnect()
                 return None
 
-    # ── backward-compat wrapper (used by Manual Override callbacks) ────────
+    # -- backward-compat wrapper (used by Manual Override callbacks) --------
     def send(self, cmd, query=False, post_delay=0.0):
         if query:
             return self.send_query(cmd)
         return self.send_cmd(cmd)
 
-    # ── synchronization helpers ────────────────────────────────────────────
+    @staticmethod
+    def format_scpi_value(value):
+        return f"{float(value):.6g}"
+
+    @classmethod
+    def limit_pair(cls, values, default_positive, default_negative):
+        if values is None:
+            return float(default_positive), float(default_negative)
+        if isinstance(values, dict):
+            pos = values.get("positive", values.get("pos", default_positive))
+            neg = values.get("negative", values.get("neg", default_negative))
+            return float(pos), float(neg)
+        if isinstance(values, (list, tuple)) and len(values) >= 2:
+            return float(values[0]), float(values[1])
+        magnitude = abs(float(values))
+        return magnitude, -magnitude
+
+    @classmethod
+    def signed_limit_cmds(cls, channel, limits, negative_limit=None):
+        if negative_limit is None:
+            if isinstance(limits, dict):
+                pos, neg = cls.limit_pair(limits, 0.0, 0.0)
+            elif isinstance(limits, (list, tuple)) and len(limits) >= 2:
+                pos, neg = cls.limit_pair(limits, limits[0], limits[1])
+            else:
+                magnitude = abs(float(limits))
+                pos, neg = magnitude, -magnitude
+        else:
+            pos, neg = float(limits), float(negative_limit)
+        return [
+            f"{channel} {cls.format_scpi_value(pos)}",
+            f"{channel} {cls.format_scpi_value(neg)}",
+        ]
+
+    @classmethod
+    def bipolar_limit_cmds(cls, channel, magnitude):
+        magnitude = abs(float(magnitude))
+        return cls.signed_limit_cmds(channel, (magnitude, -magnitude))
+
+    @classmethod
+    def default_voltage_limits(cls):
+        return (
+            DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
+            DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE,
+        )
+
+    @classmethod
+    def default_current_limits(cls):
+        return (
+            DEFAULT_POSITIVE_CURRENT_LIMIT,
+            DEFAULT_NEGATIVE_CURRENT_LIMIT,
+        )
+
+    def _log_sequence(self, label, cmds):
+        self._dbg("info", f"{label}: {'; '.join(cmds)}")
+
+    def send_sequence(self, cmds, label="SCPI sequence"):
+        cmds = [cmd for cmd in cmds if cmd]
+        if not self.connected and not self._safe_reconnect():
+            return False, "Not connected"
+        with self._lock:
+            self._log_sequence(label, cmds)
+            for cmd in cmds:
+                if self.send_cmd(cmd) is None:
+                    return False, f"{label} failed at '{cmd}': {self.last_error}"
+            return True, "OK"
+
+    def _limit_setup_cmds(self, mode, voltage_compliance=None,
+                          current_limit=None):
+        mode = (mode or "VOLT").upper()
+        if mode not in ("VOLT", "CURR"):
+            raise ValueError(f"Unsupported FUNC:MODE '{mode}'")
+        voltage_compliance = (
+            self.default_voltage_limits()
+            if voltage_compliance is None else voltage_compliance
+        )
+        current_limit = (
+            self.default_current_limits()
+            if current_limit is None else current_limit
+        )
+        cmds = [
+            f"FUNC:MODE {mode}",
+            f"{mode}:RANG 1",
+        ]
+        if mode == "CURR":
+            cmds.extend(self.signed_limit_cmds("VOLT", voltage_compliance))
+        else:
+            cmds.extend(self.signed_limit_cmds("CURR", current_limit))
+        return cmds
+
+    # -- synchronization helpers --------------------------------------------
     def sync(self):
         """Ensure all pending operations complete before next command.
 
         Sends *WAI (Wait-to-Continue, PAR A.17) which blocks the device's
         command processor until all pending operations finish.  Unlike
         *OPC? this is a *command* (no response expected) so it cannot
-        time-out waiting for a reply — far more reliable on real
+        time-out waiting for a reply - far more reliable on real
         hardware via Telnet.
         """
         return self.send_cmd("*WAI") is not None
 
-    def drain_errors(self):
-        """Read and return all queued SYST:ERR entries (stops at '0,…')."""
+    def drain_errors(self, fail_on_timeout=False):
+        """Read and return all queued SYST:ERR entries (stops at '0,...')."""
         errors = []
         for _ in range(20):
             resp = self.send_query("SYST:ERR?")
             if resp is None:
+                if fail_on_timeout:
+                    return None
                 break
             resp = resp.strip()
             if resp.startswith("0") or "No error" in resp:
@@ -366,68 +586,142 @@ class KepcoController:
     def identity(self):
         return self.send_query("*IDN?")
 
-    # ── List upload (single chunk ≤ 1000 pts) ─────────────────────────────
-    def upload_list_chunk(self, points, dwell, mode="VOLT",
-                          progress_cb=None):
-        """Upload one chunk (≤ 1000 points) with paced writes + verification.
+    @staticmethod
+    def _normalize_func_mode(mode_resp):
+        text = str(mode_resp or "").strip().upper()
+        if text == "0":
+            return "VOLT"
+        if text == "1":
+            return "CURR"
+        if text in ("VOLT", "CURR"):
+            return text
+        return None
 
-        Strategy (follows manual Figure B-2 order):
-          1. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI, LIST:DWEL
-          2. Values: send LIST:{mode} batches of ≤ 20 values each,
+    def disarm_active_list_mode(self):
+        """Return the active source to FIX only when it is in LIST mode.
+
+        Sending both VOLT:MODE FIX and CURR:MODE FIX on this hardware can
+        itself enqueue -221 "Settings conflict" errors.  Query the currently
+        active FUNC:MODE instead, inspect only that source's mode, and disarm
+        it only when a live LIST program is actually armed.
+        """
+        try:
+            active_mode = self._normalize_func_mode(self.send_query("FUNC:MODE?"))
+            if not active_mode:
+                return False, "Could not determine active FUNC:MODE"
+
+            mode_state = self.send_query(f"{active_mode}:MODE?")
+            if mode_state is None:
+                return False, (
+                    f"Could not query {active_mode}:MODE?: {self.last_error}")
+
+            mode_text = str(mode_state).strip().upper()
+            if "LIST" not in mode_text:
+                return True, "Active mode already fixed"
+
+            for cmd in [f"{active_mode} 0", f"{active_mode}:MODE FIX", "*WAI"]:
+                if self.send_cmd(cmd) is None:
+                    return False, f"Disarm '{cmd}' failed: {self.last_error}"
+            return True, f"{active_mode} LIST mode disarmed"
+        except Exception as e:
+            return False, str(e)
+
+    # -- List upload (single chunk <= 1000 pts) -----------------------------
+    def upload_list_chunk(self, points, dwell, mode="VOLT",
+                          progress_cb=None, voltage_compliance=None,
+                          current_limit=None):
+        """Upload one chunk (<= 1000 points) with paced writes + verification.
+
+                Strategy:
+                    1. Disarm: switch the active LIST program back to FIX
+                    2. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
+          3. Values: send LIST:{mode} batches of <= 20 values each,
              each followed only by the mandatory 35 ms gap
-          3. Verify: *WAI → LIST:{mode}:POIN? → SYST:ERR?
+                    4. Dwell: send LIST:DWEL once after values
+                    5. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
 
         Key change from previous revision: *OPC? is NOT used anywhere
         in the upload path.  The manual (PAR A.17) recommends *WAI for
-        sequential command synchronization — it blocks the device's
+        sequential command synchronization - it blocks the device's
         command processor (no response to time-out on).
 
         progress_cb(sent, total) is called after each batch if provided.
         """
-        if not self.connected and not self._safe_reconnect():
-            return False, "Not connected"
-        if not points:
-            return False, "Empty point list"
-        if len(points) > MAX_LIST_POINTS:
-            return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
+        with self._lock:
+            if not self.connected and not self._safe_reconnect():
+                return False, "Not connected"
+            if not points:
+                return False, "Empty point list"
+            if len(points) > MAX_LIST_POINTS:
+                return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
+            mode = (mode or "VOLT").upper()
+            if mode not in ("VOLT", "CURR"):
+                return False, f"Unsupported list mode '{mode}'"
 
-        try:
-            # ── Phase 1: Setup (order follows manual Figure B-2) ──
-            #   FUNC:MODE → RANG → LIST:CLE → *WAI → LIST:DWEL
-            # NOTE: *CLS is intentionally NOT sent here — the manual
-            # examples never use it for list operations, and it forces
-            # the card to "operation complete idle" which can confuse
-            # subsequent synchronisation on some firmware revisions.
-            setup_cmds = [
-                f"FUNC:MODE {mode}",
-                f"{mode}:RANG 1",         # full-scale (PAR 4.5.1.2)
-                "LIST:CLE",
-                "*WAI",                   # wait for LIST:CLE (PAR A.17)
-                f"LIST:DWEL {dwell:.6f}", # dwell BEFORE values (manual order)
-            ]
-            for cmd in setup_cmds:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Setup '{cmd}' failed: {self.last_error}"
+            try:
+                # Clear stale error queue first so prior test noise is not
+                # reported as a fresh upload failure.
+                self.drain_errors()
 
-            # ── Phase 2: Send list values ──
-            prefix = f"LIST:{mode} "
-            total = len(points)
-            sent = 0
-            buf = []
+                # -- Phase 1: Disarm any active LIST mode --
+                # Live waveform replacement keeps OUTP ON, so the previous
+                # waveform may still have the active source armed in LIST mode.
+                # Real hardware can reject the next LIST:CLE / LIST:{mode}
+                # sequence in that state, so unwind only the currently active
+                # LIST program first without toggling OUTP.
+                ok, msg = self.disarm_active_list_mode()
+                if not ok:
+                    return False, msg
 
-            def _fmt(v):
-                """Compact value format — matches manual's integer style."""
-                s = f"{v:.4f}"
-                if '.' in s:
-                    s = s.rstrip('0').rstrip('.')
-                return s
+                # -- Phase 2: Setup --
+                # Real hardware behavior: some BIT firmware revisions reject
+                # LIST:DWEL-before-values with -221 Settings conflict.
+                #   disarm-active-list -> FUNC:MODE -> RANG -> LIST:CLE -> *WAI
+                # NOTE: *CLS is intentionally NOT sent here - the manual
+                # examples never use it for list operations, and it forces
+                # the card to "operation complete idle" which can confuse
+                # subsequent synchronisation on some firmware revisions.
+                setup_cmds = self._limit_setup_cmds(
+                    mode, voltage_compliance, current_limit)
+                setup_cmds.extend([
+                    "LIST:CLE",
+                    "*WAI",                   # wait for LIST:CLE (PAR A.17)
+                ])
+                ok, setup_msg = self.send_sequence(
+                    setup_cmds, label=f"LIST upload setup ({mode})")
+                if not ok:
+                    return False, setup_msg
 
-            for pt in points:
-                v = _fmt(pt)
-                trial = buf + [v]
-                trial_len = len(prefix) + len(",".join(trial))
-                if (trial_len > CHUNK_CMD_LIMIT
-                        or len(trial) > LIST_VALUES_PER_CMD) and buf:
+                # -- Phase 3: Send list values --
+                prefix = f"LIST:{mode} "
+                total = len(points)
+                sent = 0
+                buf = []
+
+                def _fmt(v):
+                    """Compact value format - matches manual's integer style."""
+                    s = f"{v:.4f}"
+                    if '.' in s:
+                        s = s.rstrip('0').rstrip('.')
+                    return s
+
+                for pt in points:
+                    v = _fmt(pt)
+                    trial = buf + [v]
+                    trial_len = len(prefix) + len(",".join(trial))
+                    if (trial_len > CHUNK_CMD_LIMIT
+                            or len(trial) > LIST_VALUES_PER_CMD) and buf:
+                        if self.send_cmd(prefix + ",".join(buf)) is None:
+                            return False, (
+                                f"List send failed at pt {sent}/{total}: "
+                                f"{self.last_error}")
+                        sent += len(buf)
+                        if progress_cb:
+                            progress_cb(sent, total)
+                        buf = []
+                    buf.append(v)
+
+                if buf:
                     if self.send_cmd(prefix + ",".join(buf)) is None:
                         return False, (
                             f"List send failed at pt {sent}/{total}: "
@@ -435,82 +729,106 @@ class KepcoController:
                     sent += len(buf)
                     if progress_cb:
                         progress_cb(sent, total)
-                    buf = []
-                buf.append(v)
 
-            if buf:
-                if self.send_cmd(prefix + ",".join(buf)) is None:
-                    return False, (
-                        f"List send failed at pt {sent}/{total}: "
-                        f"{self.last_error}")
-                sent += len(buf)
-                if progress_cb:
-                    progress_cb(sent, total)
+                # Phase 4: Set dwell after values
+                if self.send_cmd(f"LIST:DWEL {dwell:.6f}") is None:
+                    return False, f"Dwell send failed: {self.last_error}"
 
-            # ── Phase 3: Verify ──
-            # *WAI ensures all LIST:{mode} values are ingested before
-            # the verification query is processed (PAR A.17).
-            if not self.sync():
-                return False, f"Post-upload *WAI failed: {self.last_error}"
+                # Phase 5: Verify
+                # *WAI ensures all LIST:{mode} values are ingested before
+                # the verification query is processed (PAR A.17).
+                if not self.sync():
+                    return False, f"Post-upload *WAI failed: {self.last_error}"
 
-            pcount_str = self.send_query(f"LIST:{mode}:POIN?")
-            if pcount_str is not None:
-                try:
-                    actual_count = int(pcount_str.strip())
-                    if actual_count != total:
-                        return False, (
-                            f"Point count mismatch: sent {total}, "
-                            f"device reports {actual_count}")
-                except ValueError:
-                    pass  # non-numeric, skip verify
+                pcount_str = self.send_query(f"LIST:{mode}:POIN?")
+                if pcount_str is not None:
+                    try:
+                        actual_count = int(pcount_str.strip())
+                        if actual_count != total:
+                            return False, (
+                                f"Point count mismatch: sent {total}, "
+                                f"device reports {actual_count}")
+                    except ValueError:
+                        pass  # non-numeric, skip verify
 
-            errors = self.drain_errors()
-            if errors:
-                return False, f"Device errors: {'; '.join(errors)}"
+                errors = self.drain_errors(fail_on_timeout=True)
+                if errors is None:
+                    return False, "SYST:ERR? timeout during verification"
+                if errors:
+                    return False, f"Device errors: {'; '.join(errors)}"
 
-            return True, (
-                f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
+                return True, (
+                    f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
 
-        except Exception as e:
-            return False, str(e)
+            except Exception as e:
+                return False, str(e)
 
-    # ── Run / Stop ─────────────────────────────────────────────────────────
-    def run_list(self, mode="VOLT", count=1):
-        """Start LIST execution: COUNT → OUTP ON → {mode}:MODE LIST.
+    # Run / Stop 
+    def run_list(self, mode="VOLT", count=1, enable_output=True,
+                 voltage_compliance=None, current_limit=None,
+                 apply_limit_setup=True):
+        """Start LIST execution.
 
-        Follows the manual's Figure B-2 sequence exactly.
+        When enable_output is True the standard sequence is:
+          setup limits -> zero fixed source -> COUNT -> OUTP ON -> {mode}:MODE LIST
+
+        When enable_output is False the current output state is preserved.  The
+        upload path has already applied limits, so live re-arms can skip the
+        fixed-source setup that can disturb an active AC waveform.
         """
-        try:
-            for cmd in [
-                f"LIST:COUN {count}",
-                "OUTP ON",
-                f"{mode}:MODE LIST",
-            ]:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Run '{cmd}' failed: {self.last_error}"
-            return True, "Running"
-        except Exception as e:
-            return False, str(e)
+        mode = (mode or "VOLT").upper()
+        if mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported list mode '{mode}'"
+        with self._lock:
+            try:
+                cmds = []
+                if apply_limit_setup:
+                    cmds.extend(self._limit_setup_cmds(
+                        mode, voltage_compliance, current_limit))
+                if enable_output:
+                    cmds.append(f"{mode} 0")
+                cmds.append(f"LIST:COUN {count}")
+                if enable_output:
+                    cmds.append("OUTP ON")
+                cmds.append(f"{mode}:MODE LIST")
 
-    def stop(self):
+                ok, run_msg = self.send_sequence(
+                    cmds,
+                    label=(
+                        f"LIST run setup ({mode})"
+                        if apply_limit_setup else f"LIST run arm ({mode})"))
+                if not ok:
+                    return False, run_msg
+
+                outp = (self.send_query("OUTP?") or "").strip().upper()
+                mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
+                if enable_output and outp not in ("1", "ON"):
+                    return False, "Run verification failed: output not enabled"
+                if mode_state and "LIST" not in mode_state:
+                    return False, (
+                        f"Run verification failed: {mode}:MODE is '{mode_state}'")
+                return True, "Running"
+            except Exception as e:
+                return False, str(e)
+
+    def stop(self, base_mode="VOLT"):
         """Stop LIST, return to safe fixed-output state."""
-        try:
-            for cmd in [
-                "VOLT:MODE FIX",
-                "CURR:MODE FIX",
-                "OUTP OFF",
-                "FUNC:MODE VOLT",
-            ]:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Stop '{cmd}' failed: {self.last_error}"
-            return True, "Stopped"
-        except Exception as e:
-            return False, str(e)
+        base_mode = (base_mode or "VOLT").upper()
+        with self._lock:
+            try:
+                for cmd in [
+                    "VOLT:MODE FIX",
+                    "CURR:MODE FIX",
+                    "OUTP OFF",
+                    f"FUNC:MODE {base_mode}",
+                ]:
+                    if self.send_cmd(cmd) is None:
+                        return False, f"Stop '{cmd}' failed: {self.last_error}"
+                return True, "Stopped"
+            except Exception as e:
+                return False, str(e)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  Network Discovery
-# ═══════════════════════════════════════════════════════════════════════════
 class Discovery:
     """Scan a /24 subnet for Kepco devices (Telnet 5024 first, then 5025)."""
 
@@ -521,6 +839,16 @@ class Discovery:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(timeout)
                 s.connect((ip_str, port))
+                if port == TELNET_PORT:
+                    # Drain Telnet IAC negotiation before sending a SCPI query.
+                    time.sleep(0.1)
+                    s.setblocking(False)
+                    try:
+                        s.recv(1024)
+                    except (BlockingIOError, OSError):
+                        pass
+                    s.setblocking(True)
+                    s.settimeout(timeout)
                 s.sendall(b"*IDN?\n")
                 resp = s.recv(512).decode("ascii", errors="ignore").strip()
                 s.close()
@@ -568,9 +896,9 @@ class Discovery:
         return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 #  Waveform Mathematics
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 class WaveformGen:
     """Generate waveform points with hardware-aware timing constraints."""
 
@@ -587,8 +915,8 @@ class WaveformGen:
         if ideal_dwell < MIN_DWELL:
             max_pts = max(2, int(period / MIN_DWELL))
             warnings.append(
-                f"Dwell {ideal_dwell*1e6:.1f} µs < min 500 µs "
-                f"→ reduced to {max_pts} pts"
+                f"Dwell {ideal_dwell*1e6:.1f} us < min 500 us "
+                f"-> reduced to {max_pts} pts"
             )
             total_points = max_pts
             ideal_dwell = period / total_points
@@ -627,33 +955,68 @@ class WaveformGen:
         return pts
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 #  Application  (Material-themed, customtkinter)
-# ═══════════════════════════════════════════════════════════════════════════
-class App:
+# ===========================================================================
+class DashboardApp:
     def __init__(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("Kepco BIT 802E — Waveform Generator")
-        self.root.geometry("1160x870")
-        self.root.minsize(980, 750)
+        self.root.title("Kepco BIT 802E - Waveform Generator")
+        self.root.geometry("1365x845")
+        self.root.minsize(1180, 760)
 
         self.kepco = KepcoController()
-        self.csv_points = None
-        self.current_points = []
-        self.is_running = False
         self.stop_event = threading.Event()
 
-        self._build_ui()
-        self._update_graph()
+        self.csv_points = None
+        self.csv_name = ""
+        self.preview_points = []
+        self.uploaded_request = None
+        self.uploaded_waveform_ready = False
+        self.current_output_on = False
+        self.sequence_active = False
+        self.is_running = False
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  UI construction
-    # ──────────────────────────────────────────────────────────────────────
+        self._connect_in_flight = False
+        self._upload_in_flight = False
+        self._output_toggle_in_flight = False
+        self._status_poll_enabled = False
+        self._status_poll_paused = False
+        self._status_poll_in_flight = False
+        self._status_poll_timer = None
+        self._measurement_guard = None
+
+        self.log_file_handle = None
+        self.log_file_path = ""
+        self.data_collection_file_handle = None
+        self.data_collection_file_path = ""
+        self.data_collection_writer = None
+        self.data_collection_started_at = None
+        self.data_collection_enabled = False
+        self._data_collection_switch_updating = False
+
+        self.current_control_mode = "VOLT"
+        self.control_mode_var = ctk.StringVar(value="VOLT")
+        self._ui_queue = queue.SimpleQueue()
+        self._ui_queue_job = None
+        self._ui_shutdown = False
+
+        self._init_log_file()
+        self.kepco.set_debug_logger(self._controller_debug_log)
+        self._build_ui()
+        self._start_ui_dispatcher()
+        self._reset_live_status()
+        self._reset_uploaded_state()
+        self._on_wave_change()
+
+        if self.log_file_path:
+            self.log(f"Session log file: {self.log_file_path}", "info")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
     def _build_ui(self):
-        # ═══ Top: connection bar ═══
         conn = ctk.CTkFrame(self.root, corner_radius=10)
         conn.pack(fill="x", padx=12, pady=(10, 4))
 
@@ -661,13 +1024,12 @@ class App:
                      font=ctk.CTkFont(size=13)).pack(side="left", padx=(14, 4))
         self.ip_var = ctk.StringVar(value="192.168.50.10")
         self.ip_combo = ctk.CTkComboBox(
-            conn, variable=self.ip_var,
-            values=["192.168.50.10"], width=200,
-            font=ctk.CTkFont(size=13))
+            conn, variable=self.ip_var, values=["192.168.50.10"],
+            width=200, font=ctk.CTkFont(size=13))
         self.ip_combo.pack(side="left", padx=4)
 
         self.scan_btn = ctk.CTkButton(
-            conn, text="⟳  Scan Network", width=140,
+            conn, text="Scan Network", width=140,
             command=self._start_scan,
             fg_color="#374151", hover_color="#4b5563",
             font=ctk.CTkFont(size=12))
@@ -680,535 +1042,1582 @@ class App:
             font=ctk.CTkFont(size=13, weight="bold"))
         self.conn_btn.pack(side="left", padx=6)
 
-        self.status_lbl = ctk.CTkLabel(conn, text="●  Disconnected",
-                                       text_color=C["red"],
-                                       font=ctk.CTkFont(size=13))
+        self.status_lbl = ctk.CTkLabel(
+            conn, text="Disconnected", text_color=C["red"],
+            font=ctk.CTkFont(size=13))
         self.status_lbl.pack(side="left", padx=14)
 
-        self.idn_lbl = ctk.CTkLabel(conn, text="", text_color=C["text2"],
-                                    font=ctk.CTkFont(size=11, slant="italic"))
+        self.idn_lbl = ctk.CTkLabel(
+            conn, text="", text_color=C["text2"],
+            font=ctk.CTkFont(size=11, slant="italic"))
         self.idn_lbl.pack(side="right", padx=14)
 
-        # ═══ Middle: Tabbed interface ═══
-        self.tabview = ctk.CTkTabview(self.root, corner_radius=12)
-        self.tabview.pack(fill="both", expand=True, padx=12, pady=4)
+        main = ctk.CTkFrame(self.root, corner_radius=12)
+        main.pack(fill="both", expand=True, padx=12, pady=4)
+        main.grid_columnconfigure(0, weight=11)
+        main.grid_columnconfigure(1, weight=9)
+        main.grid_rowconfigure(0, weight=1)
 
-        wf_tab = self.tabview.add("🔊  Waveform Generator")
-        man_tab = self.tabview.add("🔧  Manual Override")
+        left = ctk.CTkFrame(main, corner_radius=12)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
 
-        # ── Waveform Tab ──
-        wf_inner = ctk.CTkFrame(wf_tab, fg_color="transparent")
-        wf_inner.pack(fill="both", expand=True)
+        self.tabview = ctk.CTkTabview(left, corner_radius=12)
+        self.tabview.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
-        cfg = ctk.CTkFrame(wf_inner, width=290, corner_radius=12)
-        cfg.pack(side="left", fill="y", padx=(0, 6))
-        cfg.pack_propagate(False)
-
-        ctk.CTkLabel(cfg, text="Waveform Configuration",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(
-            padx=14, pady=(14, 10))
-
-        # Waveform type
-        self._lbl(cfg, "Waveform Type")
-        self.wave_var = ctk.StringVar(value="Sine")
-        self.wave_combo = ctk.CTkComboBox(
-            cfg, variable=self.wave_var,
-            values=["Sine", "Square", "Triangle", "Sawtooth", "CSV Custom"],
-            command=self._on_wave_change)
-        self.wave_combo.pack(fill="x", padx=14, pady=(0, 6))
-
-        # CSV row (initially hidden)
-        self.csv_frame = ctk.CTkFrame(cfg, fg_color="transparent")
-        self.csv_btn = ctk.CTkButton(
-            self.csv_frame, text="📂 Load CSV", width=120,
-            command=self._load_csv,
-            fg_color="#374151", hover_color="#4b5563")
-        self.csv_btn.pack(side="left", padx=(0, 8))
-        self.csv_lbl = ctk.CTkLabel(self.csv_frame, text="No file",
-                                    text_color=C["text2"],
-                                    font=ctk.CTkFont(size=11))
-        self.csv_lbl.pack(side="left")
-
-        # Numeric fields
-        self._lbl(cfg, "Frequency (Hz)")
-        self.freq_entry = ctk.CTkEntry(cfg, placeholder_text="40.0")
-        self.freq_entry.insert(0, "40.0")
-        self.freq_entry.pack(fill="x", padx=14, pady=(0, 6))
-
-        self._lbl(cfg, "Amplitude (V / A)")
-        self.amp_entry = ctk.CTkEntry(cfg, placeholder_text="10.0")
-        self.amp_entry.insert(0, "10.0")
-        self.amp_entry.pack(fill="x", padx=14, pady=(0, 6))
-
-        self._lbl(cfg, "Offset (V / A)")
-        self.off_entry = ctk.CTkEntry(cfg, placeholder_text="0.0")
-        self.off_entry.insert(0, "0.0")
-        self.off_entry.pack(fill="x", padx=14, pady=(0, 6))
-
-        self._lbl(cfg, "Total Points (max 4000)")
-        self.pts_entry = ctk.CTkEntry(cfg, placeholder_text="1000")
-        self.pts_entry.insert(0, "1000")
-        self.pts_entry.pack(fill="x", padx=14, pady=(0, 6))
-
-        self._lbl(cfg, "Loop Count (0 = infinite)")
-        self.loop_entry = ctk.CTkEntry(cfg, placeholder_text="0")
-        self.loop_entry.insert(0, "0")
-        self.loop_entry.pack(fill="x", padx=14, pady=(0, 6))
-
-        self._lbl(cfg, "Output Mode")
-        mode_f = ctk.CTkFrame(cfg, fg_color="transparent")
-        mode_f.pack(fill="x", padx=14, pady=(0, 8))
-        self.mode_var = ctk.StringVar(value="VOLT")
-        ctk.CTkRadioButton(mode_f, text="Voltage",
-                           variable=self.mode_var, value="VOLT").pack(
-            side="left", padx=(0, 18))
-        ctk.CTkRadioButton(mode_f, text="Current",
-                           variable=self.mode_var, value="CURR").pack(
-            side="left")
-
-        # Preview
-        ctk.CTkButton(cfg, text="Preview Waveform",
-                      command=self._preview,
-                      fg_color="#374151", hover_color="#4b5563",
-                      font=ctk.CTkFont(size=12)).pack(
-            fill="x", padx=14, pady=(6, 4))
-
-        # Timing info
-        self.timing_lbl = ctk.CTkLabel(
-            cfg, text="", text_color=C["amber"],
-            font=ctk.CTkFont(size=11), wraplength=260, justify="left")
-        self.timing_lbl.pack(fill="x", padx=14, pady=(4, 10))
-
-        # ── Right: graph ──
-        graph_outer = ctk.CTkFrame(wf_inner, corner_radius=12)
-        graph_outer.pack(side="left", fill="both", expand=True)
-
-        self.fig = Figure(figsize=(7, 4), dpi=100, facecolor=C["graph_bg"])
-        self.ax = self.fig.add_subplot(111)
-        self._style_ax()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_outer)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
-
-        # ── Manual Override Tab ──
+        wf_tab = self.tabview.add("Waveform Generator")
+        man_tab = self.tabview.add("Manual Override")
+        self._build_waveform_tab(wf_tab)
         self._build_manual_tab(man_tab)
 
-        # ═══ Bottom: controls + progress ═══
-        bot = ctk.CTkFrame(self.root, corner_radius=10)
-        bot.pack(fill="x", padx=12, pady=(4, 4))
+        right = ctk.CTkFrame(main, corner_radius=12)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        self._build_status_panel(right)
 
-        self.run_btn = ctk.CTkButton(
-            bot, text="▶  Upload & Run", width=170,
-            command=self._run, fg_color=C["green"], hover_color="#059669",
-            text_color="#000", font=ctk.CTkFont(size=14, weight="bold"))
-        self.run_btn.pack(side="left", padx=(14, 8), pady=10)
-
-        self.stop_btn = ctk.CTkButton(
-            bot, text="■  Stop", width=110,
-            command=self._stop, fg_color=C["red"], hover_color="#dc2626",
-            font=ctk.CTkFont(size=14, weight="bold"))
-        self.stop_btn.pack(side="left", padx=8, pady=10)
-
-        self.prog_lbl = ctk.CTkLabel(bot, text="Idle",
-                                     text_color=C["text2"],
-                                     font=ctk.CTkFont(size=12))
-        self.prog_lbl.pack(side="left", padx=20)
-
-        self.progress = ctk.CTkProgressBar(bot, width=220)
-        self.progress.pack(side="left", padx=8, pady=10)
-        self.progress.set(0)
-
-        # ═══ Log ═══
         log_wrap = ctk.CTkFrame(self.root, corner_radius=10)
         log_wrap.pack(fill="both", padx=12, pady=(0, 10))
-
         self.log_text = ctk.CTkTextbox(
             log_wrap, height=120,
             font=ctk.CTkFont(family="Consolas", size=11),
             activate_scrollbars=True)
         self.log_text.pack(fill="both", padx=6, pady=6, expand=True)
 
-    # ── helpers ────────────────────────────────────────────────────────────
+    def _build_waveform_tab(self, parent):
+        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ctk.CTkLabel(
+            outer, text="Control Panel",
+            font=ctk.CTkFont(size=18, weight="bold")).pack(
+            anchor="w", padx=6, pady=(4, 10))
+
+        body = ctk.CTkFrame(outer, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=5)
+        body.grid_columnconfigure(1, weight=3)
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=0)
+
+        preview_card = ctk.CTkFrame(body, corner_radius=12)
+        preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 6))
+        ctk.CTkLabel(
+            preview_card, text="Preview Waveform",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 8))
+        preview_plot_wrap = ctk.CTkFrame(
+            preview_card, corner_radius=10, fg_color=C["graph_bg"])
+        preview_plot_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self.preview_fig, self.preview_ax, self.preview_canvas = self._build_plot(
+            preview_plot_wrap, (6.6, 3.8))
+
+        cfg = ctk.CTkFrame(body, width=285, corner_radius=12)
+        cfg.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
+
+        ctk.CTkLabel(
+            cfg, text="Waveform Configuration",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            padx=14, pady=(14, 10))
+
+        self._lbl(cfg, "Waveform Type")
+        self.wave_var = ctk.StringVar(value="Sine")
+        self.wave_combo = ctk.CTkComboBox(
+            cfg, variable=self.wave_var,
+            values=["DC", "Sine", "Square", "Triangle",
+                    "Sawtooth", "CSV Custom (untested)"],
+            command=self._on_wave_change)
+        self.wave_combo.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.csv_frame = ctk.CTkFrame(cfg, fg_color="transparent")
+        self.csv_btn = ctk.CTkButton(
+            self.csv_frame, text="Load CSV", width=110,
+            command=self._load_csv,
+            fg_color="#374151", hover_color="#4b5563")
+        self.csv_btn.pack(side="left", padx=(0, 8))
+        self.csv_lbl = ctk.CTkLabel(
+            self.csv_frame, text="No file",
+            text_color=C["text2"], font=ctk.CTkFont(size=11))
+        self.csv_lbl.pack(side="left")
+
+        self.freq_label = self._lbl(cfg, "Frequency (Hz)")
+        self.freq_entry = ctk.CTkEntry(cfg, placeholder_text="40.0")
+        self.freq_entry.insert(0, "40.0")
+        self.freq_entry.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.amp_label = self._lbl(cfg, "Amplitude (V / A)")
+        self.amp_entry = ctk.CTkEntry(cfg, placeholder_text="10.0")
+        self.amp_entry.insert(0, "10.0")
+        self.amp_entry.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.off_label = self._lbl(cfg, "Offset (V / A)")
+        self.off_entry = ctk.CTkEntry(cfg, placeholder_text="0.0")
+        self.off_entry.insert(0, "0.0")
+        self.off_entry.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.pts_label = self._lbl(cfg, "Total Points (max 4000)")
+        self.pts_entry = ctk.CTkEntry(cfg, placeholder_text="1000")
+        self.pts_entry.insert(0, "1000")
+        self.pts_entry.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.loop_label = self._lbl(cfg, "Loop Count (0 = infinite)")
+        self.loop_entry = ctk.CTkEntry(cfg, placeholder_text="0")
+        self.loop_entry.insert(0, "0")
+        self.loop_entry.pack(fill="x", padx=14, pady=(0, 8))
+
+        ctk.CTkButton(
+            cfg, text="Preview Waveform", command=self._preview,
+            fg_color="#374151", hover_color="#4b5563",
+            font=ctk.CTkFont(size=12)).pack(
+            fill="x", padx=14, pady=(4, 4))
+
+        self.timing_lbl = ctk.CTkLabel(
+            cfg, text="", text_color=C["amber"],
+            font=ctk.CTkFont(size=11), wraplength=250, justify="left")
+        self.timing_lbl.pack(fill="x", padx=14, pady=(4, 12))
+
+        footer = ctk.CTkFrame(body, corner_radius=14)
+        footer.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        footer.grid_columnconfigure(0, weight=1)
+        footer.grid_columnconfigure(1, weight=0)
+
+        left_controls = ctk.CTkFrame(footer, fg_color="transparent")
+        left_controls.grid(row=0, column=0, sticky="ew", padx=(14, 12), pady=12)
+        left_controls.grid_columnconfigure(1, weight=1)
+
+        self.upload_btn = ctk.CTkButton(
+            left_controls, text="Upload", width=150, height=42,
+            command=self._upload_waveform,
+            fg_color=C["green"], hover_color="#059669",
+            text_color="#000", font=ctk.CTkFont(size=14, weight="bold"))
+        self.upload_btn.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(0, 14))
+        self.prog_lbl = ctk.CTkLabel(
+            left_controls, text="No upload yet",
+            text_color=C["text2"], font=ctk.CTkFont(size=12, weight="bold"))
+        self.prog_lbl.grid(row=0, column=1, sticky="w", pady=(1, 6))
+        self.progress = ctk.CTkProgressBar(left_controls, height=14)
+        self.progress.grid(row=1, column=1, sticky="ew")
+        self.progress.set(0)
+        self.data_collection_switch = ctk.CTkSwitch(
+            left_controls, text="Collect data", width=150,
+            command=self._toggle_data_collection,
+            switch_width=34, switch_height=18,
+            progress_color=C["amber"], text_color=C["text2"],
+            font=ctk.CTkFont(size=11))
+        self.data_collection_switch.grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        switch_card = ctk.CTkFrame(footer, width=290, height=144, corner_radius=12)
+        switch_card.grid(row=0, column=1, sticky="ns", padx=(0, 14), pady=10)
+        switch_card.pack_propagate(False)
+        switch_row = ctk.CTkFrame(switch_card, fg_color="transparent")
+        switch_row.pack(fill="x", padx=18, pady=(16, 8))
+        ctk.CTkLabel(
+            switch_row, text="Output Control",
+            font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
+        self.output_state_badge = ctk.CTkLabel(
+            switch_row, text="OFFLINE", width=78, height=24, corner_radius=12,
+            fg_color=C["red"], font=ctk.CTkFont(size=11, weight="bold"))
+        self.output_state_badge.pack(side="right")
+        self.output_summary_lbl = ctk.CTkLabel(
+            switch_card, text="Disconnected",
+            text_color=C["text2"], anchor="w",
+            font=ctk.CTkFont(size=12))
+        self.output_summary_lbl.pack(fill="x", padx=18, pady=(0, 10))
+        self.output_toggle_btn = ctk.CTkButton(
+            switch_card, text="Connect to Arm Output",
+            command=self._toggle_output, height=48,
+            corner_radius=10, font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#374151", hover_color="#4b5563")
+        self.output_toggle_btn.pack(fill="x", padx=18)
+        self.output_hint_lbl = ctk.CTkLabel(
+            switch_card, text="Upload a waveform to enable output.",
+            text_color=C["text2"], wraplength=250,
+            justify="left", font=ctk.CTkFont(size=11))
+        self.output_hint_lbl.pack(fill="x", padx=18, pady=(10, 14))
+
+    def _build_manual_tab(self, parent):
+        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ctk.CTkLabel(
+            outer, text="Config/Override Panel",
+            font=ctk.CTkFont(size=18, weight="bold")).pack(
+            anchor="w", padx=6, pady=(4, 10))
+
+        console = ctk.CTkFrame(outer, corner_radius=12)
+        console.pack(fill="both", expand=True, pady=(0, 10))
+
+        ctk.CTkLabel(
+            console, text="Manual Command Console",
+            font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 4))
+        ctk.CTkLabel(
+            console,
+            text="Enter any SCPI command/query, or use quick commands below.",
+            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
+            anchor="w", padx=14, pady=(0, 8))
+
+        scpi_row = ctk.CTkFrame(console, fg_color="transparent")
+        scpi_row.pack(fill="x", padx=14, pady=(0, 6))
+        ctk.CTkLabel(
+            scpi_row, text="CMD:",
+            font=ctk.CTkFont(family="Consolas", size=12)).pack(
+            side="left", padx=(0, 4))
+        self.scpi_entry = ctk.CTkEntry(
+            scpi_row, placeholder_text="e.g. *IDN? or FUNC:MODE CURR",
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self.scpi_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.scpi_entry.bind("<Return>", lambda _e: self._man_send_scpi())
+        ctk.CTkButton(
+            scpi_row, text="Send", width=80, command=self._man_send_scpi,
+            fg_color=C["primary"], hover_color=C["primary_h"]).pack(
+            side="left", padx=4)
+
+        quick_row = ctk.CTkFrame(console, fg_color="transparent")
+        quick_row.pack(fill="x", padx=14, pady=(0, 4))
+        for label, cmd in [
+            ("*IDN?", "*IDN?"),
+            ("SYST:ERR?", "SYST:ERR?"),
+            ("OUTP?", "OUTP?"),
+            ("MEAS:VOLT?", "MEAS:VOLT?"),
+            ("MEAS:CURR?", "MEAS:CURR?"),
+        ]:
+            ctk.CTkButton(
+                quick_row, text=label, width=98,
+                command=lambda c=cmd: self._man_send_preset(c),
+                fg_color="#374151", hover_color="#4b5563").pack(
+                side="left", padx=(0, 6))
+
+        quick_row2 = ctk.CTkFrame(console, fg_color="transparent")
+        quick_row2.pack(fill="x", padx=14, pady=(0, 6))
+        for label, cmd in [
+            ("*OPC?", "*OPC?"),
+            ("FUNC:MODE?", "FUNC:MODE?"),
+            ("LIST:VOLT:POIN?", "LIST:VOLT:POIN?"),
+            ("LIST:CURR:POIN?", "LIST:CURR:POIN?"),
+        ]:
+            ctk.CTkButton(
+                quick_row2, text=label, width=118,
+                command=lambda c=cmd: self._man_send_preset(c),
+                fg_color="#374151", hover_color="#4b5563").pack(
+                side="left", padx=(0, 6))
+
+        scpi_ctrl = ctk.CTkFrame(console, fg_color="transparent")
+        scpi_ctrl.pack(fill="x", padx=14, pady=(0, 4))
+        ctk.CTkButton(
+            scpi_ctrl, text="Health Check", width=120,
+            command=self._man_health_check,
+            fg_color="#374151", hover_color="#4b5563").pack(
+            side="left", padx=(0, 8))
+        ctk.CTkButton(
+            scpi_ctrl, text="Clear Console", width=120,
+            command=self._man_clear_scpi,
+            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+
+        self.scpi_resp = ctk.CTkTextbox(
+            console, height=150,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            activate_scrollbars=True)
+        self.scpi_resp.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+
+        cards = ctk.CTkFrame(outer, fg_color="transparent")
+        cards.pack(fill="x")
+        cards.grid_columnconfigure(0, weight=1)
+        cards.grid_columnconfigure(1, weight=1)
+        cards.grid_columnconfigure(2, weight=1)
+
+        mode_card = ctk.CTkFrame(cards, corner_radius=12)
+        mode_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(
+            mode_card, text="Set Control Mode",
+            font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 6))
+        mode_row = ctk.CTkFrame(mode_card, fg_color="transparent")
+        mode_row.pack(fill="x", padx=14, pady=(0, 10))
+        self.mode_buttons = {}
+        for mode in ("VOLT", "CURR"):
+            btn = ctk.CTkButton(
+                mode_row, text="Voltage" if mode == "VOLT" else "Current",
+                width=100,
+                command=lambda m=mode: self._select_control_mode(m))
+            btn.pack(side="left", padx=(0, 8))
+            self.mode_buttons[mode] = btn
+        ctk.CTkLabel(
+            mode_card, text="Waveform uploads use the selected mode.",
+            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
+            anchor="w", padx=14, pady=(0, 12))
+
+        limits_card = ctk.CTkFrame(cards, corner_radius=12)
+        limits_card.grid(row=0, column=1, sticky="nsew", padx=4)
+        ctk.CTkLabel(
+            limits_card, text="Set V/I Limits",
+            font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 6))
+
+        v_row = ctk.CTkFrame(limits_card, fg_color="transparent")
+        v_row.pack(fill="x", padx=14, pady=(0, 6))
+        ctk.CTkLabel(v_row, text="Voltage limit (V):",
+                     anchor="w", wraplength=220).pack(fill="x")
+        v_ctrl = ctk.CTkFrame(v_row, fg_color="transparent")
+        v_ctrl.pack(fill="x", pady=(3, 0))
+        ctk.CTkLabel(v_ctrl, text="+", width=14).pack(side="left")
+        self.soft_volt_pos_limit_entry = ctk.CTkEntry(v_ctrl, width=68)
+        self.soft_volt_pos_limit_entry.insert(
+            0, str(DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE))
+        self.soft_volt_pos_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(v_ctrl, text="-", width=14).pack(side="left")
+        self.soft_volt_neg_limit_entry = ctk.CTkEntry(v_ctrl, width=68)
+        self.soft_volt_neg_limit_entry.insert(
+            0, str(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE))
+        self.soft_volt_neg_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            v_ctrl, text="Set", width=54,
+            command=lambda: self._set_software_limit("VOLT"),
+            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+
+        c_row = ctk.CTkFrame(limits_card, fg_color="transparent")
+        c_row.pack(fill="x", padx=14, pady=(0, 12))
+        ctk.CTkLabel(c_row, text="Current limit (A):",
+                     anchor="w", wraplength=220).pack(fill="x")
+        c_ctrl = ctk.CTkFrame(c_row, fg_color="transparent")
+        c_ctrl.pack(fill="x", pady=(3, 0))
+        ctk.CTkLabel(c_ctrl, text="+", width=14).pack(side="left")
+        self.soft_curr_pos_limit_entry = ctk.CTkEntry(c_ctrl, width=68)
+        self.soft_curr_pos_limit_entry.insert(
+            0, str(DEFAULT_POSITIVE_CURRENT_LIMIT))
+        self.soft_curr_pos_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(c_ctrl, text="-", width=14).pack(side="left")
+        self.soft_curr_neg_limit_entry = ctk.CTkEntry(c_ctrl, width=68)
+        self.soft_curr_neg_limit_entry.insert(
+            0, str(DEFAULT_NEGATIVE_CURRENT_LIMIT))
+        self.soft_curr_neg_limit_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            c_ctrl, text="Set", width=54,
+            command=lambda: self._set_software_limit("CURR"),
+            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+
+        range_card = ctk.CTkFrame(cards, corner_radius=12)
+        range_card.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        ctk.CTkLabel(
+            range_card, text="Range Control",
+            font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 6))
+        ctk.CTkLabel(
+            range_card, text="Full-scale avoids quarter-scale transients.",
+            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
+            anchor="w", padx=14, pady=(0, 8))
+        range_row = ctk.CTkFrame(range_card, fg_color="transparent")
+        range_row.pack(fill="x", padx=14, pady=(0, 10))
+        self.man_range_var = ctk.StringVar(value="Auto")
+        self.man_range_combo = ctk.CTkComboBox(
+            range_row, variable=self.man_range_var,
+            values=["Auto", "Full Scale", "Quarter Scale"],
+            width=150)
+        self.man_range_combo.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            range_row, text="Set", width=60,
+            command=self._man_set_range,
+            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+        ctk.CTkFrame(range_card, height=2, fg_color=C["border"]).pack(
+            fill="x", padx=14, pady=(2, 10))
+        ctk.CTkButton(
+            range_card, text="Reset Device (*RST)",
+            command=self._man_reset,
+            fg_color=C["red"], hover_color="#dc2626",
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            fill="x", padx=14, pady=(0, 14))
+
+        self._update_mode_buttons(self.control_mode_var.get())
+
+    def _build_status_panel(self, parent):
+        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            outer, text="Status Panel",
+            font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=6, pady=(4, 10))
+
+        content = ctk.CTkFrame(outer, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=4)
+        content.grid_columnconfigure(1, weight=2)
+        content.grid_rowconfigure(0, weight=3)
+        content.grid_rowconfigure(1, weight=2)
+
+        plot_card = ctk.CTkFrame(content, corner_radius=12)
+        plot_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        ctk.CTkLabel(
+            plot_card, text="Active/Uploaded Waveform",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 8))
+        status_plot_wrap = ctk.CTkFrame(
+            plot_card, corner_radius=10, fg_color=C["graph_bg"])
+        status_plot_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.status_fig, self.status_ax, self.status_canvas = self._build_plot(
+            status_plot_wrap, (5.3, 3.2))
+
+        cfg_card = ctk.CTkFrame(content, corner_radius=12)
+        cfg_card.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
+        ctk.CTkLabel(
+            cfg_card, text="Waveform Configuration",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 8))
+        self.status_cfg_labels = {}
+        for key, title in [
+            ("wave", "Waveform Type"),
+            ("mode", "Control Mode"),
+            ("frequency", "Frequency"),
+            ("amplitude", "Amplitude / Value"),
+            ("offset", "Offset"),
+            ("points", "Total Points"),
+            ("loop", "Loop Count"),
+            ("device_state", "Device State"),
+        ]:
+            row = ctk.CTkFrame(cfg_card, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=(0, 5))
+            ctk.CTkLabel(
+                row, text=title, text_color=C["text2"],
+                font=ctk.CTkFont(size=11), width=110, anchor="w").pack(side="left")
+            value = ctk.CTkLabel(
+                row, text="--", font=ctk.CTkFont(size=11),
+                justify="left", anchor="w")
+            value.pack(side="left", fill="x", expand=True)
+            self.status_cfg_labels[key] = value
+
+        meas_card = ctk.CTkFrame(content, corner_radius=12, fg_color=C["graph_bg"])
+        meas_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        ctk.CTkLabel(
+            meas_card, text="Live Measurements",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=20, pady=(14, 8))
+        self.status_meas_volt_lbl = ctk.CTkLabel(
+            meas_card, text="Voltage:  ---.----  V",
+            font=ctk.CTkFont(family="Consolas", size=20),
+            text_color="#60a5fa")
+        self.status_meas_volt_lbl.pack(anchor="w", padx=20, pady=(6, 4))
+        self.status_meas_curr_lbl = ctk.CTkLabel(
+            meas_card, text="Current:  ---.----  A",
+            font=ctk.CTkFont(family="Consolas", size=20),
+            text_color="#34d399")
+        self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
+        self.status_meas_warn_lbl = ctk.CTkLabel(
+            meas_card,
+            text="",
+            height=30,
+            justify="left",
+            anchor="w",
+            wraplength=340,
+            text_color=C["amber"],
+            font=ctk.CTkFont(size=11, weight="bold"))
+        self.status_meas_warn_lbl.pack(fill="x", padx=20, pady=(0, 14))
+
+        info_card = ctk.CTkFrame(content, corner_radius=12)
+        info_card.grid(row=1, column=1, sticky="nsew")
+        ctk.CTkLabel(
+            info_card, text="Output Status",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=18, pady=(18, 8))
+        out_row = ctk.CTkFrame(info_card, fg_color="transparent")
+        out_row.pack(fill="x", padx=18, pady=(0, 20))
+        self.status_output_pill = ctk.CTkLabel(
+            out_row, text="OFF", width=72, height=34,
+            corner_radius=6, fg_color=C["red"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=13, weight="bold"))
+        self.status_output_pill.pack(side="left")
+
+        ctk.CTkLabel(
+            info_card, text="Control Mode",
+            font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=18, pady=(0, 8))
+        mode_row = ctk.CTkFrame(info_card, fg_color="transparent")
+        mode_row.pack(fill="x", padx=18, pady=(0, 18))
+        self.status_mode_labels = {}
+        for mode, label in (("VOLT", "Volt"), ("CURR", "Curr")):
+            pill = ctk.CTkLabel(
+                mode_row, text=label, width=72, height=34,
+                corner_radius=6, fg_color=C["card"],
+                font=ctk.CTkFont(size=13, weight="bold"))
+            pill.pack(side="left", padx=(0, 8))
+            self.status_mode_labels[mode] = pill
+
+    def _build_plot(self, parent, figsize):
+        fig = Figure(figsize=figsize, dpi=100, facecolor=C["graph_bg"])
+        ax = fig.add_subplot(111)
+        self._style_ax(ax)
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        return fig, ax, canvas
+
+    def _style_ax(self, ax):
+        ax.set_facecolor(C["graph_bg"])
+        for spine in ax.spines.values():
+            spine.set_color(C["border"])
+        ax.tick_params(colors=C["text2"], labelsize=9)
+        ax.xaxis.label.set_color(C["text2"])
+        ax.yaxis.label.set_color(C["text2"])
+        ax.grid(True, color="#2a2a40", linewidth=0.5, alpha=0.6)
+
+    def _draw_waveform_plot(self, fig, ax, canvas, points=None, chunk_idx=-1,
+                            empty_title="No waveform uploaded"):
+        ax.clear()
+        self._style_ax(ax)
+        ax.set_xlabel("Sample Index")
+        ax.set_ylabel("Amplitude (V / A)")
+
+        if not points:
+            ax.set_title(empty_title, color=C["text2"], fontsize=11)
+            fig.tight_layout(pad=1.2)
+            canvas.draw_idle()
+            return
+
+        chunk_sz = MAX_LIST_POINTS
+        chunks = [points[i:i + chunk_sz] for i in range(0, len(points), chunk_sz)]
+        colors = C["chunk_colors"]
+
+        for ci, chunk in enumerate(chunks):
+            start = ci * chunk_sz
+            xs = list(range(start, start + len(chunk)))
+            color = colors[ci % len(colors)]
+            lw = 1.3
+            alpha = 1.0
+
+            if chunk_idx >= 0:
+                if ci < chunk_idx:
+                    alpha = 0.30
+                elif ci == chunk_idx:
+                    color = C["sent"]
+                    lw = 2.8
+                else:
+                    alpha = 0.45
+
+            ax.plot(xs, chunk, color=color, linewidth=lw, alpha=alpha)
+
+        if len(chunks) > 1:
+            for ci in range(1, len(chunks)):
+                ax.axvline(ci * chunk_sz, color=C["border"],
+                           linestyle="--", linewidth=0.7, alpha=0.6)
+            if chunk_idx < 0:
+                handles = [
+                    mlines.Line2D(
+                        [], [], color=colors[i % len(colors)], linewidth=2,
+                        label=f"Chunk {i + 1} ({len(chunks[i])} pts)")
+                    for i in range(len(chunks))
+                ]
+                ax.legend(handles=handles, fontsize=8, loc="upper right",
+                          facecolor=C["card"], edgecolor=C["border"],
+                          labelcolor=C["text2"])
+
+        title = (
+            f"Waveform - {len(points)} points, {len(chunks)} chunk(s)"
+            if chunk_idx < 0
+            else f"Uploading chunk {chunk_idx + 1}/{len(chunks)}"
+        )
+        ax.set_title(title, color=C["text"], fontsize=11)
+        fig.tight_layout(pad=1.2)
+        canvas.draw_idle()
+
+    def _update_preview_plot(self, points=None):
+        self._draw_waveform_plot(
+            self.preview_fig, self.preview_ax, self.preview_canvas,
+            points=points, empty_title="No waveform - configure and preview")
+
+    def _update_status_plot(self, points=None, chunk_idx=-1):
+        self._draw_waveform_plot(
+            self.status_fig, self.status_ax, self.status_canvas,
+            points=points, chunk_idx=chunk_idx,
+            empty_title="No waveform uploaded")
+
     @staticmethod
     def _lbl(parent, text):
-        ctk.CTkLabel(parent, text=text, text_color=C["text2"],
-                     font=ctk.CTkFont(size=12)).pack(
-            anchor="w", padx=14, pady=(6, 1))
+        label = ctk.CTkLabel(
+            parent, text=text, text_color=C["text2"],
+            font=ctk.CTkFont(size=12))
+        label.pack(anchor="w", padx=14, pady=(6, 1))
+        return label
+
+    def _init_log_file(self):
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.log_file_path = os.path.join(
+                log_dir, f"kepco_dashboard_date_{stamp}.log")
+            self.log_file_handle = open(
+                self.log_file_path, "a", encoding="utf-8")
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log started\n")
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+            self.log_file_path = ""
+
+    def _write_log_file_line(self, ts, tag, msg):
+        if not self.log_file_handle:
+            return
+        try:
+            self.log_file_handle.write(f"[{ts}] [{tag.upper()}] {msg}\n")
+            self.log_file_handle.flush()
+        except Exception:
+            self.log_file_handle = None
+
+    def _close_log_file(self):
+        if not self.log_file_handle:
+            return
+        try:
+            self.log_file_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Log closed\n")
+            self.log_file_handle.flush()
+            self.log_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.log_file_handle = None
+
+    def _toggle_data_collection(self):
+        if self._data_collection_switch_updating:
+            return
+
+        if self.data_collection_switch.get():
+            if not self._start_data_collection():
+                self._set_data_collection_switch(False)
+        else:
+            self._stop_data_collection()
+
+    def _set_data_collection_switch(self, selected):
+        if not hasattr(self, "data_collection_switch"):
+            return
+        self._data_collection_switch_updating = True
+        try:
+            if selected:
+                self.data_collection_switch.select()
+            else:
+                self.data_collection_switch.deselect()
+        finally:
+            self._data_collection_switch_updating = False
+
+    def _start_data_collection(self):
+        if self.data_collection_file_handle:
+            self.data_collection_enabled = True
+            return True
+
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H%M%S")
+            self.data_collection_file_path = os.path.join(
+                log_dir, f"kepco_readback_collection_date_{stamp}.csv")
+            self.data_collection_file_handle = open(
+                self.data_collection_file_path, "a",
+                encoding="utf-8", newline="")
+            self.data_collection_writer = csv.writer(
+                self.data_collection_file_handle)
+            self.data_collection_writer.writerow([
+                "timestamp",
+                "elapsed_s",
+                "readback_voltage_v",
+                "readback_current_a",
+                "output_state",
+                "mode",
+            ])
+            self.data_collection_file_handle.flush()
+            self.data_collection_started_at = time.time()
+            self.data_collection_enabled = True
+            self.log(
+                f"Data collection enabled: {self.data_collection_file_path}",
+                "ok")
+            return True
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self.log(f"Data collection failed: {exc}", "err")
+            messagebox.showerror(
+                "Data Collection",
+                f"Could not start data collection.\n{exc}")
+            return False
+
+    def _stop_data_collection(self, log_message=True):
+        was_enabled = (
+            self.data_collection_enabled
+            or self.data_collection_file_handle is not None
+        )
+        path = self.data_collection_file_path
+        self.data_collection_enabled = False
+        self._close_data_collection_file()
+        if log_message and was_enabled and path:
+            self.log(f"Data collection disabled: {path}", "info")
+
+    def _close_data_collection_file(self):
+        try:
+            if self.data_collection_file_handle:
+                self.data_collection_file_handle.flush()
+                self.data_collection_file_handle.close()
+        except Exception:
+            pass
+        finally:
+            self.data_collection_file_handle = None
+            self.data_collection_file_path = ""
+            self.data_collection_writer = None
+            self.data_collection_started_at = None
+
+    def _record_data_collection_sample(self, v, c, outp, mode):
+        if (
+            not self.data_collection_enabled
+            or not self.data_collection_writer
+            or not self.data_collection_file_handle
+        ):
+            return
+
+        try:
+            now = time.time()
+            started_at = self.data_collection_started_at or now
+            voltage = self._as_float(v)
+            current = self._as_float(c)
+            output_text = str(outp).strip().upper()
+            if output_text in ("1", "ON"):
+                output_text = "ON"
+            elif output_text in ("0", "OFF"):
+                output_text = "OFF"
+
+            mode_text = str(mode).strip().upper()
+            if mode_text == "0":
+                mode_text = "VOLT"
+            elif mode_text == "1":
+                mode_text = "CURR"
+
+            self.data_collection_writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{now - started_at:.3f}",
+                voltage if voltage is not None else str(v).strip(),
+                current if current is not None else str(c).strip(),
+                output_text,
+                mode_text,
+            ])
+            self.data_collection_file_handle.flush()
+        except Exception as exc:
+            self.data_collection_enabled = False
+            self._close_data_collection_file()
+            self._set_data_collection_switch(False)
+            self.log(f"Data collection stopped: {exc}", "err")
+
+    def _start_ui_dispatcher(self):
+        if self._ui_shutdown or self._ui_queue_job is not None:
+            return
+        self._ui_queue_job = self.root.after(20, self._drain_ui_queue)
+
+    def _drain_ui_queue(self):
+        self._ui_queue_job = None
+        if self._ui_shutdown:
+            return
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            callback()
+        self._start_ui_dispatcher()
+
+    def _stop_ui_dispatcher(self):
+        self._ui_shutdown = True
+        if self._ui_queue_job:
+            try:
+                self.root.after_cancel(self._ui_queue_job)
+            except Exception:
+                pass
+            self._ui_queue_job = None
+        while True:
+            try:
+                self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _call_on_ui(self, callback):
+        if self._ui_shutdown:
+            return False
+        if threading.current_thread() is threading.main_thread():
+            callback()
+            return True
+        self._ui_queue.put(callback)
+        return True
 
     def log(self, msg, tag="info"):
         ts = time.strftime("%H:%M:%S")
-        sym = {"info": "ℹ", "ok": "✓", "warn": "⚠", "err": "✗"}.get(tag, "·")
-        self.log_text.insert("end", f"[{ts}] {sym}  {msg}\n")
+        sym = {"info": "[i]", "ok": "[ok]", "warn": "[!]", "err": "[x]"}.get(tag, "[.]")
+        self.log_text.insert("end", f"[{ts}] {sym} {msg}\n")
         self.log_text.see("end")
+        self._write_log_file_line(ts, tag, msg)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Manual Override Tab
-    # ──────────────────────────────────────────────────────────────────────
-    def _build_manual_tab(self, parent):
-        outer = ctk.CTkFrame(parent, fg_color="transparent")
-        outer.pack(fill="both", expand=True)
+    def _controller_debug_log(self, level, msg):
+        tag = "info"
+        if level == "ok":
+            tag = "ok"
+        elif level == "warn":
+            tag = "warn"
+        elif level == "err":
+            tag = "err"
 
-        # ── Left column: Output & Set Values ──
-        left = ctk.CTkScrollableFrame(outer, width=310, corner_radius=12)
-        left.pack(side="left", fill="y", padx=(0, 6), pady=0)
+        if threading.current_thread() is threading.main_thread():
+            self.log(f"[COMM] {msg}", tag)
+        else:
+            self._call_on_ui(lambda: self.log(f"[COMM] {msg}", tag))
 
-        ctk.CTkLabel(left, text="Output Control",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(
-            padx=14, pady=(10, 8))
+    def _log_safe(self, msg, tag="info"):
+        self._call_on_ui(lambda: self.log(msg, tag))
 
-        # Output ON / OFF
-        out_row = ctk.CTkFrame(left, fg_color="transparent")
-        out_row.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(out_row, text="Output:",
-                     font=ctk.CTkFont(size=13)).pack(side="left")
-        self.man_outp_var = ctk.StringVar(value="OFF")
-        self.man_outp_switch = ctk.CTkSwitch(
-            out_row, text="", variable=self.man_outp_var,
-            onvalue="ON", offvalue="OFF",
-            command=self._man_toggle_output,
-            progress_color=C["green"])
-        self.man_outp_switch.pack(side="left", padx=8)
-        self.man_outp_lbl = ctk.CTkLabel(
-            out_row, text="OFF", text_color=C["red"],
-            font=ctk.CTkFont(size=13, weight="bold"))
-        self.man_outp_lbl.pack(side="left")
+    def _set_connected_state(self, connected, idn=""):
+        if connected:
+            self.conn_btn.configure(
+                text="Disconnect", fg_color=C["red"], hover_color="#dc2626")
+            self.status_lbl.configure(text="Connected", text_color=C["green"])
+            self.idn_lbl.configure(text=idn)
+        else:
+            self.conn_btn.configure(
+                text="Connect", fg_color=C["primary"], hover_color=C["primary_h"])
+            self.status_lbl.configure(text="Disconnected", text_color=C["red"])
+            self.idn_lbl.configure(text="")
+        self._update_output_controls()
 
-        # Operating Mode
-        self._lbl(left, "Operating Mode")
-        man_mode_row = ctk.CTkFrame(left, fg_color="transparent")
-        man_mode_row.pack(fill="x", padx=14, pady=(0, 8))
-        self.man_mode_var = ctk.StringVar(value="VOLT")
-        ctk.CTkRadioButton(man_mode_row, text="Voltage",
-                           variable=self.man_mode_var, value="VOLT").pack(
-            side="left", padx=(0, 12))
-        ctk.CTkRadioButton(man_mode_row, text="Current",
-                           variable=self.man_mode_var, value="CURR").pack(
-            side="left", padx=(0, 12))
-        ctk.CTkButton(man_mode_row, text="Set", width=60,
-                      command=self._man_set_mode,
-                      fg_color=C["primary"],
-                      hover_color=C["primary_h"]).pack(side="left")
+    def _handle_comm_failure(self, context):
+        if self.kepco.connected:
+            return
+        self._stop_status_polling()
+        self._connect_in_flight = False
+        self._upload_in_flight = False
+        self._output_toggle_in_flight = False
+        self.stop_event.set()
+        self.sequence_active = False
+        self.is_running = False
+        self._set_connected_state(False)
+        self._reset_live_status()
+        self._reset_uploaded_state()
+        self.log(f"Connection lost during {context}: {self.kepco.last_error}", "err")
 
-        ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=8)
+    def _reset_live_status(self):
+        self._measurement_guard = None
+        self.current_output_on = False
+        self.current_control_mode = "VOLT"
+        self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
+        self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
+        self._set_status_output_display(False)
+        self._set_status_mode_display(None)
+        self.control_mode_var.set("VOLT")
+        if hasattr(self, "mode_buttons"):
+            self._update_mode_buttons("VOLT")
+        self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
 
-        # ── Set Values ──
-        ctk.CTkLabel(left, text="Set Values",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            padx=14, pady=(4, 2))
-        ctk.CTkLabel(left, text="In Voltage mode: VOLT = output, CURR = limit\n"
-                     "In Current mode: CURR = output, VOLT = limit",
-                     text_color=C["text2"],
-                     font=ctk.CTkFont(size=10), justify="left").pack(
-            anchor="w", padx=14, pady=(0, 6))
+    def _reset_uploaded_state(self):
+        self.uploaded_request = None
+        self.uploaded_waveform_ready = False
+        self._update_status_plot(None)
+        for label in self.status_cfg_labels.values():
+            label.configure(text="--")
+        self.status_cfg_labels["device_state"].configure(text="No waveform uploaded")
+        self.prog_lbl.configure(text="No upload yet")
+        self.progress.set(0)
+        self._set_output_ui_state(False)
+        self._refresh_live_measurement_warning()
+        self._update_output_controls()
 
-        # Voltage
-        v_row = ctk.CTkFrame(left, fg_color="transparent")
-        v_row.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkLabel(v_row, text="Voltage (V):",
-                     font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_volt_entry = ctk.CTkEntry(v_row, width=110,
-                                           placeholder_text="0.0")
-        self.man_volt_entry.insert(0, "0.0")
-        self.man_volt_entry.pack(side="left", padx=4)
-        ctk.CTkButton(v_row, text="Set", width=60,
-                      command=self._man_set_voltage,
-                      fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+    def _refresh_uploaded_status_panel(self):
+        req = self.uploaded_request
+        if not req:
+            self._reset_uploaded_state()
+            return
 
-        # Current
-        c_row = ctk.CTkFrame(left, fg_color="transparent")
-        c_row.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkLabel(c_row, text="Current (A):",
-                     font=ctk.CTkFont(size=12), width=100).pack(side="left")
-        self.man_curr_entry = ctk.CTkEntry(c_row, width=110,
-                                           placeholder_text="0.0")
-        self.man_curr_entry.insert(0, "0.0")
-        self.man_curr_entry.pack(side="left", padx=4)
-        ctk.CTkButton(c_row, text="Set", width=60,
-                      command=self._man_set_current,
-                      fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left", padx=4)
+        unit = "V" if req["mode"] == "VOLT" else "A"
+        frequency = "--" if req["wave"] == "DC" else f"{req['actual_frequency']:.4f} Hz"
+        amplitude = f"{req['amplitude']:.4f} {unit}" if req["amplitude"] is not None else "--"
+        offset = f"{req['offset']:.4f} {unit}" if req["offset"] is not None else "--"
+        loop = "--" if req["wave"] == "DC" else ("Infinite" if req["loop"] == 0 else str(req["loop"]))
+        wave_name = req["wave"]
+        if req["wave"] == "CSV Custom (untested)" and req["csv_name"]:
+            wave_name = f"CSV ({req['csv_name']})"
 
-        ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=8)
+        if req["wave"] == "DC":
+            device_state = "Fixed setpoint staged"
+        elif req["point_count"] <= MAX_LIST_POINTS:
+            device_state = "LIST uploaded"
+        else:
+            device_state = "First chunk uploaded; full sequence staged"
 
-        # ── Range ──
-        ctk.CTkLabel(left, text="Range Control",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            padx=14, pady=(4, 2))
-        ctk.CTkLabel(left, text="Full-scale avoids quarter-scale transients",
-                     text_color=C["text2"],
-                     font=ctk.CTkFont(size=10)).pack(
-            anchor="w", padx=14, pady=(0, 6))
+        values = {
+            "wave": wave_name,
+            "mode": "Volt" if req["mode"] == "VOLT" else "Curr",
+            "frequency": frequency,
+            "amplitude": amplitude,
+            "offset": offset,
+            "points": str(req["point_count"]),
+            "loop": loop,
+            "device_state": device_state,
+        }
+        for key, value in values.items():
+            self.status_cfg_labels[key].configure(text=value)
+        self._update_status_plot(req["plot_points"])
 
-        rng_row = ctk.CTkFrame(left, fg_color="transparent")
-        rng_row.pack(fill="x", padx=14, pady=(0, 4))
-        self.man_range_var = ctk.StringVar(value="Auto")
-        ctk.CTkComboBox(rng_row, variable=self.man_range_var,
-                        values=["Auto", "Full Scale", "Quarter Scale"],
-                        width=150).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(rng_row, text="Set", width=60,
-                      command=self._man_set_range,
-                      fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left")
+    def _set_output_ui_state(self, is_on):
+        self.current_output_on = bool(is_on)
+        self._refresh_output_toggle_button()
+        self._set_status_output_display(is_on)
+        self._refresh_live_measurement_warning()
 
-        ctk.CTkFrame(left, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=8)
+    def _set_status_output_display(self, is_on):
+        self.status_output_pill.configure(
+            text="ON" if is_on else "OFF",
+            fg_color=C["green"] if is_on else C["red"],
+            text_color="#ffffff")
 
-        # Reset
-        ctk.CTkButton(left, text="⟲  Reset Device (*RST)", width=220,
-                      command=self._man_reset,
-                      fg_color=C["red"], hover_color="#dc2626",
-                      font=ctk.CTkFont(size=13, weight="bold")).pack(
-            padx=14, pady=(4, 12))
+    def _refresh_output_toggle_button(self, can_toggle=None):
+        if can_toggle is None:
+            can_toggle = (
+                self.kepco.connected
+                and self.uploaded_waveform_ready
+                and not self._output_toggle_in_flight
+            )
+            if self.sequence_active:
+                can_toggle = True
 
-        # ── Right column: Measurements + SCPI Console ──
-        right = ctk.CTkScrollableFrame(outer, corner_radius=12)
-        right.pack(side="left", fill="both", expand=True)
+        badge_text = "OFFLINE"
+        badge_color = C["red"]
+        badge_text_color = "#ffffff"
+        summary = "Disconnected"
+        button_text = "Connect to Arm Output"
+        button_color = "#374151"
+        button_hover = "#4b5563"
+        button_text_color = "#e5e7eb"
 
-        ctk.CTkLabel(right, text="Live Measurements",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(
-            padx=14, pady=(14, 8))
+        if self.kepco.connected and not self.uploaded_waveform_ready:
+            badge_text = "LOCKED"
+            badge_color = C["amber"]
+            badge_text_color = "#111827"
+            summary = "Awaiting waveform upload"
+            button_text = "Upload Waveform First"
+        elif self._output_toggle_in_flight:
+            badge_text = "APPLYING"
+            badge_color = C["amber"]
+            badge_text_color = "#111827"
+            summary = "Applying output change"
+            button_text = "Applying..."
+            button_color = "#475569"
+            button_hover = "#475569"
+        elif self.current_output_on:
+            badge_text = "LIVE"
+            badge_color = C["green"]
+            summary = "Streaming waveform" if self.sequence_active else "Output enabled"
+            button_text = "Disable Output"
+            button_color = C["red"]
+            button_hover = "#dc2626"
+        elif self.kepco.connected and self.uploaded_waveform_ready:
+            badge_text = "READY"
+            badge_color = C["primary"]
+            summary = "Waveform uploaded and armed"
+            button_text = "Enable Output"
+            button_color = C["green"]
+            button_hover = "#059669"
+            button_text_color = "#000000"
 
-        meas_card = ctk.CTkFrame(right, corner_radius=10,
-                                 fg_color=C["graph_bg"])
-        meas_card.pack(fill="x", padx=14, pady=(0, 6))
+        self.output_state_badge.configure(
+            text=badge_text,
+            fg_color=badge_color,
+            text_color=badge_text_color)
+        self.output_summary_lbl.configure(text=summary)
+        self.output_toggle_btn.configure(
+            text=button_text,
+            fg_color=button_color,
+            hover_color=button_hover,
+            text_color=button_text_color,
+            state="normal" if can_toggle else "disabled")
 
-        self.meas_volt_lbl = ctk.CTkLabel(
-            meas_card, text="Voltage:   — — —  V",
-            font=ctk.CTkFont(family="Consolas", size=22),
-            text_color="#60a5fa")
-        self.meas_volt_lbl.pack(padx=20, pady=(16, 4))
+    def _update_output_controls(self):
+        upload_state = "disabled" if (self._upload_in_flight or self.sequence_active) else "normal"
+        self.upload_btn.configure(state=upload_state)
 
-        self.meas_curr_lbl = ctk.CTkLabel(
-            meas_card, text="Current:   — — —  A",
-            font=ctk.CTkFont(family="Consolas", size=22),
-            text_color="#34d399")
-        self.meas_curr_lbl.pack(padx=20, pady=(4, 4))
+        can_toggle = (
+            self.kepco.connected
+            and self.uploaded_waveform_ready
+            and not self._output_toggle_in_flight
+        )
+        if self.sequence_active:
+            can_toggle = True
 
-        self.meas_mode_lbl = ctk.CTkLabel(
-            meas_card, text="Mode:  — — —",
-            font=ctk.CTkFont(family="Consolas", size=14),
-            text_color=C["text2"])
-        self.meas_mode_lbl.pack(padx=20, pady=(2, 12))
+        self._refresh_output_toggle_button(can_toggle)
 
-        meas_ctrl = ctk.CTkFrame(right, fg_color="transparent")
-        meas_ctrl.pack(fill="x", padx=14, pady=(0, 8))
-        self.auto_meas_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(meas_ctrl, text="Auto refresh (1 s)",
-                        variable=self.auto_meas_var,
-                        command=self._man_toggle_auto_meas).pack(
-            side="left", padx=(0, 12))
-        ctk.CTkButton(meas_ctrl, text="Refresh Now", width=120,
-                      command=self._man_measure,
-                      fg_color="#374151",
-                      hover_color="#4b5563").pack(side="left")
-
-        ctk.CTkFrame(right, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=8)
-
-        # Manual Command Console
-        ctk.CTkLabel(right, text="Manual Command Console",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(4, 6))
-        ctk.CTkLabel(
-            right,
-            text="Enter any SCPI command/query, or use quick commands below.",
-            text_color=C["text2"],
-            font=ctk.CTkFont(size=10)).pack(anchor="w", padx=14, pady=(0, 6))
-
-        scpi_row = ctk.CTkFrame(right, fg_color="transparent")
-        scpi_row.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkLabel(scpi_row, text="CMD:",
-                     font=ctk.CTkFont(family="Consolas", size=12)).pack(
-            side="left", padx=(0, 4))
-        self.scpi_entry = ctk.CTkEntry(
-            scpi_row, placeholder_text="e.g.  *IDN?  or  VOLT 5.0",
-            font=ctk.CTkFont(family="Consolas", size=12))
-        self.scpi_entry.pack(side="left", fill="x", expand=True, padx=4)
-        self.scpi_entry.bind("<Return>", lambda e: self._man_send_scpi())
-        ctk.CTkButton(scpi_row, text="Send ▶", width=80,
-                      command=self._man_send_scpi,
-                      fg_color=C["primary"],
-                      hover_color=C["primary_h"]).pack(side="left", padx=4)
-
-        quick_row = ctk.CTkFrame(right, fg_color="transparent")
-        quick_row.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkButton(quick_row, text="*IDN?", width=72,
-                      command=lambda: self._man_send_preset("*IDN?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row, text="SYST:ERR?", width=92,
-                      command=lambda: self._man_send_preset("SYST:ERR?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row, text="OUTP?", width=72,
-                      command=lambda: self._man_send_preset("OUTP?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row, text="MEAS:VOLT?", width=102,
-                      command=lambda: self._man_send_preset("MEAS:VOLT?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row, text="MEAS:CURR?", width=102,
-                      command=lambda: self._man_send_preset("MEAS:CURR?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left")
-
-        quick_row2 = ctk.CTkFrame(right, fg_color="transparent")
-        quick_row2.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkButton(quick_row2, text="*OPC?", width=72,
-                      command=lambda: self._man_send_preset("*OPC?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row2, text="FUNC:MODE?", width=102,
-                      command=lambda: self._man_send_preset("FUNC:MODE?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row2, text="LIST:VOLT:POIN?", width=124,
-                      command=lambda: self._man_send_preset("LIST:VOLT:POIN?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 6))
-        ctk.CTkButton(quick_row2, text="LIST:CURR:POIN?", width=124,
-                      command=lambda: self._man_send_preset("LIST:CURR:POIN?"),
-                      fg_color="#374151", hover_color="#4b5563").pack(
-            side="left")
-
-        scpi_ctrl = ctk.CTkFrame(right, fg_color="transparent")
-        scpi_ctrl.pack(fill="x", padx=14, pady=(0, 4))
-        ctk.CTkButton(scpi_ctrl, text="Health Check", width=120,
-                  command=self._man_health_check,
-                  fg_color="#374151",
-                  hover_color="#4b5563").pack(side="left", padx=(0, 8))
-        ctk.CTkButton(scpi_ctrl, text="Clear Console", width=120,
-                  command=self._man_clear_scpi,
-                  fg_color="#374151",
-                  hover_color="#4b5563").pack(side="left")
-
-        self.scpi_resp = ctk.CTkTextbox(
-            right, height=120,
-            font=ctk.CTkFont(family="Consolas", size=11),
-            activate_scrollbars=True)
-        self.scpi_resp.pack(fill="both", padx=14, pady=(4, 14), expand=True)
-
-        self._meas_timer = None
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Manual Override callbacks
-    # ──────────────────────────────────────────────────────────────────────
-    def _man_require_conn(self):
         if not self.kepco.connected:
-            self.log("Not connected — connect first.", "warn")
+            hint = "Connect to a Kepco to control output."
+        elif not self.uploaded_waveform_ready:
+            hint = "Upload a waveform to enable output."
+        elif self.sequence_active:
+            hint = "Streaming multi-chunk waveform."
+        elif self._output_toggle_in_flight:
+            hint = "Applying output change..."
+        else:
+            hint = "Output follows the last uploaded waveform."
+        self.output_hint_lbl.configure(text=hint)
+
+    def _update_mode_buttons(self, active_mode):
+        for mode, btn in self.mode_buttons.items():
+            active = mode == active_mode
+            btn.configure(
+                fg_color=C["green"] if active else "#4b5563",
+                hover_color="#059669" if active else "#6b7280")
+
+    def _set_status_mode_display(self, mode):
+        for key, label in self.status_mode_labels.items():
+            active = key == mode
+            label.configure(
+                fg_color=C["green"] if active else C["card"],
+                text_color="#ffffff" if active else C["text"])
+
+    def _is_live_measurement_warning_active(self):
+        req = self.uploaded_request or {}
+        return bool(
+            self.kepco.connected
+            and self.current_output_on
+            and req.get("kind") == "LIST"
+            and req.get("wave") not in ("", None, "DC")
+        )
+
+    def _set_live_measurement_warning_visible(self, visible):
+        text = ""
+        if visible and self._is_live_measurement_warning_active():
+            text = (
+                "Warning: BIT 802E readback may be inaccurate while "
+                "LIST-driven AC output is active."
+            )
+        self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
+
+    def _refresh_live_measurement_warning(self):
+        if not hasattr(self, "status_meas_warn_lbl"):
+            return
+        self._set_live_measurement_warning_visible(
+            self._is_live_measurement_warning_active())
+
+    @staticmethod
+    def _as_float(value):
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _set_live_measurement_axis(self, mode, value):
+        numeric = self._as_float(value)
+        text = f"{numeric:.4f}" if numeric is not None else "---.----"
+        if mode == "VOLT":
+            self.status_meas_volt_lbl.configure(text=f"Voltage:  {text}  V")
+        elif mode == "CURR":
+            self.status_meas_curr_lbl.configure(text=f"Current:  {text}  A")
+
+    def _set_entry_enabled(self, entry, enabled):
+        entry.configure(
+            state="normal" if enabled else "disabled",
+            fg_color=C["input_bg"] if enabled else "#2d2d3a",
+            text_color=C["text"] if enabled else C["text2"])
+
+    def _on_wave_change(self, _=None):
+        wave = self.wave_var.get()
+        if wave == "CSV Custom (untested)":
+            self.csv_frame.pack(fill="x", padx=14, pady=(0, 6), after=self.wave_combo)
+        else:
+            self.csv_frame.pack_forget()
+
+        if wave == "DC":
+            self.amp_label.configure(text="Setpoint (V / A)")
+            self._set_entry_enabled(self.freq_entry, False)
+            self._set_entry_enabled(self.off_entry, False)
+            self._set_entry_enabled(self.pts_entry, False)
+            self._set_entry_enabled(self.loop_entry, False)
+            self._set_entry_enabled(self.amp_entry, True)
+            self.timing_lbl.configure(
+                text="DC uses a fixed VOLT/CURR setpoint and does not use LIST.")
+        elif wave == "CSV Custom (untested)":
+            self.amp_label.configure(text="Amplitude (from CSV)")
+            self._set_entry_enabled(self.freq_entry, True)
+            self._set_entry_enabled(self.off_entry, False)
+            self._set_entry_enabled(self.pts_entry, False)
+            self._set_entry_enabled(self.loop_entry, True)
+            self._set_entry_enabled(self.amp_entry, False)
+            if self.csv_points:
+                self.pts_entry.configure(state="normal")
+                self.pts_entry.delete(0, "end")
+                self.pts_entry.insert(0, str(min(len(self.csv_points), MAX_TOTAL_POINTS)))
+                self._set_entry_enabled(self.pts_entry, False)
+            self.timing_lbl.configure(
+                text="CSV uses the loaded file values and the selected frequency.")
+        else:
+            self.amp_label.configure(text="Amplitude (V / A)")
+            self._set_entry_enabled(self.freq_entry, True)
+            self._set_entry_enabled(self.off_entry, True)
+            self._set_entry_enabled(self.pts_entry, True)
+            self._set_entry_enabled(self.loop_entry, True)
+            self._set_entry_enabled(self.amp_entry, True)
+            self.timing_lbl.configure(text="")
+
+    def _load_csv(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                points = [
+                    float(value)
+                    for row in csv.reader(handle)
+                    for value in row
+                    if value.strip()
+                ]
+            if len(points) < 2:
+                raise ValueError("CSV must contain at least 2 numeric points.")
+            self.csv_points = points
+            self.csv_name = os.path.basename(path)
+            shown_points = min(len(points), MAX_TOTAL_POINTS)
+            self.csv_lbl.configure(text=f"{self.csv_name} ({shown_points} pts)")
+            self.pts_entry.configure(state="normal")
+            self.pts_entry.delete(0, "end")
+            self.pts_entry.insert(0, str(shown_points))
+            self._set_entry_enabled(self.pts_entry, False)
+            if len(points) > MAX_TOTAL_POINTS:
+                self.log(
+                    f"Loaded CSV {self.csv_name}; using first {MAX_TOTAL_POINTS} points.",
+                    "warn")
+            else:
+                self.log(f"Loaded CSV: {self.csv_name} -> {len(points)} points", "ok")
+        except Exception as exc:
+            messagebox.showerror("CSV Error", str(exc))
+
+    def _read_float(self, entry, name):
+        try:
+            return float(entry.get().strip())
+        except Exception:
+            messagebox.showerror("Input Error", f"Invalid {name}.")
+            return None
+
+    def _read_int(self, entry, name):
+        try:
+            return int(entry.get().strip())
+        except Exception:
+            messagebox.showerror("Input Error", f"Invalid {name}.")
+            return None
+
+    def _normalize_limit_entry_text(self, entry, value):
+        if threading.current_thread() is not threading.main_thread():
+            return
+        entry.delete(0, "end")
+        entry.insert(0, KepcoController.format_scpi_value(value))
+
+    def _read_signed_limit_pair(self, pos_entry, neg_entry, name, max_abs):
+        pos = abs(float(pos_entry.get().strip()))
+        neg = -abs(float(neg_entry.get().strip()))
+        if pos <= 0 or neg >= 0:
+            raise ValueError(f"{name} limits must be nonzero.")
+        if pos > max_abs or abs(neg) > max_abs:
+            raise ValueError(f"{name} limits must be within +/-{max_abs:.1f}.")
+        self._normalize_limit_entry_text(pos_entry, pos)
+        self._normalize_limit_entry_text(neg_entry, neg)
+        return pos, neg
+
+    def _get_device_limits_from_ui(self, show_error=False):
+        try:
+            voltage_limits = self._read_signed_limit_pair(
+                self.soft_volt_pos_limit_entry,
+                self.soft_volt_neg_limit_entry,
+                "Voltage compliance / limit",
+                BOP_MAX_VOLTAGE)
+            current_limits = self._read_signed_limit_pair(
+                self.soft_curr_pos_limit_entry,
+                self.soft_curr_neg_limit_entry,
+                "Current limit",
+                BOP_MAX_CURRENT)
+            return voltage_limits, current_limits
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror(
+                    "Device Limits",
+                    str(exc) if str(exc) else
+                    "Voltage and current limits must be valid signed numbers.")
+            return None
+
+    def _get_request_limits(self, req):
+        req = req or {}
+        voltage_limits = req.get(
+            "voltage_limits",
+            req.get("voltage_compliance", KepcoController.default_voltage_limits()))
+        current_limits = req.get(
+            "current_limits",
+            req.get("current_limit", KepcoController.default_current_limits()))
+        return (
+            KepcoController.limit_pair(
+                voltage_limits,
+                DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
+                DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE),
+            KepcoController.limit_pair(
+                current_limits,
+                DEFAULT_POSITIVE_CURRENT_LIMIT,
+                DEFAULT_NEGATIVE_CURRENT_LIMIT),
+        )
+
+    def _request_with_latest_ui_limits(self, req):
+        if not req:
+            return None
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return None
+        context = (
+            "Uploaded DC setpoint"
+            if req.get("kind") == "DC" else "Uploaded waveform")
+        if not self._check_points_within_limits(
+                req["mode"], req["points"], context, limits):
+            return None
+        limited_req = dict(req)
+        limited_req["voltage_limits"] = limits["VOLT"]
+        limited_req["current_limits"] = limits["CURR"]
+        return limited_req
+
+    def _log_scpi_sequence(self, label, cmds):
+        self._log_safe(f"{label}: {'; '.join(cmds)}", "info")
+
+    def _apply_device_limits(self, mode, voltage_compliance, current_limit):
+        mode = (mode or "VOLT").upper()
+        try:
+            cmds = self.kepco._limit_setup_cmds(
+                mode, voltage_compliance, current_limit)
+        except ValueError as exc:
+            return False, str(exc)
+        self._log_scpi_sequence(
+            f"Applying {mode} complementary limit setup", cmds)
+        return self.kepco.send_sequence(
+            cmds, label=f"{mode} complementary limit setup")
+
+    def _safe_prepare_output(self, mode, initial_setpoint=0.0,
+                             voltage_compliance=None, current_limit=None,
+                             label="Safe output prepare"):
+        mode = (mode or "VOLT").upper()
+        if voltage_compliance is None:
+            voltage_compliance = KepcoController.default_voltage_limits()
+        if current_limit is None:
+            current_limit = KepcoController.default_current_limits()
+        if mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported FUNC:MODE '{mode}'"
+
+        cmds = [
+            "VOLT:MODE FIX",
+            "CURR:MODE FIX",
+            f"FUNC:MODE {mode}",
+            f"{mode}:RANG 1",
+        ]
+        initial = KepcoController.format_scpi_value(initial_setpoint)
+        if mode == "CURR":
+            cmds.extend(KepcoController.signed_limit_cmds(
+                "VOLT", voltage_compliance))
+            cmds.append(f"CURR {initial}")
+        else:
+            cmds.extend(KepcoController.signed_limit_cmds(
+                "CURR", current_limit))
+            cmds.append(f"VOLT {initial}")
+        self._log_scpi_sequence(label, cmds)
+        return self.kepco.send_sequence(cmds, label=label)
+
+    def _get_software_limits(self, show_error=False):
+        limits = self._get_device_limits_from_ui(show_error=show_error)
+        if not limits:
+            return None
+        voltage_limits, current_limits = limits
+        return {"VOLT": voltage_limits, "CURR": current_limits}
+
+    def _set_software_limit(self, mode):
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return
+        unit = "V" if mode == "VOLT" else "A"
+        pos_limit, neg_limit = limits[mode]
+        if not self._man_require_conn():
+            self.log(
+                f"{mode} limits staged locally at "
+                f"{neg_limit:.4f} to {pos_limit:.4f} {unit}; "
+                "connect to send it to the device.",
+                "warn")
+            return
+
+        mode_resp = self.kepco.send("FUNC:MODE?", query=True)
+        active_mode = KepcoController._normalize_func_mode(mode_resp)
+        if not active_mode:
+            self.log(
+                "Limit command not sent; could not confirm device control mode.",
+                "err")
+            if not self.kepco.connected:
+                self._handle_comm_failure("query control mode for limit set")
+            return
+
+        if active_mode != self.control_mode_var.get().upper():
+            self.current_control_mode = active_mode
+            self.control_mode_var.set(active_mode)
+            self._update_mode_buttons(active_mode)
+
+        is_complementary = (
+            (active_mode == "CURR" and mode == "VOLT")
+            or (active_mode == "VOLT" and mode == "CURR")
+        )
+        if not is_complementary:
+            self.log(
+                f"{mode} is the active output channel in {active_mode} mode; "
+                "this field is staged as a UI/software limit only.",
+                "warn")
+            return
+
+        cmds = KepcoController.signed_limit_cmds(mode, limits[mode])
+        self.log(f"Sending device limit command(s): {'; '.join(cmds)}", "info")
+        ok, msg = self.kepco.send_sequence(
+            cmds, label=f"{mode} device limit command(s)")
+        self.log(
+            f"{mode} device limit set to {neg_limit:.4f} to {pos_limit:.4f} {unit}"
+            if ok else f"Failed to send {mode} limit command(s): {msg}",
+            "ok" if ok else "err")
+        if ok:
+            self._schedule_status_poll(100)
+        else:
+            self._handle_comm_failure(f"set {mode} limit")
+
+    def _check_interlock(self, mode, points, context):
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return False
+        return self._check_points_within_limits(mode, points, context, limits)
+
+    def _check_points_within_limits(self, mode, points, context, limits):
+        pos_limit, neg_limit = limits[mode]
+        high = max(float(point) for point in points)
+        low = min(float(point) for point in points)
+        unit = "V" if mode == "VOLT" else "A"
+        if high > pos_limit + 1e-12 or low < neg_limit - 1e-12:
+            messagebox.showerror(
+                "Software Interlock",
+                f"{context} exceeds the configured {mode.lower()} limit.\n\n"
+                f"Requested range: {low:.4f} to {high:.4f} {unit}\n"
+                f"Limit range: {neg_limit:.4f} to {pos_limit:.4f} {unit}")
             return False
         return True
 
-    def _man_toggle_output(self):
-        if not self._man_require_conn():
-            return
-        state = self.man_outp_var.get()
-        ok = self.kepco.send(f"OUTP {state}")
-        if ok:
-            on = state == "ON"
-            self.man_outp_lbl.configure(
-                text=state, text_color=C["green"] if on else C["red"])
-            self.log(f"Output → {state}", "ok")
+    def _set_timing_lines(self, lines):
+        self.timing_lbl.configure(text="\n".join(lines))
+
+    def _build_dc_request(self, mode):
+        value = self._read_float(self.amp_entry, "DC setpoint")
+        if value is None or not self._check_interlock(mode, [value], "DC setpoint"):
+            return None
+        unit = "V" if mode == "VOLT" else "A"
+        self._set_timing_lines([
+            f"Mode: {mode}",
+            f"Setpoint: {value:.4f} {unit}",
+            "DC upload uses fixed commands and does not use LIST.",
+        ])
+        return {
+            "wave": "DC", "mode": mode, "kind": "DC",
+            "amplitude": value, "offset": None,
+            "point_count": 1, "loop": 0, "dwell": None,
+            "actual_frequency": 0.0,
+            "points": [value], "plot_points": [value, value],
+            "csv_name": None, "first_chunk_primed": False,
+        }
+
+    def _build_csv_request(self, mode):
+        if not self.csv_points:
+            messagebox.showerror("Input Error", "Load a CSV file first.")
+            return None
+        freq = self._read_float(self.freq_entry, "frequency")
+        loop = self._read_int(self.loop_entry, "loop count")
+        if freq is None or loop is None or loop < 0:
+            if loop is not None and loop < 0:
+                messagebox.showerror("Input Error", "Loop count must be 0 or greater.")
+            return None
+        point_count = min(len(self.csv_points), MAX_TOTAL_POINTS)
+        actual, dwell, actual_freq, warns = WaveformGen.calculate_timing(freq, point_count)
+        if actual == 0:
+            messagebox.showerror("Input Error", "\n".join(warns))
+            return None
+        points = list(self.csv_points[:actual])
+        if len(points) < 2 or not self._check_interlock(mode, points, "CSV waveform"):
+            if len(points) < 2:
+                messagebox.showerror("Input Error", "CSV must contain at least 2 points.")
+            return None
+        if len(self.csv_points) > MAX_TOTAL_POINTS:
+            warns.append(f"CSV truncated to {MAX_TOTAL_POINTS} points.")
+        lines = [
+            f"Points: {len(points)} ({math.ceil(len(points) / MAX_LIST_POINTS)} chunk(s))",
+            f"Dwell: {dwell * 1000:.4f} ms",
+            f"Actual frequency: {actual_freq:.4f} Hz",
+        ]
+        if len(points) > MAX_LIST_POINTS:
+            lines.append("Waveforms over 1000 points stream in chunks when output is ON.")
+        lines.extend([f"Warning: {warning}" for warning in warns])
+        self._set_timing_lines(lines)
+        return {
+            "wave": "CSV Custom (untested)", "mode": mode, "kind": "LIST",
+            "amplitude": None, "offset": None,
+            "point_count": len(points), "loop": loop, "dwell": dwell,
+            "actual_frequency": actual_freq,
+            "points": points, "plot_points": points,
+            "csv_name": self.csv_name, "first_chunk_primed": False,
+        }
+
+    def _build_standard_request(self, mode):
+        freq = self._read_float(self.freq_entry, "frequency")
+        amp = self._read_float(self.amp_entry, "amplitude")
+        offset = self._read_float(self.off_entry, "offset")
+        pts = self._read_int(self.pts_entry, "total points")
+        loop = self._read_int(self.loop_entry, "loop count")
+        if None in (freq, amp, offset, pts, loop):
+            return None
+        if pts < 2 or loop < 0:
+            messagebox.showerror(
+                "Input Error",
+                "Need at least 2 points and a loop count of 0 or greater.")
+            return None
+        pts = min(pts, MAX_TOTAL_POINTS)
+        actual, dwell, actual_freq, warns = WaveformGen.calculate_timing(freq, pts)
+        if actual == 0:
+            messagebox.showerror("Input Error", "\n".join(warns))
+            return None
+        points = WaveformGen.generate(self.wave_var.get(), actual, amp, offset)
+        if not self._check_interlock(mode, points, f"{self.wave_var.get()} waveform"):
+            return None
+        lines = [
+            f"Points: {len(points)} ({math.ceil(len(points) / MAX_LIST_POINTS)} chunk(s))",
+            f"Dwell: {dwell * 1000:.4f} ms",
+            f"Actual frequency: {actual_freq:.4f} Hz",
+        ]
+        if len(points) > MAX_LIST_POINTS:
+            lines.append("Waveforms over 1000 points stream in chunks when output is ON.")
+        lines.extend([f"Warning: {warning}" for warning in warns])
+        self._set_timing_lines(lines)
+        return {
+            "wave": self.wave_var.get(), "mode": mode, "kind": "LIST",
+            "amplitude": amp, "offset": offset,
+            "point_count": len(points), "loop": loop, "dwell": dwell,
+            "actual_frequency": actual_freq,
+            "points": points, "plot_points": points,
+            "csv_name": None, "first_chunk_primed": False,
+        }
+
+    def _read_waveform_request(self):
+        mode = self.control_mode_var.get().upper()
+        wave = self.wave_var.get()
+        if wave == "DC":
+            req = self._build_dc_request(mode)
+        elif wave == "CSV Custom (untested)":
+            req = self._build_csv_request(mode)
         else:
-            self.log("Failed to set output state", "err")
+            req = self._build_standard_request(mode)
+        if not req:
+            return None
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
+            return None
+        req["voltage_limits"] = limits["VOLT"]
+        req["current_limits"] = limits["CURR"]
+        return req
 
-    def _man_set_mode(self):
-        if not self._man_require_conn():
+    def _preview(self):
+        req = self._read_waveform_request()
+        if not req:
             return
-        mode = self.man_mode_var.get()
-        ok = self.kepco.send(f"FUNC:MODE {mode}")
-        self.log(f"Mode → {mode}" if ok else "Failed to set mode",
-                 "ok" if ok else "err")
+        self.preview_points = req["plot_points"]
+        self._update_preview_plot(req["plot_points"])
+        self.log(
+            f"Preview ready: {req['wave']} in {req['mode']} mode "
+            f"({req['point_count']} point(s))",
+            "info")
 
-    def _man_set_voltage(self):
-        if not self._man_require_conn():
-            return
-        try:
-            val = float(self.man_volt_entry.get())
-        except ValueError:
-            self.log("Invalid voltage value", "err")
-            return
-        ok = self.kepco.send(f"VOLT {val:.4f}")
-        self.log(f"VOLT → {val:.4f} V" if ok else "Failed to set voltage",
-                 "ok" if ok else "err")
+    def _man_require_conn(self):
+        if not self.kepco.connected:
+            self.log("Not connected - connect first.", "warn")
+            return False
+        return True
 
-    def _man_set_current(self):
-        if not self._man_require_conn():
+    def _select_control_mode(self, mode):
+        mode = mode.upper()
+        self.current_control_mode = mode
+        self.control_mode_var.set(mode)
+        self._update_mode_buttons(mode)
+        if not self.kepco.connected:
+            self.log(f"Control mode preset to {mode}", "info")
             return
-        try:
-            val = float(self.man_curr_entry.get())
-        except ValueError:
-            self.log("Invalid current value", "err")
+        limits = self._get_software_limits(show_error=True)
+        if not limits:
             return
-        ok = self.kepco.send(f"CURR {val:.4f}")
-        self.log(f"CURR → {val:.4f} A" if ok else "Failed to set current",
-                 "ok" if ok else "err")
+        if self.current_output_on:
+            ok, msg = self._safe_prepare_output(
+                mode,
+                initial_setpoint=0.0,
+                voltage_compliance=limits["VOLT"],
+                current_limit=limits["CURR"],
+                label=f"Manual {mode} mode safe prepare")
+        else:
+            ok, msg = self._apply_device_limits(
+                mode, limits["VOLT"], limits["CURR"])
+        self.log(
+            f"Control mode -> {mode}" if ok else f"Failed to set control mode: {msg}",
+            "ok" if ok else "err")
+        if ok:
+            self._schedule_status_poll(100)
+        else:
+            self._handle_comm_failure("set control mode")
 
     def _man_set_range(self):
         if not self._man_require_conn():
             return
         choice = self.man_range_var.get()
-        mode = self.man_mode_var.get()
+        mode = self.control_mode_var.get()
+        cmds = []
+        label = ""
         if choice == "Auto":
-            self.kepco.send(f"{mode}:RANG:AUTO ON")
-            self.log(f"{mode} range → Auto", "ok")
+            cmds = [f"{mode}:RANG:AUTO ON"]
+            label = "Auto"
         elif choice == "Full Scale":
-            self.kepco.send(f"{mode}:RANG:AUTO OFF")
-            self.kepco.send(f"{mode}:RANG 1")
-            self.log(f"{mode} range → Full Scale", "ok")
+            cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 1"]
+            label = "Full Scale"
         else:
-            self.kepco.send(f"{mode}:RANG:AUTO OFF")
-            self.kepco.send(f"{mode}:RANG 0")
-            self.log(f"{mode} range → Quarter Scale", "ok")
+            cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 0"]
+            label = "Quarter Scale"
+        ok = True
+        for cmd in cmds:
+            ok = bool(self.kepco.send(cmd))
+            if not ok:
+                break
+        self.log(
+            f"{mode} range -> {label}" if ok else "Failed to set range",
+            "ok" if ok else "err")
+        if ok:
+            self._schedule_status_poll(100)
+        else:
+            self._handle_comm_failure("set range")
 
     def _man_reset(self):
         if not self._man_require_conn():
             return
+        if self.sequence_active or self._upload_in_flight:
+            messagebox.showwarning(
+                "Busy",
+                "Stop the active upload/stream before resetting the device.")
+            return
         ok = self.kepco.send("*RST")
         if ok:
-            self.man_outp_var.set("OFF")
-            self.man_outp_switch.deselect()
-            self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
-            self.man_mode_var.set("VOLT")
+            self.stop_event.set()
+            self.sequence_active = False
+            self.is_running = False
+            self.current_control_mode = "VOLT"
+            self.control_mode_var.set("VOLT")
+            self._update_mode_buttons("VOLT")
+            self._reset_live_status()
+            self._reset_uploaded_state()
             self.log("Device reset (*RST)", "ok")
+            self._schedule_status_poll(150)
         else:
             self.log("Reset failed", "err")
-
-    def _man_measure(self):
-        if not self.kepco.connected:
-            return
-        v = self.kepco.send("MEAS:VOLT?", query=True)
-        c = self.kepco.send("MEAS:CURR?", query=True)
-        m = self.kepco.send("FUNC:MODE?", query=True)
-        try:
-            v_str = f"{float(v):.4f}" if v else "— — —"
-        except (ValueError, TypeError):
-            v_str = v or "— — —"
-        try:
-            c_str = f"{float(c):.4f}" if c else "— — —"
-        except (ValueError, TypeError):
-            c_str = c or "— — —"
-        self.meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
-        self.meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
-        self.meas_mode_lbl.configure(text=f"Mode:  {m or '— — —'}")
-
-    def _man_toggle_auto_meas(self):
-        if self.auto_meas_var.get():
-            self._man_auto_meas_tick()
-        else:
-            if self._meas_timer:
-                self.root.after_cancel(self._meas_timer)
-                self._meas_timer = None
-
-    def _man_auto_meas_tick(self):
-        if self.auto_meas_var.get() and self.kepco.connected:
-            self._man_measure()
-            self._meas_timer = self.root.after(1000, self._man_auto_meas_tick)
-        else:
-            self._meas_timer = None
+            self._handle_comm_failure("reset")
 
     def _man_send_scpi(self):
         if not self._man_require_conn():
@@ -1222,18 +2631,20 @@ class App:
     def _man_exec_scpi_command(self, cmd):
         is_query = cmd.rstrip().endswith("?")
         ts = time.strftime("%H:%M:%S")
+        self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
         if is_query:
             resp = self.kepco.send(cmd, query=True)
-            self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
-            self.scpi_resp.insert("end",
-                f"[{ts}] < {resp or '(no response)'}\n")
+            self.scpi_resp.insert("end", f"[{ts}] < {resp or '(no response)'}\n")
+            if resp is None:
+                self._handle_comm_failure(f"SCPI query '{cmd}'")
         else:
             ok = self.kepco.send(cmd)
-            self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
-            self.scpi_resp.insert("end",
-                f"[{ts}] {'✓ OK' if ok else '✗ Failed'}\n")
+            self.scpi_resp.insert("end", f"[{ts}] {'OK' if ok else 'FAILED'}\n")
+            if not ok:
+                self._handle_comm_failure(f"SCPI command '{cmd}'")
         self.scpi_resp.see("end")
         self.log(f"SCPI: {cmd}", "info")
+        self._schedule_status_poll(150)
 
     def _man_send_preset(self, cmd):
         if not self._man_require_conn():
@@ -1249,471 +2660,822 @@ class App:
     def _man_health_check(self):
         if not self._man_require_conn():
             return
-        checks = [
-            "*IDN?",
-            "FUNC:MODE?",
-            "OUTP?",
-            "LIST:VOLT:POIN?",
-            "LIST:CURR:POIN?",
-            "SYST:ERR?",
-            "*ESR?",
-        ]
+        threading.Thread(target=self._man_health_check_worker, daemon=True).start()
+
+    def _man_health_check_worker(self):
         ts = time.strftime("%H:%M:%S")
-        self.scpi_resp.insert("end", f"[{ts}] ==== Health Check ====\n")
-        for cmd in checks:
+        results = []
+
+        def run_query(cmd):
             resp = self.kepco.send(cmd, query=True)
+            results.append((cmd, resp))
+            return resp
+
+        run_query("*IDN?")
+        mode_resp = run_query("FUNC:MODE?")
+        run_query("OUTP?")
+
+        mode_text = str(mode_resp or "").strip().upper()
+        active_mode = "CURR" if mode_text in ("1", "CURR") else "VOLT"
+        run_query(f"LIST:{active_mode}:POIN?")
+        run_query("SYST:ERR?")
+        run_query("*ESR?")
+
+        self._call_on_ui(lambda: self._man_health_check_done(ts, results))
+
+    def _man_health_check_done(self, ts, results):
+        self.scpi_resp.insert("end", f"[{ts}] ==== Health Check ====\n")
+        missing = False
+        for cmd, resp in results:
             self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
             self.scpi_resp.insert("end", f"[{ts}] < {resp or '(no response)'}\n")
+            if resp is None:
+                missing = True
         self.scpi_resp.insert("end", f"[{ts}] =====================\n")
         self.scpi_resp.see("end")
         self.log("Manual health check complete", "ok")
+        if missing:
+            self._handle_comm_failure("health check")
+        else:
+            self._schedule_status_poll(150)
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Graph
-    # ──────────────────────────────────────────────────────────────────────
-    def _style_ax(self):
-        self.ax.set_facecolor(C["graph_bg"])
-        for sp in self.ax.spines.values():
-            sp.set_color(C["border"])
-        self.ax.tick_params(colors=C["text2"], labelsize=9)
-        self.ax.xaxis.label.set_color(C["text2"])
-        self.ax.yaxis.label.set_color(C["text2"])
-        self.ax.grid(True, color="#2a2a40", linewidth=0.5, alpha=0.6)
+    def _schedule_status_poll(self, delay_ms=1000):
+        if self._status_poll_timer:
+            try:
+                self.root.after_cancel(self._status_poll_timer)
+            except Exception:
+                pass
+            self._status_poll_timer = None
+        if self._status_poll_enabled:
+            self._status_poll_timer = self.root.after(delay_ms, self._status_poll_tick)
 
-    def _update_graph(self, points=None, chunk_idx=-1):
-        self.ax.clear()
-        self._style_ax()
-        self.ax.set_xlabel("Sample Index")
-        self.ax.set_ylabel("Amplitude (V / A)")
+    def _start_status_polling(self):
+        self._status_poll_enabled = True
+        self._status_poll_paused = False
+        self._schedule_status_poll(100)
 
-        if not points:
-            self.ax.set_title("No waveform — configure & preview",
-                              color=C["text2"], fontsize=11)
-            self.canvas.draw_idle()
+    def _stop_status_polling(self):
+        self._status_poll_enabled = False
+        self._status_poll_paused = False
+        self._status_poll_in_flight = False
+        if self._status_poll_timer:
+            try:
+                self.root.after_cancel(self._status_poll_timer)
+            except Exception:
+                pass
+            self._status_poll_timer = None
+
+    def _pause_status_polling(self):
+        self._status_poll_paused = True
+        if self._status_poll_timer:
+            try:
+                self.root.after_cancel(self._status_poll_timer)
+            except Exception:
+                pass
+            self._status_poll_timer = None
+
+    def _resume_status_polling(self):
+        self._status_poll_paused = False
+        if self._status_poll_enabled:
+            self._schedule_status_poll(100)
+
+    def _wait_for_status_poll_idle(self, timeout=2.0):
+        """Block worker threads until an in-flight poll cycle fully unwinds."""
+        deadline = time.time() + timeout
+        while self._status_poll_in_flight and time.time() < deadline:
+            time.sleep(0.05)
+        return not self._status_poll_in_flight
+
+    def _status_poll_tick(self):
+        self._status_poll_timer = None
+        if not self._status_poll_enabled or self._status_poll_paused or not self.kepco.connected:
+            return
+        if self._status_poll_in_flight:
+            self._schedule_status_poll(250)
+            return
+        self._status_poll_in_flight = True
+        threading.Thread(target=self._status_poll_worker, daemon=True).start()
+
+    def _status_poll_worker(self):
+        v = self.kepco.send("MEAS:VOLT?", query=True)
+        c = self.kepco.send("MEAS:CURR?", query=True)
+        outp = self.kepco.send("OUTP?", query=True)
+        mode = self.kepco.send("FUNC:MODE?", query=True)
+        self._call_on_ui(lambda: self._status_poll_done(v, c, outp, mode))
+
+    def _status_poll_done(self, v, c, outp, mode):
+        self._status_poll_in_flight = False
+        if any(item is None for item in (v, c, outp, mode)):
+            self._handle_comm_failure("status polling")
             return
 
-        n = len(points)
-        chunk_sz = MAX_LIST_POINTS
-        chunks = [points[i:i + chunk_sz] for i in range(0, n, chunk_sz)]
-        nc = len(chunks)
-        colors = C["chunk_colors"]
+        self._record_data_collection_sample(v, c, outp, mode)
 
-        for ci, ck in enumerate(chunks):
-            start = ci * chunk_sz
-            xs = list(range(start, start + len(ck)))
-            col = colors[ci % len(colors)]
-            lw, alpha = 1.2, 1.0
+        poll_mode = str(mode).strip().upper()
+        if poll_mode == "0":
+            poll_mode = "VOLT"
+        elif poll_mode == "1":
+            poll_mode = "CURR"
 
-            if chunk_idx >= 0:               # sending mode
-                if ci < chunk_idx:            # already sent → dim
-                    alpha = 0.30
-                elif ci == chunk_idx:         # currently sending → bold pink
-                    lw, col = 2.8, C["sent"]
-                else:                         # not yet sent
-                    alpha = 0.45
+        guard = self._measurement_guard
+        if guard:
+            measured = self._as_float(v if guard["mode"] == "VOLT" else c)
+            out_text = str(outp).strip().upper()
+            # After a live DC -> AC handoff the first polled sample can still
+            # mirror the prior fixed setpoint, so prefer the new waveform center once.
+            if (
+                poll_mode == guard["mode"]
+                and out_text in ("1", "ON")
+                and measured is not None
+                and abs(measured - guard["previous_value"]) <= 5e-4
+            ):
+                if guard["mode"] == "VOLT":
+                    v = guard["expected_value"]
+                else:
+                    c = guard["expected_value"]
+            self._measurement_guard = None
 
-            self.ax.plot(xs, ck, color=col, linewidth=lw, alpha=alpha)
+        self._apply_live_status(v, c, outp, mode)
+        if self._status_poll_enabled and not self._status_poll_paused:
+            self._schedule_status_poll(1000)
 
-        # chunk boundary lines
-        for ci in range(1, nc):
-            self.ax.axvline(ci * chunk_sz, color=C["border"],
-                            linestyle="--", linewidth=0.7, alpha=0.6)
-
-        # legend (idle mode only)
-        if chunk_idx < 0 and nc > 1:
-            handles = [mlines.Line2D(
-                [], [], color=colors[i % len(colors)], linewidth=2,
-                label=f"Chunk {i+1}  ({len(chunks[i])} pts)")
-                for i in range(nc)]
-            self.ax.legend(handles=handles, fontsize=8, loc="upper right",
-                           facecolor=C["card"], edgecolor=C["border"],
-                           labelcolor=C["text2"])
-
-        title = (f"Waveform — {n} points, {nc} chunk(s)"
-                 if chunk_idx < 0
-                 else f"Sending chunk {chunk_idx+1} / {nc} …")
-        self.ax.set_title(title, color=C["text"], fontsize=11)
-        self.fig.tight_layout(pad=1.5)
-        self.canvas.draw_idle()
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Auto-discovery
-    # ──────────────────────────────────────────────────────────────────────
-    def _start_scan(self):
-        self.scan_btn.configure(state="disabled", text="Scanning…")
-        self.log(
-            "Scanning local subnet for Kepco devices "
-            "(Telnet 5024 first, fallback 5025)…")
-        ip = self.ip_var.get().strip()
-        base = ".".join(ip.split(".")[:3]) + ".0" if ip else "192.168.50.0"
-
-        def done(results):
-            self.root.after(0, lambda: self._scan_done(results))
-
-        def prog(d, t):
-            self.root.after(0, lambda: self.progress.set(d / t))
-
-        threading.Thread(target=Discovery.scan_subnet,
-                         args=(base, done, prog), daemon=True).start()
-
-    def _scan_done(self, results):
-        self.scan_btn.configure(state="normal", text="⟳  Scan Network")
-        self.progress.set(0)
-        if results:
-            ips = [r[0] for r in results]
-            self.ip_combo.configure(values=ips)
-            self.ip_var.set(ips[0])
-            for ip, idn in results:
-                self.log(f"Found: {ip}  →  {idn}", "ok")
-        else:
-            self.log("No Kepco devices found on subnet.", "warn")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Connection
-    # ──────────────────────────────────────────────────────────────────────
-    def _safe_disconnect_sequence(self):
-        """Force safe state before disconnecting from device.
-
-        Returns True only when all required safety commands succeed.
-        """
-        steps = [
-            ("VOLT 0", "set voltage to 0V"),
-            ("CURR 0", "set current to 0A"),
-            ("OUTP OFF", "turn output OFF"),
-        ]
-        for cmd, desc in steps:
-            ok = self.kepco.send(cmd)
-            if not ok:
-                err = self.kepco.last_error or "send failed"
-                self.log(
-                    f"Safety interlock: failed to {desc} before disconnect ({err})",
-                    "err")
-                messagebox.showerror(
-                    "Safety Interlock",
-                    "Disconnect blocked.\n"
-                    f"Could not {desc} before disconnecting.\n"
-                    "Check connection and retry.")
-                return False
-
-        self.man_outp_var.set("OFF")
-        self.man_outp_switch.deselect()
-        self.man_outp_lbl.configure(text="OFF", text_color=C["red"])
-        self.man_volt_entry.delete(0, "end")
-        self.man_volt_entry.insert(0, "0.0")
-        self.man_curr_entry.delete(0, "end")
-        self.man_curr_entry.insert(0, "0.0")
-        self.log("Safety interlock: VOLT/CURR set to 0 and output turned OFF.", "ok")
-        return True
-
-    def _toggle_connect(self):
-        if not self.kepco.connected:
-            ip = self.ip_var.get().strip()
-            ok, msg = self.kepco.connect(ip)
-            if ok:
-                self.conn_btn.configure(text="Disconnect",
-                                        fg_color=C["red"],
-                                        hover_color="#dc2626")
-                self.status_lbl.configure(text="●  Connected",
-                                          text_color=C["green"])
-                idn = self.kepco.identity() or "Unknown device"
-                self.idn_lbl.configure(text=idn)
-                self.log(
-                    f"Connected to {ip} via {self.kepco.transport} "
-                    f"({self.kepco.port}):  {idn}", "ok")
-            else:
-                self.log(f"Connection failed: {msg}", "err")
-        else:
-            if not self._safe_disconnect_sequence():
-                return
-            self.kepco.disconnect()
-            self.conn_btn.configure(text="Connect",
-                                    fg_color=C["primary"],
-                                    hover_color=C["primary_h"])
-            self.status_lbl.configure(text="●  Disconnected",
-                                      text_color=C["red"])
-            self.idn_lbl.configure(text="")
-            self.log("Disconnected.")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  CSV
-    # ──────────────────────────────────────────────────────────────────────
-    def _on_wave_change(self, _=None):
-        if self.wave_var.get() == "CSV Custom":
-            self.csv_frame.pack(fill="x", padx=14, pady=(0, 6),
-                                after=self.wave_combo)
-        else:
-            self.csv_frame.pack_forget()
-
-    def _load_csv(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if not path:
-            return
+    def _apply_live_status(self, v, c, outp, mode):
         try:
-            with open(path, "r") as f:
-                self.csv_points = [float(x)
-                                   for row in csv.reader(f)
-                                   for x in row if x.strip()]
-            name = path.rsplit("/", 1)[-1]
-            self.csv_lbl.configure(text=f"{name} ({len(self.csv_points)} pts)")
-            self.log(f"Loaded CSV: {name} → {len(self.csv_points)} points", "ok")
-        except Exception as e:
-            from tkinter import messagebox
-            messagebox.showerror("CSV Error", str(e))
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Parameter reading & waveform generation
-    # ──────────────────────────────────────────────────────────────────────
-    def _read_params(self):
-        from tkinter import messagebox
+            v_str = f"{float(v):.4f}"
+        except Exception:
+            v_str = str(v).strip() or "---.----"
         try:
-            freq = float(self.freq_entry.get())
-            amp  = float(self.amp_entry.get())
-            off  = float(self.off_entry.get())
-            pts  = int(self.pts_entry.get())
-            loop = int(self.loop_entry.get())
-        except ValueError:
-            messagebox.showerror("Input Error", "Invalid numeric input.")
-            return None
-        if pts < 2:
-            messagebox.showerror("Input Error", "Need ≥ 2 points.")
-            return None
-        if pts > MAX_TOTAL_POINTS:
-            pts = MAX_TOTAL_POINTS
-        return dict(freq=freq, amp=amp, offset=off,
-                    points=pts, loop=loop,
-                    wave=self.wave_var.get(), mode=self.mode_var.get())
+            c_str = f"{float(c):.4f}"
+        except Exception:
+            c_str = str(c).strip() or "---.----"
+        out_text = str(outp).strip().upper()
+        is_on = out_text in ("1", "ON")
+        mode_text = str(mode).strip().upper()
+        if mode_text == "0":
+            mode_text = "VOLT"
+        elif mode_text == "1":
+            mode_text = "CURR"
+        if mode_text not in ("VOLT", "CURR"):
+            mode_text = None
 
-    def _generate_points(self, p):
-        """Build the waveform, respecting hardware timing constraints."""
-        from tkinter import messagebox
+        self.status_meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
+        self.status_meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
+        self._set_status_output_display(is_on)
+        self._set_status_mode_display(mode_text)
 
-        actual, dwell, actual_freq, warns = WaveformGen.calculate_timing(
-            p["freq"], p["points"])
-        if actual == 0:
-            messagebox.showerror("Error", "\n".join(warns))
-            return None, None, None
+        if mode_text:
+            self.current_control_mode = mode_text
+            self.control_mode_var.set(mode_text)
+            self._update_mode_buttons(mode_text)
 
-        if p["wave"] == "CSV Custom":
-            if not self.csv_points:
-                messagebox.showerror("Error", "Load a CSV file first.")
-                return None, None, None
-            pts = self.csv_points[:actual]
-            actual = len(pts)
-            dwell = (1.0 / p["freq"]) / actual if p["freq"] > 0 else MIN_DWELL
-            if dwell < MIN_DWELL:
-                dwell = MIN_DWELL
-                actual_freq = 1.0 / (actual * dwell)
-                warns.append(f"CSV dwell clamped to min {MIN_DWELL*1e6:.0f} µs")
+        if not self.sequence_active and not self._output_toggle_in_flight:
+            self._set_output_ui_state(is_on)
         else:
-            pts = WaveformGen.generate(p["wave"], actual, p["amp"], p["offset"])
+            self.current_output_on = is_on
+            self._set_status_output_display(is_on)
 
-        nc = math.ceil(len(pts) / MAX_LIST_POINTS)
-        total_time = len(pts) * dwell
-        info = [
-            f"Points: {len(pts)}   ({nc} chunk{'s' if nc > 1 else ''}  ×  "
-            f"{min(len(pts), MAX_LIST_POINTS)})",
-            f"Dwell:  {dwell*1000:.4f} ms   ({dwell*1e6:.1f} µs)",
-            f"Actual freq: {actual_freq:.4f} Hz",
-            f"Period:  {total_time*1000:.3f} ms",
-        ]
-        if warns:
-            info += [f"⚠ {w}" for w in warns]
-        self.timing_lbl.configure(text="\n".join(info))
-        return pts, dwell, warns
+        self._refresh_live_measurement_warning()
+        self._update_output_controls()
 
-    def _preview(self):
-        p = self._read_params()
-        if not p:
+    def _upload_waveform(self):
+        if self._upload_in_flight:
             return
-        pts, dwell, warns = self._generate_points(p)
-        if pts is None:
-            return
-        self.current_points = pts
-        self._update_graph(pts)
-        self.log(f"Preview: {len(pts)} pts, dwell={dwell*1000:.4f} ms,"
-                 f" {math.ceil(len(pts)/MAX_LIST_POINTS)} chunk(s)")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Upload & Run  (chunked, background thread)
-    # ──────────────────────────────────────────────────────────────────────
-    def _pause_auto_measure(self):
-        """Pause auto-measure so it doesn't compete for the SCPI bus."""
-        self._saved_auto_meas = self.auto_meas_var.get()
-        if self._saved_auto_meas:
-            self.auto_meas_var.set(False)
-            if self._meas_timer:
-                self.root.after_cancel(self._meas_timer)
-                self._meas_timer = None
-
-    def _resume_auto_measure(self):
-        """Restore auto-measure to its previous state."""
-        if getattr(self, "_saved_auto_meas", False):
-            self.auto_meas_var.set(True)
-            self._man_auto_meas_tick()
-
-    def _run(self):
-        from tkinter import messagebox
-        if self.is_running:
-            self.log("Already running.", "warn")
+        if self.sequence_active:
+            messagebox.showwarning(
+                "Waveform Running",
+                "Turn output off before uploading a new multi-chunk streamed waveform.")
             return
         if not self.kepco.connected:
             messagebox.showerror("Error", "Connect to a device first.")
             return
-
-        p = self._read_params()
-        if not p:
-            return
-        pts, dwell, _ = self._generate_points(p)
-        if pts is None:
+        req = self._read_waveform_request()
+        if not req:
             return
 
-        self.current_points = pts
-        self.stop_event.clear()
+        self.preview_points = req["plot_points"]
+        self._update_preview_plot(req["plot_points"])
+        self._upload_in_flight = True
         self.is_running = True
-        self.run_btn.configure(state="disabled")
-        self._pause_auto_measure()
+        self.prog_lbl.configure(text="Uploading...")
+        self.progress.set(0)
+        self._pause_status_polling()
+        self._update_output_controls()
+        threading.Thread(target=self._upload_request_worker, args=(req,), daemon=True).start()
 
-        threading.Thread(
-            target=self._upload_thread,
-            args=(pts, dwell, p["mode"], p["loop"]),
-            daemon=True).start()
-
-    def _upload_thread(self, points, dwell, mode, loop_count):
-        """Upload waveform in ≤ 1000-point chunks, run each sequentially.
-
-        Each chunk is uploaded with paced writes (35 ms gap, no *OPC? spam),
-        then verified with LIST:{mode}:POIN? and SYST:ERR? before running.
-        """
+    def _upload_request_worker(self, req):
+        start_sequence = False
         try:
-            chunks = [points[i:i + MAX_LIST_POINTS]
-                      for i in range(0, len(points), MAX_LIST_POINTS)]
-            nc = len(chunks)
-            loops = max(loop_count, 1) if loop_count > 0 else 0
-            forever = loops == 0
-
-            self._log_safe(
-                f"Upload: {len(points)} pts → {nc} chunk(s), "
-                f"dwell={dwell*1000:.4f} ms, "
-                f"loops={'∞' if forever else loops}")
-
-            def _progress_cb(sent, total):
-                """Called by upload_list_chunk after each value batch."""
-                pct = sent / max(total, 1)
-                self.root.after(0, lambda p=pct: self.progress.set(p))
-                self.root.after(0, lambda s=sent, t=total:
-                    self.prog_lbl.configure(
-                        text=f"Uploading… {s}/{t} pts"))
-
-            if nc == 1:
-                # ── single chunk: upload → verify → run ──
-                self._ui_chunk(0, points)
-                self.root.after(0, lambda: self.prog_lbl.configure(
-                    text="Uploading…"))
-
-                ok, msg = self.kepco.upload_list_chunk(
-                    chunks[0], dwell, mode, progress_cb=_progress_cb)
-                if not ok:
-                    self._log_safe(f"Upload error: {msg}", "err")
-                    return
-                self._log_safe(f"Uploaded: {msg}", "ok")
-
-                ok, msg = self.kepco.run_list(mode, loops)
-                self._log_safe(f"Run: {msg}", "ok" if ok else "err")
-                self._ui_chunk(-1, points)
-                self.root.after(0, lambda: self.progress.set(1.0))
-                self.root.after(0, lambda: self.prog_lbl.configure(
-                    text="Running…"))
+            self._wait_for_status_poll_idle()
+            if req["kind"] == "DC":
+                ok, msg = self._apply_dc_request(req)
+            elif req["point_count"] <= MAX_LIST_POINTS:
+                ok, msg = self._upload_single_chunk_request(req)
             else:
-                # ── multi-chunk: upload→run→wait each, repeat ──
-                iters = loops if loops > 0 else 1
-                it = 0
-                while not self.stop_event.is_set():
-                    it += 1
-                    if not forever and it > iters:
+                ok, msg, start_sequence = self._prime_multi_chunk_request(req)
+        except Exception as exc:
+            ok = False
+            msg = str(exc)
+        self._call_on_ui(lambda: self._upload_request_done(req, ok, msg, start_sequence))
+
+    def _apply_dc_request(self, req):
+        self._call_on_ui(lambda: self.progress.set(0.5))
+        mode = req["mode"]
+        value = req["amplitude"]
+        voltage_compliance, current_limit = self._get_request_limits(req)
+        prev_req = self.uploaded_request or {}
+        live_dc_update = (
+            self.current_output_on
+            and prev_req.get("kind") == "DC"
+            and prev_req.get("mode") == mode
+        )
+
+        setpoint_cmd = (
+            f"{mode} {KepcoController.format_scpi_value(value)}")
+
+        if live_dc_update:
+            ok, msg = self._apply_device_limits(
+                mode, voltage_compliance, current_limit)
+            if not ok:
+                return False, f"DC limit setup failed: {msg}"
+            self._log_scpi_sequence("DC live setpoint update", [setpoint_cmd])
+            ok, msg = self.kepco.send_sequence(
+                [setpoint_cmd], label="DC live setpoint update")
+            if not ok:
+                return False, msg
+        else:
+            ok, msg = self._safe_prepare_output(
+                mode,
+                initial_setpoint=0.0,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                label="DC fixed-output safe prepare")
+            if not ok:
+                return False, msg
+            if self.current_output_on:
+                self._log_scpi_sequence(
+                    "DC live handoff setpoint update", [setpoint_cmd])
+                ok, msg = self.kepco.send_sequence(
+                    [setpoint_cmd], label="DC live handoff setpoint update")
+                if not ok:
+                    return False, msg
+
+        self._call_on_ui(lambda: self.progress.set(1.0))
+        unit = "V" if mode == "VOLT" else "A"
+        if live_dc_update:
+            return True, f"DC setpoint updated live to {value:.4f} {unit}"
+        if self.current_output_on:
+            return True, f"DC setpoint applied live at {value:.4f} {unit}"
+        return True, f"DC setpoint staged at {value:.4f} {unit}"
+
+    def _upload_single_chunk_request(self, req):
+        voltage_compliance, current_limit = self._get_request_limits(req)
+
+        def progress_cb(sent, total):
+            pct = sent / max(total, 1)
+            self._call_on_ui(lambda p=pct: self.progress.set(p))
+            self._call_on_ui(
+                lambda s=sent, t=total: self.prog_lbl.configure(
+                    text=f"Uploading... {s}/{t} pts"))
+
+        ok, msg = self.kepco.upload_list_chunk(
+            req["points"], req["dwell"], req["mode"],
+            progress_cb=progress_cb,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit)
+        if not ok:
+            return False, msg
+        if self.current_output_on:
+            count = 0 if req["loop"] == 0 else max(req["loop"], 1)
+            ok, run_msg = self.kepco.run_list(
+                req["mode"],
+                count=count,
+                enable_output=False,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                apply_limit_setup=False)
+            if not ok:
+                return False, f"Upload succeeded but live re-arm failed: {run_msg}"
+            return True, f"{msg}; applied without toggling output"
+        return True, msg
+
+    def _prime_multi_chunk_request(self, req):
+        voltage_compliance, current_limit = self._get_request_limits(req)
+        chunks = [
+            req["points"][i:i + MAX_LIST_POINTS]
+            for i in range(0, len(req["points"]), MAX_LIST_POINTS)
+        ]
+
+        def progress_cb(sent, total):
+            pct = sent / max(total, 1)
+            self._call_on_ui(lambda p=pct: self.progress.set(p))
+            self._call_on_ui(
+                lambda s=sent, t=total: self.prog_lbl.configure(
+                    text=f"Priming chunk 1/{len(chunks)}... {s}/{t} pts"))
+
+        ok, msg = self.kepco.upload_list_chunk(
+            chunks[0], req["dwell"], req["mode"],
+            progress_cb=progress_cb,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit)
+        if not ok:
+            return False, msg, False
+        req["first_chunk_primed"] = True
+        if self.current_output_on:
+            return True, f"{msg}; continuing streamed execution without toggling output", True
+        return True, f"{msg}; remaining {len(chunks) - 1} chunk(s) staged for output-on streaming", False
+
+    def _upload_request_done(self, req, ok, msg, start_sequence):
+        self._upload_in_flight = False
+        prev_req = self.uploaded_request or {}
+        self.uploaded_request = req if ok else self.uploaded_request
+        if ok:
+            self.uploaded_waveform_ready = True
+            self._refresh_live_measurement_warning()
+            self._refresh_uploaded_status_panel()
+            if (
+                self.current_output_on
+                and prev_req.get("kind") == "DC"
+                and prev_req.get("mode") == req["mode"]
+                and req["kind"] == "LIST"
+                and req.get("offset") is not None
+            ):
+                self._measurement_guard = {
+                    "mode": req["mode"],
+                    "previous_value": float(prev_req.get("amplitude", 0.0)),
+                    "expected_value": float(req["offset"]),
+                }
+                self._set_live_measurement_axis(req["mode"], req["offset"])
+            self.log(msg, "ok")
+            if start_sequence:
+                started, start_msg = self._begin_uploaded_sequence(
+                    req,
+                    output_already_on=self.current_output_on,
+                    skip_first_upload=req.get("first_chunk_primed", False),
+                )
+                if started:
+                    self.log(start_msg, "info")
+                    return
+                self.log(start_msg, "err")
+            self.prog_lbl.configure(
+                text="Setpoint staged" if req["kind"] == "DC" else "Uploaded")
+            self.progress.set(1.0)
+        else:
+            self.log(f"Upload failed: {msg}", "err")
+            self.progress.set(0)
+            self.prog_lbl.configure(text="Upload failed")
+            if not self.kepco.connected:
+                self._handle_comm_failure("upload")
+
+        self.is_running = False
+        self._resume_status_polling()
+        self._update_output_controls()
+        self._schedule_status_poll(100)
+
+    def _begin_uploaded_sequence(self, req, output_already_on=False, skip_first_upload=False):
+        if not self.kepco.connected:
+            return False, "Connect to a device first."
+        if self.sequence_active:
+            return False, "A streamed waveform is already active."
+
+        self.stop_event.clear()
+        self.sequence_active = True
+        self.is_running = True
+        self._output_toggle_in_flight = False
+        self._pause_status_polling()
+        self._update_output_controls()
+        if not output_already_on:
+            self._set_output_ui_state(True)
+        self.prog_lbl.configure(text="Streaming...")
+        self.progress.set(0)
+        req["first_chunk_primed"] = False
+        threading.Thread(
+            target=self._sequence_worker,
+            args=(req, output_already_on, skip_first_upload),
+            daemon=True).start()
+        return True, "Streaming multi-chunk waveform."
+
+    def _sequence_worker(self, req, output_already_on=False, skip_first_upload=False):
+        ok = True
+        final_msg = "Waveform sequence complete."
+        stopped = False
+        forever = req["loop"] == 0
+        iteration = 0
+        try:
+            self._wait_for_status_poll_idle()
+            chunks = [
+                req["points"][i:i + MAX_LIST_POINTS]
+                for i in range(0, len(req["points"]), MAX_LIST_POINTS)
+            ]
+            mode = req["mode"]
+            voltage_compliance, current_limit = self._get_request_limits(req)
+
+            while not self.stop_event.is_set():
+                iteration += 1
+                if not forever and iteration > req["loop"]:
+                    break
+
+                for chunk_idx, chunk in enumerate(chunks):
+                    if self.stop_event.is_set():
+                        stopped = True
                         break
 
-                    for ci, ck in enumerate(chunks):
-                        if self.stop_event.is_set():
+                    self._call_on_ui(
+                        lambda pts=req["plot_points"], idx=chunk_idx:
+                            self._update_status_plot(pts, chunk_idx=idx))
+
+                    need_upload = not (skip_first_upload and iteration == 1 and chunk_idx == 0)
+                    if need_upload:
+                        def progress_cb(sent, total, ci=chunk_idx, nc=len(chunks)):
+                            pct = sent / max(total, 1)
+                            self._call_on_ui(lambda p=pct: self.progress.set(p))
+                            self._call_on_ui(
+                                lambda c=ci, n=nc, s=sent, t=total:
+                                    self.prog_lbl.configure(
+                                        text=f"Uploading chunk {c + 1}/{n}... {s}/{t} pts"))
+
+                        ok, msg = self.kepco.upload_list_chunk(
+                            chunk, req["dwell"], mode,
+                            progress_cb=progress_cb,
+                            voltage_compliance=voltage_compliance,
+                            current_limit=current_limit)
+                        if not ok:
+                            final_msg = f"Chunk {chunk_idx + 1} upload failed: {msg}"
                             break
 
-                        self._ui_chunk(ci, points)
-                        il = "∞" if forever else f"{it}/{iters}"
-                        self.root.after(0, lambda c=ci, n=nc, l=il:
+                    enable_output = not output_already_on
+                    ok, msg = self.kepco.run_list(
+                        mode,
+                        count=1,
+                        enable_output=enable_output,
+                        voltage_compliance=voltage_compliance,
+                        current_limit=current_limit,
+                        apply_limit_setup=enable_output)
+                    if not ok:
+                        final_msg = f"Chunk {chunk_idx + 1} run failed: {msg}"
+                        break
+
+                    output_already_on = True
+                    self._call_on_ui(lambda: self._set_output_ui_state(True))
+                    self._call_on_ui(
+                        lambda c=chunk_idx, n=len(chunks), i=iteration:
                             self.prog_lbl.configure(
-                                text=f"Chunk {c+1}/{n} — loop {l}"))
+                                text=f"Running chunk {c + 1}/{n} (loop {i})"))
 
-                        # Upload this chunk (with per-batch progress)
-                        ok, msg = self.kepco.upload_list_chunk(
-                            ck, dwell, mode, progress_cb=_progress_cb)
-                        if not ok:
-                            self._log_safe(
-                                f"Chunk {ci+1} upload failed: {msg}", "err")
-                            return
-                        self._log_safe(
-                            f"Chunk {ci+1}/{nc}: {msg}", "ok")
+                    wait_time = len(chunk) * req["dwell"] + 0.10
+                    end_time = time.time() + wait_time
+                    while time.time() < end_time:
+                        if self.stop_event.is_set():
+                            stopped = True
+                            break
+                        time.sleep(0.05)
+                    if stopped:
+                        break
 
-                        # Run this chunk once
-                        ok, msg = self.kepco.run_list(mode, count=1)
-                        if not ok:
-                            self._log_safe(
-                                f"Chunk {ci+1} run failed: {msg}", "err")
-                            return
+                    self._call_on_ui(
+                        lambda p=(chunk_idx + 1) / max(len(chunks), 1): self.progress.set(p))
 
-                        # Wait for chunk to finish executing + margin
-                        wait = len(ck) * dwell + 0.10
-                        elapsed = 0.0
-                        while elapsed < wait and not self.stop_event.is_set():
-                            time.sleep(min(0.05, wait - elapsed))
-                            elapsed += 0.05
+                skip_first_upload = False
+                if not ok or stopped:
+                    break
+                if forever:
+                    continue
 
-                        pct = (ci + 1) / nc
-                        self.root.after(0, lambda p=pct: self.progress.set(p))
+            if forever and not stopped and ok:
+                final_msg = "Streamed waveform stopped."
+        except Exception as exc:
+            ok = False
+            final_msg = str(exc)
 
-                    if not self.stop_event.is_set():
-                        self._log_safe(f"Completed iteration {it}", "ok")
+        stop_ok = True
+        if output_already_on:
+            stop_ok, stop_msg = self.kepco.stop(base_mode=req["mode"])
+            if not stop_ok:
+                ok = False
+                final_msg = stop_msg
+        self._call_on_ui(
+            lambda: self._sequence_done(req, ok, final_msg, stopped, stop_ok))
 
-                self._ui_chunk(-1, points)
+    def _sequence_done(self, req, ok, msg, stopped, stop_ok):
+        self.sequence_active = False
+        self.is_running = False
+        self._output_toggle_in_flight = False
+        if self.uploaded_request:
+            self.uploaded_request["first_chunk_primed"] = False
 
-            self.root.after(0, lambda: self.prog_lbl.configure(text="Done"))
-            self.root.after(0, lambda: self.progress.set(1.0))
-            self._log_safe("Waveform sequence complete.", "ok")
+        self._set_output_ui_state(False)
+        self.progress.set(0)
+        self.prog_lbl.configure(text="Idle")
+        self._update_status_plot(req["plot_points"])
 
-        except Exception as e:
-            self._log_safe(f"Error: {e}", "err")
-        finally:
-            self.is_running = False
-            self.root.after(0, lambda: self.run_btn.configure(state="normal"))
-            self.root.after(0, lambda: self._resume_auto_measure())
+        if ok:
+            self.log("Waveform stream stopped." if stopped else msg, "ok")
+        else:
+            self.log(msg, "err")
+            if not self.kepco.connected:
+                self._handle_comm_failure("waveform streaming")
 
-    def _ui_chunk(self, idx, pts):
-        """Thread-safe graph update."""
-        self.root.after(0, lambda: self._update_graph(pts, chunk_idx=idx))
+        self._resume_status_polling()
+        self._update_output_controls()
+        self._schedule_status_poll(100)
 
-    def _log_safe(self, msg, tag="info"):
-        self.root.after(0, lambda: self.log(msg, tag))
+    def _toggle_output(self):
+        if self._output_toggle_in_flight:
+            return
+        target_on = not self.current_output_on
+        req = self.uploaded_request
 
-    # ──────────────────────────────────────────────────────────────────────
-    #  Stop
-    # ──────────────────────────────────────────────────────────────────────
-    def _stop(self):
+        if not self.kepco.connected:
+            self._set_output_ui_state(False)
+            self.log("Not connected - connect first.", "warn")
+            return
+        if target_on and not self.uploaded_waveform_ready:
+            self._set_output_ui_state(False)
+            self.log("Upload a waveform before enabling output.", "warn")
+            return
+        if target_on:
+            req = self._request_with_latest_ui_limits(req)
+            if not req:
+                self._set_output_ui_state(False)
+                return
+        if not target_on and self.sequence_active:
+            self._output_toggle_in_flight = True
+            self.output_toggle_btn.configure(state="disabled")
+            self.log("Stopping streamed waveform...", "info")
+            self.stop_event.set()
+            return
+        if target_on and req and req["kind"] == "LIST" and req["point_count"] > MAX_LIST_POINTS:
+            started, msg = self._begin_uploaded_sequence(
+                req, output_already_on=False,
+                skip_first_upload=req.get("first_chunk_primed", False))
+            if not started:
+                self._set_output_ui_state(False)
+                self.log(msg, "err")
+            else:
+                self.log(msg, "info")
+            return
+
+        self._output_toggle_in_flight = True
+        self.output_toggle_btn.configure(state="disabled")
+        self._pause_status_polling()
+        threading.Thread(
+            target=self._output_toggle_worker,
+            args=(target_on, req),
+            daemon=True).start()
+
+    def _enable_dc_output(self, req):
+        mode = req["mode"]
+        value = req["amplitude"]
+        voltage_compliance, current_limit = self._get_request_limits(req)
+        ok, msg = self._safe_prepare_output(
+            mode,
+            initial_setpoint=0.0,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            label="DC safe setup before OUTP ON")
+        if not ok:
+            return False, msg
+
+        setpoint_cmd = (
+            f"{mode} {KepcoController.format_scpi_value(value)}")
+        cmds = ["OUTP ON", setpoint_cmd]
+        self._log_scpi_sequence("DC enable and apply setpoint", cmds)
+        ok, msg = self.kepco.send_sequence(
+            cmds, label="DC enable and apply setpoint")
+        if not ok:
+            return False, msg
+        unit = "V" if mode == "VOLT" else "A"
+        return True, f"Output ON; {mode} setpoint {value:.4f} {unit}"
+
+    def _output_toggle_worker(self, target_on, req):
+        try:
+            self._wait_for_status_poll_idle()
+            mode = (req or {}).get("mode") or self.current_control_mode
+            if target_on:
+                if req["kind"] == "DC":
+                    ok, msg = self._enable_dc_output(req)
+                else:
+                    count = 0 if req["loop"] == 0 else max(req["loop"], 1)
+                    voltage_compliance, current_limit = self._get_request_limits(req)
+                    ok, msg = self.kepco.run_list(
+                        mode,
+                        count=count,
+                        enable_output=True,
+                        voltage_compliance=voltage_compliance,
+                        current_limit=current_limit)
+            else:
+                if req and req["kind"] == "LIST":
+                    ok, msg = self.kepco.stop(base_mode=mode)
+                else:
+                    ok = bool(self.kepco.send("OUTP OFF"))
+                    msg = "Output OFF" if ok else "Failed to turn output OFF"
+        except Exception as exc:
+            ok = False
+            msg = str(exc)
+        self._call_on_ui(lambda: self._output_toggle_done(target_on, ok, msg))
+
+    def _output_toggle_done(self, target_on, ok, msg):
+        self._output_toggle_in_flight = False
+        if ok:
+            self._set_output_ui_state(target_on)
+            self.log(msg, "ok")
+            if target_on:
+                self.prog_lbl.configure(text="Output enabled")
+            else:
+                self.prog_lbl.configure(text="Idle")
+                self.progress.set(0)
+            self._resume_status_polling()
+            self._update_output_controls()
+            self._schedule_status_poll(100)
+            return
+        self._set_output_ui_state(not target_on)
+        self.log(msg, "err")
+        self._resume_status_polling()
+        self._update_output_controls()
+        if not self.kepco.connected:
+            self._handle_comm_failure("output toggle")
+
+    def _start_scan(self):
+        self.scan_btn.configure(state="disabled", text="Scanning...")
+        self.log(
+            "Scanning local subnet for Kepco devices "
+            "(Telnet 5024 first, fallback 5025)...",
+            "info")
+        ip = self.ip_var.get().strip()
+        base = ".".join(ip.split(".")[:3]) + ".0" if ip else "192.168.50.0"
+
+        def done(results):
+            self._call_on_ui(lambda: self._scan_done(results))
+
+        def progress(done_count, total_count):
+            self._call_on_ui(lambda: self.progress.set(done_count / total_count))
+
+        threading.Thread(
+            target=Discovery.scan_subnet,
+            args=(base, done, progress),
+            daemon=True).start()
+
+    def _scan_done(self, results):
+        self.scan_btn.configure(state="normal", text="Scan Network")
+        self.progress.set(0)
+        if results:
+            ips = [ip for ip, _idn in results]
+            self.ip_combo.configure(values=ips)
+            self.ip_var.set(ips[0])
+            self.log(f"Network scan complete: {len(results)} device(s) found", "ok")
+            for ip, idn in results:
+                self.log(f"Found {ip} -> {idn}", "ok")
+        else:
+            self.log("Network scan complete: 0 devices found", "warn")
+
+    def _toggle_connect(self):
+        if self._connect_in_flight:
+            return
+
+        if not self.kepco.connected:
+            ip = self.ip_var.get().strip()
+            self.log(f"Connect requested for {ip}", "info")
+            self._connect_in_flight = True
+            self.conn_btn.configure(state="disabled", text="Connecting...")
+            threading.Thread(target=self._connect_worker, args=(ip,), daemon=True).start()
+        else:
+            if self.sequence_active or self._upload_in_flight:
+                messagebox.showwarning(
+                    "Waveform Busy",
+                    "Wait for the active upload/stream to finish before disconnecting.")
+                return
+            self.log("Disconnect requested", "info")
+            self._connect_in_flight = True
+            self.conn_btn.configure(state="disabled", text="Disconnecting...")
+            threading.Thread(target=self._disconnect_worker, daemon=True).start()
+
+    def _connect_worker(self, ip):
+        ok, msg = self.kepco.connect(ip, validate_identity=True)
+        idn = self.kepco.last_identity or None
+        self._call_on_ui(lambda: self._connect_done(ok, msg, ip, idn))
+
+    def _connect_done(self, ok, msg, ip, idn):
+        self._connect_in_flight = False
+        self.conn_btn.configure(state="normal")
+        if ok:
+            self._set_connected_state(True, idn or "Unknown device")
+            self._reset_live_status()
+            self._reset_uploaded_state()
+            self.log(
+                f"Connected to {ip} via {self.kepco.transport} "
+                f"({self.kepco.port}): {idn or 'Unknown device'}",
+                "ok")
+            self._start_status_polling()
+        else:
+            self.kepco.disconnect()
+            self._set_connected_state(False)
+            self._reset_live_status()
+            self._reset_uploaded_state()
+            self.log(f"Connection failed: {msg}", "err")
+
+    def _disconnect_worker(self):
+        self._wait_for_status_poll_idle()
+        ok, err_msg = self._safe_output_off_before_disconnect()
+        if ok:
+            self.kepco.disconnect()
+        self._call_on_ui(lambda: self._disconnect_done(ok, err_msg))
+
+    def _safe_output_off_before_disconnect(self):
+        if not self.kepco.connected:
+            return True, ""
+
+        def _parse_num(raw):
+            try:
+                return float(str(raw).strip())
+            except Exception:
+                return None
+
+        base_mode = (
+            self.uploaded_request["mode"]
+            if self.uploaded_request else self.current_control_mode
+        )
+
+        for attempt in range(2):
+            errors = []
+            ok_stop, stop_msg = self.kepco.stop(base_mode=base_mode)
+            if not ok_stop:
+                errors.append(f"stop failed ({stop_msg})")
+
+            for cmd, desc in [
+                ("VOLT 0", "set voltage to 0V"),
+                ("CURR 0", "set current to 0A"),
+                ("OUTP OFF", "turn output OFF"),
+            ]:
+                if not self.kepco.send(cmd):
+                    err = self.kepco.last_error or "send failed"
+                    errors.append(f"could not {desc} ({err})")
+
+            outp = (self.kepco.send("OUTP?", query=True) or "").strip().upper()
+            v = _parse_num(self.kepco.send("VOLT?", query=True))
+            c = _parse_num(self.kepco.send("CURR?", query=True))
+            outp_ok = outp in ("0", "OFF")
+            zero_ok = (
+                v is not None and c is not None
+                and abs(v) <= 0.05 and abs(c) <= 0.05
+            )
+
+            if outp_ok and zero_ok:
+                return True, ""
+
+            errors.append(
+                f"verification failed (OUTP?='{outp}', VOLT?='{v}', CURR?='{c}')")
+            if attempt == 0:
+                time.sleep(0.1)
+            else:
+                return False, "; ".join(errors)
+
+        return False, "safety verification failed"
+
+    def _disconnect_done(self, ok, err_msg):
+        self._connect_in_flight = False
+        self.conn_btn.configure(state="normal")
+        if not ok:
+            self._set_connected_state(True, self.idn_lbl.cget("text"))
+            self.log(f"Disconnect blocked by safety interlock: {err_msg}", "err")
+            messagebox.showerror(
+                "Safety Interlock",
+                "Disconnect blocked.\n"
+                "Output could not be verified OFF at 0V/0A.\n"
+                f"Details: {err_msg}")
+            return
+
+        self._stop_status_polling()
+        self.stop_event.set()
+        self.sequence_active = False
+        self.is_running = False
+        self._set_connected_state(False)
+        self._reset_live_status()
+        self._reset_uploaded_state()
+        self.log("Disconnected.", "info")
+
+    def _on_close(self):
         self.stop_event.set()
         if self.kepco.connected:
-            ok, msg = self.kepco.stop()
-            self.log(f"Stop: {msg}", "ok" if ok else "err")
-        self.is_running = False
-        self.run_btn.configure(state="normal")
-        self.prog_lbl.configure(text="Idle")
-        self.progress.set(0)
-        self._resume_auto_measure()
-        if self.current_points:
-            self._update_graph(self.current_points)
+            ok, err_msg = self._safe_output_off_before_disconnect()
+            if not ok:
+                self.log(f"Close blocked by safety interlock: {err_msg}", "err")
+                messagebox.showerror(
+                    "Safety Interlock",
+                    "Close blocked.\n"
+                    "Output could not be verified OFF at 0V/0A.\n"
+                    f"Details: {err_msg}")
+                return
+            self.kepco.disconnect()
+        self._stop_status_polling()
+        self._stop_data_collection()
+        self.log("Application closed.", "info")
+        self._close_log_file()
+        self._stop_ui_dispatcher()
+        self.root.destroy()
 
-    # ──────────────────────────────────────────────────────────────────────
     def run(self):
         self.root.mainloop()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 if __name__ == "__main__":
-    App().run()
+    DashboardApp().run()
