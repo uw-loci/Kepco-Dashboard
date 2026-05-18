@@ -1,39 +1,31 @@
-# Kepco BIT 802E Waveform Generator
+# Kepco BIT 802E Dashboard
 
-Desktop GUI for generating, previewing, uploading, and controlling waveforms on a Kepco BIT 802E / BOP power supply. The app uses a hardened SCPI controller with Telnet-first communication, socket fallback, chunked LIST uploads, live status polling, and safety interlocks for disconnect and shutdown.
+Desktop GUI for configuring, previewing, uploading, and running DC setpoints or LIST waveforms on a Kepco BIT 802E / BOP power supply. The app is built with CustomTkinter and Matplotlib, talks SCPI over TCP, and is designed around a staged workflow: connect, configure, preview, upload, then enable output.
 
-## Key Features
+## What The App Does
 
-- Generate `DC`, `Sine`, `Square`, `Triangle`, `Sawtooth`, and CSV-based waveforms
-- Preview waveform shape and timing before anything is sent to hardware
-- Upload LIST waveforms in verified chunks that respect device limits
-- Connect over Telnet on `5024` with automatic fallback to SCPI socket `5025`
-- Scan local `/24` networks for devices and validate them with `*IDN?`
-- Use manual SCPI controls for diagnostics, measurements, and overrides
-- Persist session logs to `logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log`
-- Develop offline with the included simulator in `kepco_simulator.py`
-- Enforce safe disconnect behavior by returning output to `0 V`, `0 A`, and `OFF`
+- Connects to a Kepco by IP, trying Telnet on `5024` first and direct SCPI socket on `5025` second
+- Scans the selected `/24` subnet and validates candidate devices with `*IDN?`
+- Generates `DC`, `Sine`, `Square`, `Triangle`, `Sawtooth`, and CSV-based waveforms
+- Previews waveform shape locally before sending anything to hardware
+- Uploads LIST data in verified chunks that fit the BIT 802E command and point limits
+- Supports voltage (`VOLT`) and current (`CURR`) control modes with signed software limits
+- Provides manual SCPI controls, quick diagnostic queries, range control, health check, and reset
+- Shows the uploaded waveform, live output state, control mode, and voltage/current readback
+- Optionally records live readback samples to CSV
+- Logs session and communication activity to `logs/`
+- Attempts a safe shutdown on disconnect or close by stopping output and verifying `OFF` at approximately `0 V` and `0 A`
 
-## Project Files
+## Main Files
 
-- `kepco_ui.py`: main CustomTkinter desktop application
-- `kepco_simulator.py`: simulator that emulates Kepco Telnet and socket behavior
+- `kepco_ui.py`: main desktop application, SCPI controller, waveform generation, discovery, and UI orchestration
+- `requirements.txt`: Python dependencies
 - `docs/interface.md`: architecture and interface notes
 - `docs/802e_manual.md`: device reference material
-- `requirements.txt`: Python dependencies
-
-## Hardware Limits Implemented
-
-- Minimum dwell: `0.0005 s`
-- Maximum dwell: `10.0 s`
-- Maximum points per single LIST upload: `1000`
-- Maximum total staged points in the UI: `4000`
-- Preferred transport: Telnet on `5024`
-- Fallback transport: direct SCPI socket on `5025`
 
 ## Getting Started
 
-1. Create and activate a virtual environment.
+Create a virtual environment and install dependencies:
 
 ```powershell
 python -m venv .venv
@@ -41,177 +33,89 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. Optional: run the simulator for offline testing.
-
-```powershell
-python kepco_simulator.py
-```
-
-3. Start the UI.
+Start the dashboard:
 
 ```powershell
 python kepco_ui.py
 ```
 
-4. In the app:
+## Typical Workflow
 
-- Select or scan for a device IP
-- Connect and confirm identity
-- Choose control mode and waveform settings
-- Preview the waveform locally
-- Upload the waveform
-- Toggle output on to run it
-- Stop or disconnect when finished
+1. Enter a device IP or use **Scan Network**.
+2. Click **Connect** and confirm the device identity appears.
+3. In **Manual Override**, select `VOLT` or `CURR` mode and adjust V/I limits if needed.
+4. In **Waveform Generator**, choose a waveform and enter frequency, amplitude, offset, point count, and loop count.
+5. Click **Preview Waveform** to validate the waveform locally.
+6. Click **Upload** to stage the DC setpoint or LIST waveform on the device.
+7. Use **Enable Output** to run the uploaded output.
+8. Use **Disable Output**, **Disconnect**, or close the app when finished.
 
-## Functional UI Flow
+The output control remains locked until a waveform or DC setpoint has been uploaded.
 
-This diagram focuses on the actual user-triggered paths in the UI.
+## Waveforms And Uploads
 
-```mermaid
-flowchart TD
-    A[Launch UI] --> B[Session log opens]
-    B --> C[Enter IP or click Scan Network]
-    C --> D[Click Connect]
-    D --> E{Connection and *IDN? succeed}
-    E -- No --> F[Show connection error in log]
-    E -- Yes --> G[Connected state enabled and status polling starts]
+`DC` uses fixed `VOLT` or `CURR` commands and does not use LIST mode.
 
-    G --> H[Select VOLT or CURR mode]
-    H --> I[Choose waveform type]
-    I --> J[Enter waveform settings or load CSV]
-    J --> K[Click Preview Waveform]
-    K --> L[Preview plot updates locally]
-    L --> M[Click Upload]
-    M --> N{Request accepted}
-    N -- No --> O[Show validation or upload error]
-    N -- Yes --> P[Waveform or DC setpoint becomes ready]
+Generated AC waveforms and CSV waveforms use LIST mode. A single LIST upload is limited to `1000` points, so larger waveforms are staged as multiple chunks. The app supports up to `4000` total points and streams multi-chunk waveforms chunk-by-chunk while output is enabled.
 
-    P --> Q[Click Output toggle]
-    Q --> R{Ready waveform is DC, single LIST, or multi-chunk LIST}
-    R -- DC --> S[Send OUTP ON]
-    R -- Single LIST --> T[Run uploaded LIST]
-    R -- Multi-chunk LIST --> U[Start streamed chunk sequence]
+CSV mode reads numeric cells from the selected file, flattens them into one point list, requires at least two points, and uses the selected frequency to calculate dwell. If the file contains more than `4000` values, only the first `4000` are used.
 
-    S --> V[Status tab and measurements update]
-    T --> V
-    U --> V
+## Limits And Safety
 
-    G --> W[Manual Override tab]
-    W --> X[Send SCPI command or query]
-    X --> V
+Implemented hardware and software limits:
 
-    V --> Y[Click Output toggle OFF or Stop]
-    Y --> Z[Return output to safe idle state]
-    Z --> G
+- Minimum dwell: `0.0005 s`
+- Maximum dwell: `10.0 s`
+- Maximum LIST points per upload chunk: `1000`
+- Maximum staged waveform points: `4000`
+- BOP voltage rating used by the UI limit check: `+/-100 V`
+- BOP current rating used by the UI limit check: `+/-2 A`
+- Default voltage compliance entries: `+20 V` and `-20 V`
+- Default current limit entries: `+2 A` and `-2 A`
 
-    G --> AA[Click Disconnect or close app]
-    AA --> AB[Run safety shutdown and verify OFF at 0 V and 0 A]
-    AB --> AC[Socket closes and UI returns to disconnected state]
+Before preview or upload, the app validates the requested waveform against the configured signed limit range for the selected control mode. On disconnect or application close, it stops LIST mode, sets `VOLT 0`, sets `CURR 0`, sends `OUTP OFF`, and verifies `OUTP?`, `VOLT?`, and `CURR?`. If verification fails, disconnect or close is blocked so the operator can resolve the unsafe state.
+
+## Status, Logs, And Data Collection
+
+While connected, the dashboard polls:
+
+- `MEAS:VOLT?`
+- `MEAS:CURR?`
+- `OUTP?`
+- `FUNC:MODE?`
+
+Session logs are written to:
+
+```text
+logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log
 ```
 
-## Telnet and SCPI Communication Flow
+When **Collect data** is enabled, readback samples are written to:
 
-This diagram focuses on the controller behavior used for connect, command execution, upload, run, and disconnect.
-
-```mermaid
-flowchart TD
-    A[UI action starts worker thread] --> B[KepcoController]
-
-    B --> C[Try TCP connect on 5024 Telnet]
-    C --> D{Telnet connect works}
-    D -- Yes --> E[Drain Telnet negotiation bytes]
-    D -- No --> F[Try TCP connect on 5025 socket]
-    F --> G{Socket connect works}
-    G -- No --> H[Return connection failure to UI]
-    G -- Yes --> I[Use socket transport]
-    E --> J[Send *IDN?]
-    I --> J
-    J --> K[Read response and strip Telnet prompt or echo noise]
-    K --> L[Return connected state to UI]
-
-    L --> M{Operation}
-    M -- Preview --> N[No SCPI traffic]
-    M -- Manual command --> O[Send SCPI command]
-    M -- Manual query --> P[Send SCPI query and read one response]
-    M -- Upload LIST --> Q[Prepare LIST upload]
-    M -- Output ON --> R[Run DC output or LIST mode]
-    M -- Output OFF or Disconnect --> S[Stop output and verify safe state]
-
-    O --> T[Pause about 35 ms between non-query commands]
-    T --> U[If using Telnet drain echoed bytes]
-
-    P --> V[Read one response line]
-    V --> W[Remove IAC bytes prompt text and echoed command]
-
-    Q --> X[Optional disarm of active LIST mode]
-    X --> Y[Send FUNC:MODE mode and mode:RANG 1]
-    Y --> Z[Send LIST:CLE and wait]
-    Z --> AA[Send LIST values in small batches]
-    AA --> AB[Pause between commands and drain Telnet echo]
-    AB --> AC[Send LIST:DWEL and wait]
-    AC --> AD[Query LIST points accepted]
-    AD --> AE[Query SYST:ERR?]
-    AE --> AF[Return upload success or failure to UI]
-
-    R --> AG[DC: OUTP ON]
-    R --> AH[LIST: LIST:COUN then mode:MODE LIST]
-    AG --> AI[Status polling continues]
-    AH --> AI
-
-    S --> AJ[For LIST stop return mode to FIX and turn output OFF]
-    AJ --> AK[Send VOLT 0 and CURR 0 for disconnect]
-    AK --> AL[Verify OUTP? VOLT? and CURR?]
-    AL --> AM{Verification passed}
-    AM -- No --> AN[Block disconnect and report interlock error]
-    AM -- Yes --> AO[Close socket and reset UI state]
+```text
+logs/kepco_readback_collection_date_YYYY-MM-DD_HHMMSS.csv
 ```
 
-## Runtime Behavior Summary
+The data collection CSV includes timestamp, elapsed seconds, readback voltage, readback current, output state, and mode.
 
-- `Preview` is local-only and does not send SCPI commands.
-- `Upload` sends SCPI only after input validation, dwell calculation, and software interlock checks.
-- Single-chunk waveforms are uploaded once and can then be armed or run.
-- Multi-chunk waveforms are streamed chunk-by-chunk because the device accepts at most `1000` LIST points per upload.
-- The controller spaces non-query commands by about `35 ms` to respect device throughput limits.
-- On Telnet, the controller drains echoed command bytes so the device echo buffer does not block later commands.
-- Status polling runs only while connected and updates output state, measurements, and the status tab.
+## Communication Notes
 
-## CSV Behavior
+The controller uses paced SCPI writes with a `35 ms` gap between non-query commands. Telnet echo and negotiation bytes are drained so query responses are not confused with echoed commands. Uploads verify accepted LIST point count and check the device error queue after the transfer.
 
-- CSV input accepts numeric values and flattens rows into one point list.
-- The UI uses the loaded CSV values as the waveform data and computes dwell from the requested frequency.
-- CSV data is truncated to the app's maximum supported total point count when necessary.
-- CSV waveforms require at least `2` valid points.
-
-## Safety and Interlocks
-
-- The app prevents disconnect while an upload or multi-chunk stream is active.
-- Before disconnect, the controller attempts the following sequence:
-- Stop LIST mode
-- Set `VOLT 0`
-- Set `CURR 0`
-- Send `OUTP OFF`
-- Verify `OUTP?`, `VOLT?`, and `CURR?`
-- If verification fails, disconnect is blocked and the user is shown an interlock error.
+Preview is local-only. Upload, output toggle, manual SCPI commands, status polling, and disconnect safety checks are the paths that communicate with the device.
 
 ## Troubleshooting
 
-- If connection fails, confirm the device is reachable on port `5024` or `5025`.
-- If the app connects but commands appear to stall, inspect Telnet echo handling and device firmware behavior.
-- If uploads fail, check waveform size, dwell constraints, and software limits in the selected control mode.
-- Use `kepco_simulator.py` to reproduce connection and upload behavior without hardware.
-- Review the log panel or the saved session log file for command-level details.
-
-## Development Notes
-
-- The SCPI controller is implemented in `KepcoController` inside `kepco_ui.py`.
-- Device discovery is handled by `Discovery.scan_subnet`.
-- Waveform timing and point generation live in `WaveformGen`.
-- The GUI orchestration is handled by `DashboardApp`.
+- If connection fails, confirm the IP address and check ports `5024` and `5025`.
+- If scan finds nothing, enter an IP in the expected subnet first; scan uses that `/24`.
+- If upload is rejected, check waveform point count, dwell warnings, and the configured V/I limits.
+- If output is locked, upload a waveform or DC setpoint first.
+- Use `kepco_simulator.py` to test the workflow without hardware.
+- Review the on-screen log or the saved session log for SCPI-level details.
 
 ## Known Limitations
 
 - The repository does not currently include automated tests.
 - CSV mode is labeled `untested` in the UI and should be validated on target hardware.
-- During AC waveform uploads using the LIST command, Live Measurement readback values are inaccurate due to limitations of the 802E BIT LAN card.
-- Higher frequency waveforms are limited by the number of points that can be sent due to a dwell time minimum of 0.0005 seconds. This produces a larger step difference between each point.
+- BIT 802E readback can be inaccurate while LIST-driven AC output is active; the UI shows a warning during that state.
+- Higher frequency requests may reduce the requested point count because dwell cannot go below `0.0005 s`.
