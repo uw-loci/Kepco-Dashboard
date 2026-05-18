@@ -20,8 +20,14 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 
 - `kepco_ui.py`: main desktop application, SCPI controller, waveform generation, discovery, and UI orchestration
 - `requirements.txt`: Python dependencies
-- `docs/interface.md`: architecture and interface notes
 - `docs/802e_manual.md`: device reference material
+
+The main code paths in `kepco_ui.py` are organized around four classes:
+
+- `DashboardApp`: builds the UI and coordinates preview, upload, output control, status polling, logging, and data collection
+- `KepcoController`: owns SCPI transport, command pacing, LIST upload/run/stop behavior, and disconnect safety actions
+- `Discovery`: scans a `/24` subnet for devices that respond like Kepco/BOP/BIT hardware
+- `WaveformGen`: calculates dwell timing and generates waveform point lists
 
 ## Getting Started
 
@@ -110,7 +116,6 @@ Preview is local-only. Upload, output toggle, manual SCPI commands, status polli
 - If scan finds nothing, enter an IP in the expected subnet first; scan uses that `/24`.
 - If upload is rejected, check waveform point count, dwell warnings, and the configured V/I limits.
 - If output is locked, upload a waveform or DC setpoint first.
-- Use `kepco_simulator.py` to test the workflow without hardware.
 - Review the on-screen log or the saved session log for SCPI-level details.
 
 ## Known Limitations
