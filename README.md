@@ -110,6 +110,15 @@ The controller uses paced SCPI writes with a `35 ms` gap between non-query comma
 
 Preview is local-only. Upload, output toggle, manual SCPI commands, status polling, and disconnect safety checks are the paths that communicate with the device.
 
+## Maintenance Notes
+
+- Route device communication through `KepcoController.send_cmd`, `send_query`, or `send_sequence`; those helpers enforce locking, command pacing, Telnet echo handling, and reconnect behavior.
+- Worker threads must update the GUI through `DashboardApp._call_on_ui`. Direct Tkinter updates from background threads can destabilize the UI.
+- Upload, output-toggle, and streaming paths pause status polling, wait for any in-flight poll to finish, then resume polling. Disconnect waits for any active poll before running the safety sequence and stops polling after disconnect.
+- Waveforms over `1000` points are not resident on the device all at once. The first chunk is primed, then `_sequence_worker` uploads and runs subsequent chunks while streaming.
+- V/I limit entries serve both as software interlocks and as device limit inputs. The active output channel is checked in software; the complementary channel is sent to the device as the compliance/current limit when appropriate.
+- Data collection is driven by status polling, so samples pause whenever polling is paused for uploads, output transitions, streaming, or disconnect safety checks.
+
 ## Troubleshooting
 
 - If connection fails, confirm the IP address and check ports `5024` and `5025`.
