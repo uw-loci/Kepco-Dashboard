@@ -31,6 +31,8 @@ import matplotlib.lines as mlines
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+from solenoid_temperature_reader import WebMonitorSolenoidTemperatureReader
+
 # -- Constants ---------------------------------------------------------------
 MIN_DWELL        = 0.0005    # 500 us - hardware minimum
 MAX_DWELL        = 10.0      # hardware maximum
@@ -51,6 +53,7 @@ DEFAULT_POSITIVE_CURRENT_LIMIT = 2.0
 DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
 DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
+SOLENOID_TEMPERATURE_POLL_MS = 3000
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -988,6 +991,9 @@ class DashboardApp:
         self._status_poll_in_flight = False
         self._status_poll_timer = None
         self._measurement_guard = None
+        self._solenoid_temperature_poll_timer = None
+        self._last_solenoid_temperature_error_logged = None
+        self._last_solenoid_temperature_source_logged = None
 
         self.log_file_handle = None
         self.log_file_path = ""
@@ -997,6 +1003,11 @@ class DashboardApp:
         self.data_collection_started_at = None
         self.data_collection_enabled = False
         self._data_collection_switch_updating = False
+        self.solenoid_temperature_reader = WebMonitorSolenoidTemperatureReader()
+        self.solenoid_temperatures = {"1": None, "2": None}
+        self.solenoid_temperature_timestamp = None
+        self.solenoid_temperature_source_path = None
+        self.solenoid_temperature_error = None
 
         self.current_control_mode = "VOLT"
         self.control_mode_var = ctk.StringVar(value="VOLT")
@@ -1011,6 +1022,7 @@ class DashboardApp:
         self._reset_live_status()
         self._reset_uploaded_state()
         self._on_wave_change()
+        self._start_solenoid_temperature_polling()
 
         if self.log_file_path:
             self.log(f"Session log file: {self.log_file_path}", "info")
@@ -1804,6 +1816,69 @@ class DashboardApp:
             self._close_data_collection_file()
             self._set_data_collection_switch(False)
             self.log(f"Data collection stopped: {exc}", "err")
+
+    def _start_solenoid_temperature_polling(self):
+        self._poll_solenoid_temperatures()
+
+    def _schedule_solenoid_temperature_poll(self, delay_ms=SOLENOID_TEMPERATURE_POLL_MS):
+        if self._ui_shutdown:
+            return
+        if self._solenoid_temperature_poll_timer:
+            try:
+                self.root.after_cancel(self._solenoid_temperature_poll_timer)
+            except Exception:
+                pass
+            self._solenoid_temperature_poll_timer = None
+        self._solenoid_temperature_poll_timer = self.root.after(
+            delay_ms, self._poll_solenoid_temperatures)
+
+    def _stop_solenoid_temperature_polling(self):
+        if self._solenoid_temperature_poll_timer:
+            try:
+                self.root.after_cancel(self._solenoid_temperature_poll_timer)
+            except Exception:
+                pass
+            self._solenoid_temperature_poll_timer = None
+
+    def _poll_solenoid_temperatures(self):
+        self._solenoid_temperature_poll_timer = None
+        if self._ui_shutdown:
+            return
+
+        snapshot = self.solenoid_temperature_reader.read_latest()
+        self.solenoid_temperature_error = snapshot.error
+        self.solenoid_temperature_source_path = snapshot.source_path
+        self.solenoid_temperature_timestamp = snapshot.timestamp
+
+        if snapshot.error:
+            self.solenoid_temperatures = {"1": None, "2": None}
+            if snapshot.error != self._last_solenoid_temperature_error_logged:
+                self.log(
+                    f"Solenoid temperature read unavailable: {snapshot.error}",
+                    "warn")
+                self._last_solenoid_temperature_error_logged = snapshot.error
+            self._schedule_solenoid_temperature_poll()
+            return
+
+        self.solenoid_temperatures = {
+            "1": snapshot.solenoid_1,
+            "2": snapshot.solenoid_2,
+        }
+
+        if (
+            snapshot.source_path
+            and snapshot.source_path != self._last_solenoid_temperature_source_logged
+        ):
+            self.log(
+                f"Reading solenoid temperatures from {snapshot.source_path}",
+                "info")
+            self._last_solenoid_temperature_source_logged = snapshot.source_path
+
+        if self._last_solenoid_temperature_error_logged is not None:
+            self.log("Solenoid temperature read recovered.", "ok")
+            self._last_solenoid_temperature_error_logged = None
+
+        self._schedule_solenoid_temperature_poll()
 
     def _start_ui_dispatcher(self):
         if self._ui_shutdown or self._ui_queue_job is not None:
@@ -3466,6 +3541,7 @@ class DashboardApp:
                 return
             self.kepco.disconnect()
         self._stop_status_polling()
+        self._stop_solenoid_temperature_polling()
         self._stop_data_collection()
         self.log("Application closed.", "info")
         self._close_log_file()
