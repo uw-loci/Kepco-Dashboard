@@ -23,6 +23,7 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 - `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM WebMonitor JSONL logs for DC current monitoring
 - `requirements.txt`: Python dependencies
 - `docs/802e_manual.md`: device reference material
+- [`docs/KEPCO LAN IP Configuration Steps 2026-3-15-CMov.pdf`](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf): Kepco LAN/IP setup reference for configuring network access to the supply
 
 The main code paths in `kepco_ui.py` are organized around four classes:
 
@@ -32,6 +33,8 @@ The main code paths in `kepco_ui.py` are organized around four classes:
 - `WaveformGen`: calculates dwell timing and generates waveform point lists
 
 ## Getting Started
+New Kepco devices must be configured for LAN/IP access before the dashboard can connect to them. Follow the steps in the [Kepco LAN/IP configuration guide](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf) before using **Scan Network** or **Connect** with a new supply.
+
 
 Create a virtual environment and install dependencies:
 
@@ -153,6 +156,7 @@ Preview is local-only. Upload, output toggle, manual SCPI commands, status polli
 
 ## Troubleshooting
 
+- When connecting the Kepco to a new laptop/device, set a manual IP address for the Ethernet adapter on the same subnet. See step 7 in the [Kepco LAN/IP configuration guide](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf).
 - If connection fails, confirm the IP address and check ports `5024` and `5025`.
 - If scan finds nothing, enter an IP in the expected subnet first; scan uses that `/24`.
 - If upload is rejected, check waveform point count, dwell warnings, and the configured V/I limits.
