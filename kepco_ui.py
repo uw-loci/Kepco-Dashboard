@@ -66,6 +66,8 @@ DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
 DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
+DEFAULT_VMON_THRESHOLD_V = 1.0
+DEFAULT_IMON_THRESHOLD_MA = 5.0
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -1039,6 +1041,7 @@ class DashboardApp:
         self.solenoid_temperature_timestamp = None
         self.solenoid_temperature_source_path = None
         self.solenoid_temperature_error = None
+        self.dc_current_monitor_state = {"Vmon": "inactive", "Imon": "inactive"}
 
         # UI-thread handoff state. Worker callbacks are queued here and drained
         # by a short root.after loop so Tk widgets stay on the main thread.
@@ -1377,7 +1380,7 @@ class DashboardApp:
         cards.grid_columnconfigure(2, weight=1)
 
         mode_card = ctk.CTkFrame(cards, corner_radius=12)
-        mode_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        mode_card.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
         ctk.CTkLabel(
             mode_card, text="Set Control Mode",
             font=ctk.CTkFont(size=14, weight="bold")).pack(
@@ -1398,7 +1401,7 @@ class DashboardApp:
             anchor="w", padx=14, pady=(0, 12))
 
         limits_card = ctk.CTkFrame(cards, corner_radius=12)
-        limits_card.grid(row=0, column=1, sticky="nsew", padx=4)
+        limits_card.grid(row=0, column=0, sticky="nsew", padx=4)
         ctk.CTkLabel(
             limits_card, text="Set V/I Limits",
             font=ctk.CTkFont(size=14, weight="bold")).pack(
@@ -1477,6 +1480,37 @@ class DashboardApp:
             font=ctk.CTkFont(size=13, weight="bold")).pack(
             fill="x", padx=14, pady=(0, 14))
 
+        monitor_card = ctk.CTkFrame(cards, corner_radius=12)
+        monitor_card.grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ctk.CTkLabel(
+            monitor_card, text="DC Current Monitor Thresholds",
+            font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 6))
+
+        monitor_row = ctk.CTkFrame(monitor_card, fg_color="transparent")
+        monitor_row.pack(fill="x", padx=14, pady=(0, 14))
+
+        v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
+        v_ctrl.pack(side="left", padx=(0, 18))
+        ctk.CTkLabel(
+            v_ctrl, text="Vmon tolerance (V):",
+            text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
+            anchor="w")
+        self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=120)
+        self.vmon_threshold_entry.insert(0, str(DEFAULT_VMON_THRESHOLD_V))
+        self.vmon_threshold_entry.pack(anchor="w", pady=(3, 0))
+
+        i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
+        i_ctrl.pack(side="left")
+        ctk.CTkLabel(
+            i_ctrl, text="Imon tolerance (mA):",
+            text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
+            anchor="w")
+        self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=120)
+        self.imon_threshold_entry.insert(0, str(DEFAULT_IMON_THRESHOLD_MA))
+        self.imon_threshold_entry.pack(anchor="w", pady=(3, 0))
+
         self._update_mode_buttons(self.control_mode_var.get())
 
     def _build_status_panel(self, parent):
@@ -1553,6 +1587,17 @@ class DashboardApp:
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#34d399")
         self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
+        monitor_row = ctk.CTkFrame(meas_card, fg_color="transparent")
+        monitor_row.pack(fill="x", padx=20, pady=(0, 12))
+        self.status_monitor_labels = {}
+        for key in ("Vmon", "Imon"):
+            pill = ctk.CTkLabel(
+                monitor_row, text=key, width=74, height=28,
+                corner_radius=6, fg_color=C["card"],
+                text_color=C["text2"],
+                font=ctk.CTkFont(size=12, weight="bold"))
+            pill.pack(side="left", padx=(0, 8))
+            self.status_monitor_labels[key] = pill
         self.status_meas_warn_lbl = ctk.CTkLabel(
             meas_card,
             text="",
@@ -2027,6 +2072,7 @@ class DashboardApp:
         self.current_control_mode = "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
         self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
+        self._set_dc_current_monitors_inactive()
         self._set_status_output_display(False)
         self._set_status_mode_display(None)
         self.control_mode_var.set("VOLT")
@@ -2045,6 +2091,7 @@ class DashboardApp:
         self.prog_lbl.configure(text="No upload yet")
         self.progress.set(0)
         self._set_output_ui_state(False)
+        self._set_dc_current_monitors_inactive()
         self._refresh_live_measurement_warning()
         self._update_output_controls()
 
@@ -2089,6 +2136,8 @@ class DashboardApp:
         self.current_output_on = bool(is_on)
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
+        if not is_on:
+            self._set_dc_current_monitors_inactive()
         self._refresh_live_measurement_warning()
 
     def _set_status_output_display(self, is_on):
@@ -2224,6 +2273,86 @@ class DashboardApp:
             return
         self._set_live_measurement_warning_visible(
             self._is_live_measurement_warning_active())
+
+    def _set_dc_monitor_indicator(self, key, state):
+        if not hasattr(self, "status_monitor_labels"):
+            return
+
+        colors = {
+            "inactive": (C["card"], C["text2"]),
+            "ok": (C["green"], "#000000"),
+            "triggered": (C["red"], "#ffffff"),
+            "unavailable": (C["amber"], "#111827"),
+        }
+        fg_color, text_color = colors.get(state, colors["inactive"])
+        self.status_monitor_labels[key].configure(
+            fg_color=fg_color, text_color=text_color)
+        self.dc_current_monitor_state[key] = state
+
+    def _set_dc_current_monitors_inactive(self):
+        self._set_dc_monitor_indicator("Vmon", "inactive")
+        self._set_dc_monitor_indicator("Imon", "inactive")
+
+    def _read_monitor_thresholds(self):
+        voltage_threshold = DEFAULT_VMON_THRESHOLD_V
+        current_threshold_ma = DEFAULT_IMON_THRESHOLD_MA
+
+        if hasattr(self, "vmon_threshold_entry"):
+            value = self._as_float(self.vmon_threshold_entry.get())
+            if value is not None and value > 0:
+                voltage_threshold = value
+        if hasattr(self, "imon_threshold_entry"):
+            value = self._as_float(self.imon_threshold_entry.get())
+            if value is not None and value > 0:
+                current_threshold_ma = value
+
+        return voltage_threshold, current_threshold_ma / 1000.0
+
+    def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
+        req = self.uploaded_request or {}
+        active = (
+            self.kepco.connected
+            and is_on
+            and mode_text == "CURR"
+            and req.get("kind") == "DC"
+            and req.get("mode") == "CURR"
+        )
+        if not active:
+            self._set_dc_current_monitors_inactive()
+            return
+
+        iset = self._as_float(req.get("amplitude"))
+        live_current = self._as_float(current)
+        live_voltage = self._as_float(voltage)
+        voltage_threshold, current_threshold = self._read_monitor_thresholds()
+
+        if iset is not None and live_current is not None:
+            imon_state = (
+                "ok"
+                if abs(live_current - iset) <= current_threshold
+                else "triggered"
+            )
+        else:
+            imon_state = "triggered"
+        self._set_dc_monitor_indicator("Imon", imon_state)
+
+        temp_a = self._as_float(self.solenoid_temperatures.get("1"))
+        temp_b = self._as_float(self.solenoid_temperatures.get("2"))
+        if temp_a is None or temp_b is None:
+            self._set_dc_monitor_indicator("Vmon", "unavailable")
+            return
+
+        if iset is None or live_voltage is None:
+            self._set_dc_monitor_indicator("Vmon", "triggered")
+            return
+
+        expected_voltage = iset * (20.95 + 0.0470 * (temp_a + temp_b))
+        vmon_state = (
+            "ok"
+            if abs(live_voltage - expected_voltage) <= voltage_threshold
+            else "triggered"
+        )
+        self._set_dc_monitor_indicator("Vmon", vmon_state)
 
     @staticmethod
     def _as_float(value):
@@ -2977,6 +3106,7 @@ class DashboardApp:
             self.current_output_on = is_on
             self._set_status_output_display(is_on)
 
+        self._update_dc_current_monitors(v, c, is_on, mode_text)
         self._refresh_live_measurement_warning()
         self._update_output_controls()
 
