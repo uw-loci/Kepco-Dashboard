@@ -67,7 +67,7 @@ DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
 PMON_STALE_SECONDS = 10.0
-DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 1.0
+DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
 DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
 
 # -- Material colour palette -------------------------------------------------
@@ -1518,7 +1518,7 @@ class DashboardApp:
         self.imon_threshold_entry.pack(anchor="w", pady=(3, 0))
 
         btn_wrap = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        btn_wrap.pack(side="right")
+        btn_wrap.pack(side="left", padx=(16, 0), pady=(16, 0))
         ctk.CTkButton(
             btn_wrap, text="Set", width=60,
             command=self._set_monitor_thresholds,
