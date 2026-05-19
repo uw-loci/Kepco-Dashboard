@@ -1427,7 +1427,7 @@ class DashboardApp:
         ctk.CTkLabel(v_ctrl, text="-", width=14).pack(side="left")
         self.soft_volt_neg_limit_entry = ctk.CTkEntry(v_ctrl, width=68)
         self.soft_volt_neg_limit_entry.insert(
-            0, str(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE))
+            0, str(abs(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE)))
         self.soft_volt_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
             v_ctrl, text="Set", width=54,
@@ -1448,7 +1448,7 @@ class DashboardApp:
         ctk.CTkLabel(c_ctrl, text="-", width=14).pack(side="left")
         self.soft_curr_neg_limit_entry = ctk.CTkEntry(c_ctrl, width=68)
         self.soft_curr_neg_limit_entry.insert(
-            0, str(DEFAULT_NEGATIVE_CURRENT_LIMIT))
+            0, str(abs(DEFAULT_NEGATIVE_CURRENT_LIMIT)))
         self.soft_curr_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
             c_ctrl, text="Set", width=54,
@@ -2597,12 +2597,12 @@ class DashboardApp:
     def _read_signed_limit_pair(self, pos_entry, neg_entry, name, max_abs):
         pos = abs(float(pos_entry.get().strip()))
         neg = -abs(float(neg_entry.get().strip()))
-        if pos <= 0 or neg >= 0:
+        if pos <= 0 or abs(neg) <= 0:
             raise ValueError(f"{name} limits must be nonzero.")
         if pos > max_abs or abs(neg) > max_abs:
             raise ValueError(f"{name} limits must be within +/-{max_abs:.1f}.")
         self._normalize_limit_entry_text(pos_entry, pos)
-        self._normalize_limit_entry_text(neg_entry, neg)
+        self._normalize_limit_entry_text(neg_entry, abs(neg))
         return pos, neg
 
     def _get_device_limits_from_ui(self, show_error=False):
