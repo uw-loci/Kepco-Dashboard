@@ -66,8 +66,9 @@ DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
 DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
-DEFAULT_VMON_THRESHOLD_V = 1.0
-DEFAULT_IMON_THRESHOLD_MA = 5.0
+PMON_STALE_SECONDS = 10.0
+DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V = 1.0
+DEFAULT_CURRENT_MONITOR_THRESHOLD_MA = 5.0
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -1041,7 +1042,9 @@ class DashboardApp:
         self.solenoid_temperature_timestamp = None
         self.solenoid_temperature_source_path = None
         self.solenoid_temperature_error = None
-        self.dc_current_monitor_state = {"Vmon": "inactive", "Imon": "inactive"}
+        self._last_unique_pmon_timestamp = None
+        self._last_unique_pmon_seen_at = None
+        self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
 
         # UI-thread handoff state. Worker callbacks are queued here and drained
         # by a short root.after loop so Tk widgets stay on the main thread.
@@ -1494,21 +1497,21 @@ class DashboardApp:
         v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
         v_ctrl.pack(side="left", padx=(0, 18))
         ctk.CTkLabel(
-            v_ctrl, text="Vmon tolerance (V):",
+            v_ctrl, text="Voltage tolerance (V):",
             text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
             anchor="w")
         self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=120)
-        self.vmon_threshold_entry.insert(0, str(DEFAULT_VMON_THRESHOLD_V))
+        self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V))
         self.vmon_threshold_entry.pack(anchor="w", pady=(3, 0))
 
         i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
         i_ctrl.pack(side="left")
         ctk.CTkLabel(
-            i_ctrl, text="Imon tolerance (mA):",
+            i_ctrl, text="Current tolerance (mA):",
             text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
             anchor="w")
         self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=120)
-        self.imon_threshold_entry.insert(0, str(DEFAULT_IMON_THRESHOLD_MA))
+        self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_MA))
         self.imon_threshold_entry.pack(anchor="w", pady=(3, 0))
 
         self._update_mode_buttons(self.control_mode_var.get())
@@ -1573,41 +1576,64 @@ class DashboardApp:
 
         meas_card = ctk.CTkFrame(content, corner_radius=12, fg_color=C["graph_bg"])
         meas_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        title_font = ctk.CTkFont(size=15, weight="bold")
+        meas_title_row = ctk.CTkFrame(meas_card, fg_color="transparent")
+        meas_title_row.pack(fill="x", padx=20, pady=(14, 8))
         ctk.CTkLabel(
-            meas_card, text="Live Measurements",
-            font=ctk.CTkFont(size=15, weight="bold")).pack(
-            anchor="w", padx=20, pady=(14, 8))
+            meas_title_row, text="Live Measurements",
+            font=title_font).pack(side="left")
+        self.status_ac_invalid_lbl = ctk.CTkLabel(
+            meas_title_row, text="Invalid During AC Operation",
+            text_color=C["red"], font=title_font)
+        self._ac_invalid_label_visible = False
+
+        meas_values = ctk.CTkFrame(meas_card, fg_color="transparent")
+        meas_values.pack(fill="x", padx=20, pady=(6, 10))
+        meas_values.grid_columnconfigure(0, weight=1)
+        meas_values.grid_columnconfigure(1, weight=1)
+
+        vi_values = ctk.CTkFrame(meas_values, fg_color="transparent")
+        vi_values.grid(row=0, column=0, sticky="w")
         self.status_meas_volt_lbl = ctk.CTkLabel(
-            meas_card, text="Voltage:  ---.----  V",
+            vi_values, text="Voltage:  ---.----  V",
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#60a5fa")
-        self.status_meas_volt_lbl.pack(anchor="w", padx=20, pady=(6, 4))
+        self.status_meas_volt_lbl.pack(anchor="w", pady=(0, 4))
         self.status_meas_curr_lbl = ctk.CTkLabel(
-            meas_card, text="Current:  ---.----  A",
+            vi_values, text="Current:  ---.----  A",
             font=ctk.CTkFont(family="Consolas", size=20),
             text_color="#34d399")
-        self.status_meas_curr_lbl.pack(anchor="w", padx=20, pady=(4, 14))
-        monitor_row = ctk.CTkFrame(meas_card, fg_color="transparent")
-        monitor_row.pack(fill="x", padx=20, pady=(0, 12))
-        self.status_monitor_labels = {}
-        for key in ("Vmon", "Imon"):
-            pill = ctk.CTkLabel(
-                monitor_row, text=key, width=74, height=28,
-                corner_radius=6, fg_color=C["card"],
+        self.status_meas_curr_lbl.pack(anchor="w", pady=(4, 0))
+
+        temp_values = ctk.CTkFrame(meas_values, fg_color="transparent")
+        temp_values.grid(row=0, column=1, sticky="w", padx=(20, 0))
+        temp_font = ctk.CTkFont(family="Consolas", size=20)
+        self.status_solenoid_temp_1_lbl = ctk.CTkLabel(
+            temp_values, text="Solenoid 1:  --.-  \N{DEGREE SIGN}C",
+            font=temp_font, text_color="#facc15")
+        self.status_solenoid_temp_1_lbl.pack(anchor="w", pady=(0, 4))
+        self.status_solenoid_temp_2_lbl = ctk.CTkLabel(
+            temp_values, text="Solenoid 2:  --.-  \N{DEGREE SIGN}C",
+            font=temp_font, text_color="#facc15")
+        self.status_solenoid_temp_2_lbl.pack(anchor="w", pady=(4, 0))
+
+        self.status_live_console = ctk.CTkFrame(
+            meas_card, corner_radius=6, fg_color="#111827",
+            border_width=1, border_color=C["border"])
+        self.status_live_console.pack(fill="x", padx=20, pady=(0, 14))
+        self.status_live_console_labels = {}
+        for key in ("voltage", "current", "pmon", "stale"):
+            label = ctk.CTkLabel(
+                self.status_live_console,
+                text="",
+                height=20,
+                justify="left",
+                anchor="w",
                 text_color=C["text2"],
-                font=ctk.CTkFont(size=12, weight="bold"))
-            pill.pack(side="left", padx=(0, 8))
-            self.status_monitor_labels[key] = pill
-        self.status_meas_warn_lbl = ctk.CTkLabel(
-            meas_card,
-            text="",
-            height=30,
-            justify="left",
-            anchor="w",
-            wraplength=340,
-            text_color=C["amber"],
-            font=ctk.CTkFont(size=11, weight="bold"))
-        self.status_meas_warn_lbl.pack(fill="x", padx=20, pady=(0, 14))
+                font=ctk.CTkFont(family="Consolas", size=12, weight="bold"))
+            label.pack(fill="x", padx=10, pady=(6 if key == "voltage" else 0, 6))
+            self.status_live_console_labels[key] = label
+        self.status_live_console_labels["stale"].pack_forget()
 
         info_card = ctk.CTkFrame(content, corner_radius=12)
         info_card.grid(row=1, column=1, sticky="nsew")
@@ -1936,9 +1962,12 @@ class DashboardApp:
         self.solenoid_temperature_error = snapshot.error
         self.solenoid_temperature_source_path = snapshot.source_path
         self.solenoid_temperature_timestamp = snapshot.timestamp
+        self._note_pmon_timestamp(snapshot.timestamp)
 
         if snapshot.error:
             self.solenoid_temperatures = {"1": None, "2": None}
+            self._update_solenoid_temperature_display()
+            self._refresh_pmon_console_lines()
             if snapshot.error != self._last_solenoid_temperature_error_logged:
                 self.log(
                     f"Solenoid temperature read unavailable: {snapshot.error}",
@@ -1951,6 +1980,8 @@ class DashboardApp:
             "1": snapshot.solenoid_1,
             "2": snapshot.solenoid_2,
         }
+        self._update_solenoid_temperature_display()
+        self._refresh_pmon_console_lines()
 
         if (
             snapshot.source_path
@@ -2079,7 +2110,7 @@ class DashboardApp:
         if hasattr(self, "mode_buttons"):
             self._update_mode_buttons("VOLT")
         self._set_output_ui_state(False)
-        self._refresh_live_measurement_warning()
+        self._refresh_ac_operation_notice()
 
     def _reset_uploaded_state(self):
         self.uploaded_request = None
@@ -2092,7 +2123,7 @@ class DashboardApp:
         self.progress.set(0)
         self._set_output_ui_state(False)
         self._set_dc_current_monitors_inactive()
-        self._refresh_live_measurement_warning()
+        self._refresh_ac_operation_notice()
         self._update_output_controls()
 
     def _refresh_uploaded_status_panel(self):
@@ -2138,7 +2169,7 @@ class DashboardApp:
         self._set_status_output_display(is_on)
         if not is_on:
             self._set_dc_current_monitors_inactive()
-        self._refresh_live_measurement_warning()
+        self._refresh_ac_operation_notice(is_on)
 
     def _set_status_output_display(self, is_on):
         self.status_output_pill.configure(
@@ -2250,52 +2281,77 @@ class DashboardApp:
                 fg_color=C["green"] if active else C["card"],
                 text_color="#ffffff" if active else C["text"])
 
-    def _is_live_measurement_warning_active(self):
+    def _is_ac_operation_active(self, is_on=None):
         req = self.uploaded_request or {}
+        output_on = self.current_output_on if is_on is None else bool(is_on)
         return bool(
             self.kepco.connected
-            and self.current_output_on
+            and output_on
             and req.get("kind") == "LIST"
             and req.get("wave") not in ("", None, "DC")
         )
 
-    def _set_live_measurement_warning_visible(self, visible):
-        text = ""
-        if visible and self._is_live_measurement_warning_active():
-            text = (
-                "Warning: BIT 802E readback may be inaccurate while "
-                "LIST-driven AC output is active."
-            )
-        self.status_meas_warn_lbl.configure(text=text, text_color=C["amber"])
-
-    def _refresh_live_measurement_warning(self):
-        if not hasattr(self, "status_meas_warn_lbl"):
+    def _refresh_ac_operation_notice(self, is_on=None):
+        if not hasattr(self, "status_ac_invalid_lbl"):
             return
-        self._set_live_measurement_warning_visible(
-            self._is_live_measurement_warning_active())
+        visible = self._is_ac_operation_active(is_on)
+        if visible:
+            self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
+            self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
+        if visible and not self._ac_invalid_label_visible:
+            self.status_ac_invalid_lbl.pack(side="left", padx=(16, 0))
+            self._ac_invalid_label_visible = True
+        elif not visible and self._ac_invalid_label_visible:
+            self.status_ac_invalid_lbl.pack_forget()
+            self._ac_invalid_label_visible = False
 
-    def _set_dc_monitor_indicator(self, key, state):
-        if not hasattr(self, "status_monitor_labels"):
+    def _set_live_console_line(self, key, text, color, visible=True):
+        if not hasattr(self, "status_live_console_labels"):
+            return
+        label = self.status_live_console_labels.get(key)
+        if label is None:
+            return
+        if visible:
+            try:
+                label.pack_info()
+                packed = True
+            except Exception:
+                packed = False
+            if not packed:
+                label.pack(fill="x", padx=10, pady=(0, 6))
+            label.configure(text=text, text_color=color)
+        else:
+            label.pack_forget()
+
+    def _refresh_pmon_console_lines(self):
+        if self.solenoid_temperature_error:
+            self._set_live_console_line(
+                "pmon", "WebMonitor Log File Not Found/Invalid", C["amber"])
+            self._set_live_console_line(
+                "stale", "Warning: stale values from PMON",
+                C["amber"], visible=False)
             return
 
-        colors = {
-            "inactive": (C["card"], C["text2"]),
-            "ok": (C["green"], "#000000"),
-            "triggered": (C["red"], "#ffffff"),
-            "unavailable": (C["amber"], "#111827"),
-        }
-        fg_color, text_color = colors.get(state, colors["inactive"])
-        self.status_monitor_labels[key].configure(
-            fg_color=fg_color, text_color=text_color)
-        self.dc_current_monitor_state[key] = state
+        self._set_live_console_line("pmon", "WebMonitor Log File valid", C["green"])
+        stale_age = self._pmon_stale_age_seconds()
+        stale = stale_age is not None and stale_age > PMON_STALE_SECONDS
+        self._set_live_console_line(
+            "stale",
+            "Warning: stale values from PMON",
+            C["amber"],
+            visible=stale)
 
     def _set_dc_current_monitors_inactive(self):
-        self._set_dc_monitor_indicator("Vmon", "inactive")
-        self._set_dc_monitor_indicator("Imon", "inactive")
+        self._set_live_console_line(
+            "voltage", "Voltage monitor inactive", C["text2"])
+        self._set_live_console_line(
+            "current", "Current monitor inactive", C["text2"])
+        self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
+        self._refresh_pmon_console_lines()
 
     def _read_monitor_thresholds(self):
-        voltage_threshold = DEFAULT_VMON_THRESHOLD_V
-        current_threshold_ma = DEFAULT_IMON_THRESHOLD_MA
+        voltage_threshold = DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V
+        current_threshold_ma = DEFAULT_CURRENT_MONITOR_THRESHOLD_MA
 
         if hasattr(self, "vmon_threshold_entry"):
             value = self._as_float(self.vmon_threshold_entry.get())
@@ -2327,43 +2383,98 @@ class DashboardApp:
         voltage_threshold, current_threshold = self._read_monitor_thresholds()
 
         if iset is not None and live_current is not None:
-            imon_state = (
-                "ok"
-                if abs(live_current - iset) <= current_threshold
-                else "triggered"
-            )
+            current_ok = abs(live_current - iset) <= current_threshold
         else:
-            imon_state = "triggered"
-        self._set_dc_monitor_indicator("Imon", imon_state)
+            current_ok = False
+        self._set_live_console_line(
+            "current",
+            "Current within expected range" if current_ok else "Current outside expected range",
+            C["green"] if current_ok else C["red"])
+        self.dc_current_monitor_state["current"] = "ok" if current_ok else "triggered"
 
         temp_a = self._as_float(self.solenoid_temperatures.get("1"))
         temp_b = self._as_float(self.solenoid_temperatures.get("2"))
-        if temp_a is None or temp_b is None:
-            self._set_dc_monitor_indicator("Vmon", "unavailable")
-            return
-
-        if iset is None or live_voltage is None:
-            self._set_dc_monitor_indicator("Vmon", "triggered")
+        if temp_a is None or temp_b is None or iset is None or live_voltage is None:
+            self._set_live_console_line(
+                "voltage", "Cannot compute expected voltage", C["amber"])
+            self.dc_current_monitor_state["voltage"] = "unavailable"
+            self._refresh_pmon_console_lines()
             return
 
         expected_voltage = iset * (20.95 + 0.0470 * (temp_a + temp_b))
-        vmon_state = (
-            "ok"
-            if abs(live_voltage - expected_voltage) <= voltage_threshold
-            else "triggered"
-        )
-        self._set_dc_monitor_indicator("Vmon", vmon_state)
+        voltage_ok = abs(live_voltage - expected_voltage) <= voltage_threshold
+        self._set_live_console_line(
+            "voltage",
+            "Voltage within expected range" if voltage_ok else "Voltage outside expected range",
+            C["green"] if voltage_ok else C["red"])
+        self.dc_current_monitor_state["voltage"] = "ok" if voltage_ok else "triggered"
+        self._refresh_pmon_console_lines()
 
     @staticmethod
     def _as_float(value):
         try:
-            return float(value)
+            number = float(value)
         except Exception:
             return None
+        return number if math.isfinite(number) else None
+
+    def _format_measurement_value(self, value):
+        numeric = self._as_float(value)
+        return f"{numeric:.4f}" if numeric is not None else "---.----"
+
+    def _format_temperature_value(self, value):
+        numeric = self._as_float(value)
+        return f"{numeric:.1f}" if numeric is not None else "--.-"
+
+    def _update_solenoid_temperature_display(self):
+        if not hasattr(self, "status_solenoid_temp_1_lbl"):
+            return
+        temp_1 = self._format_temperature_value(self.solenoid_temperatures.get("1"))
+        temp_2 = self._format_temperature_value(self.solenoid_temperatures.get("2"))
+        self.status_solenoid_temp_1_lbl.configure(
+            text=f"Solenoid 1:  {temp_1}  \N{DEGREE SIGN}C")
+        self.status_solenoid_temp_2_lbl.configure(
+            text=f"Solenoid 2:  {temp_2}  \N{DEGREE SIGN}C")
+
+    def _note_pmon_timestamp(self, timestamp):
+        if not timestamp:
+            return
+        if timestamp != self._last_unique_pmon_timestamp:
+            self._last_unique_pmon_timestamp = timestamp
+            self._last_unique_pmon_seen_at = time.time()
+
+    @staticmethod
+    def _timestamp_to_epoch(timestamp):
+        text = str(timestamp or "").strip()
+        if not text:
+            return None
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return time.mktime(time.strptime(text[:19], fmt))
+            except ValueError:
+                pass
+        return None
+
+    def _pmon_stale_age_seconds(self):
+        timestamp = self.solenoid_temperature_timestamp
+        if not timestamp:
+            return None
+
+        epoch = self._timestamp_to_epoch(timestamp)
+        if epoch is not None:
+            return max(0.0, time.time() - epoch)
+
+        self._note_pmon_timestamp(timestamp)
+        if self._last_unique_pmon_seen_at is None:
+            return None
+        return max(0.0, time.time() - self._last_unique_pmon_seen_at)
 
     def _set_live_measurement_axis(self, mode, value):
-        numeric = self._as_float(value)
-        text = f"{numeric:.4f}" if numeric is not None else "---.----"
+        if self._is_ac_operation_active():
+            text = "---.----"
+        else:
+            text = self._format_measurement_value(value)
         if mode == "VOLT":
             self.status_meas_volt_lbl.configure(text=f"Voltage:  {text}  V")
         elif mode == "CURR":
@@ -3072,14 +3183,6 @@ class DashboardApp:
 
     def _apply_live_status(self, v, c, outp, mode):
         """Normalize raw SCPI status replies and update local/UI state."""
-        try:
-            v_str = f"{float(v):.4f}"
-        except Exception:
-            v_str = str(v).strip() or "---.----"
-        try:
-            c_str = f"{float(c):.4f}"
-        except Exception:
-            c_str = str(c).strip() or "---.----"
         out_text = str(outp).strip().upper()
         is_on = out_text in ("1", "ON")
         mode_text = str(mode).strip().upper()
@@ -3090,6 +3193,9 @@ class DashboardApp:
         if mode_text not in ("VOLT", "CURR"):
             mode_text = None
 
+        ac_operation = self._is_ac_operation_active(is_on)
+        v_str = "---.----" if ac_operation else self._format_measurement_value(v)
+        c_str = "---.----" if ac_operation else self._format_measurement_value(c)
         self.status_meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
         self.status_meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
         self._set_status_output_display(is_on)
@@ -3106,8 +3212,8 @@ class DashboardApp:
             self.current_output_on = is_on
             self._set_status_output_display(is_on)
 
+        self._refresh_ac_operation_notice(is_on)
         self._update_dc_current_monitors(v, c, is_on, mode_text)
-        self._refresh_live_measurement_warning()
         self._update_output_controls()
 
     # -- Upload and multi-chunk streaming ------------------------------------
@@ -3272,7 +3378,7 @@ class DashboardApp:
         self.uploaded_request = req if ok else self.uploaded_request
         if ok:
             self.uploaded_waveform_ready = True
-            self._refresh_live_measurement_warning()
+            self._refresh_ac_operation_notice()
             self._refresh_uploaded_status_panel()
             if (
                 self.current_output_on
