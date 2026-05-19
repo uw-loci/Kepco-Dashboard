@@ -3,12 +3,14 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 
 
 WEBMONITOR_LOG_PATTERN = "webMonitor_log_*.txt"
 EBEAM_DASHBOARD_DIR = "EBEAM_dashboard"
 WEBMONITOR_LOG_DIR = "EBEAM-Dashboard-WMLogs"
+WEBMONITOR_TAIL_CHUNK_BYTES = 64 * 1024
+WEBMONITOR_TAIL_SCAN_BYTES = 2 * 1024 * 1024
 
 TemperatureValue = Optional[Union[float, str]]
 
@@ -36,60 +38,57 @@ class WebMonitorSolenoidTemperatureReader:
     def read_latest(self) -> SolenoidTemperatureSnapshot:
         """Return solenoid 1/2 values from the newest valid WebMonitor log entry."""
         try:
-            log_file = self._find_latest_log_file()
-            if log_file is None:
+            log_files = self._find_log_files_newest_first()
+            if not log_files:
                 return SolenoidTemperatureSnapshot(
                     error=f"No {WEBMONITOR_LOG_PATTERN} files found in {self.log_dir}"
                 )
 
-            try:
-                if log_file.stat().st_size == 0:
-                    return SolenoidTemperatureSnapshot(
-                        source_path=str(log_file),
-                        error=f"Newest WebMonitor log is empty: {log_file}",
-                    )
-            except OSError as exc:
-                return SolenoidTemperatureSnapshot(
-                    source_path=str(log_file),
-                    error=f"Unable to inspect WebMonitor log {log_file}: {exc}",
-                )
+            for log_file in log_files:
+                try:
+                    if log_file.stat().st_size == 0:
+                        continue
+                except OSError:
+                    continue
 
-            entry = self._read_last_valid_entry(log_file)
-            if entry is None:
-                return SolenoidTemperatureSnapshot(
-                    source_path=str(log_file),
-                    error=f"No valid JSON status entry found in {log_file}",
-                )
+                entry = self._read_last_valid_entry(log_file)
+                if entry is None:
+                    continue
 
-            temperatures = self._extract_temperatures(entry)
-            if temperatures is None:
-                return SolenoidTemperatureSnapshot(
-                    source_path=str(log_file),
-                    error=f"Latest valid JSON entry has no status.temperatures object: {log_file}",
-                )
+                temperatures = self._extract_temperatures(entry)
+                if temperatures is None:
+                    continue
 
-            timestamp = entry.get("timestamp")
-            if not isinstance(timestamp, str):
-                timestamp = None
+                timestamp = entry.get("timestamp")
+                if not isinstance(timestamp, str):
+                    timestamp = None
+
+                return SolenoidTemperatureSnapshot(
+                    solenoid_1=self._normalize_temperature_value(
+                        self._get_temperature(temperatures, "1")
+                    ),
+                    solenoid_2=self._normalize_temperature_value(
+                        self._get_temperature(temperatures, "2")
+                    ),
+                    timestamp=timestamp,
+                    source_path=str(log_file),
+                )
 
             return SolenoidTemperatureSnapshot(
-                solenoid_1=self._normalize_temperature_value(
-                    self._get_temperature(temperatures, "1")
-                ),
-                solenoid_2=self._normalize_temperature_value(
-                    self._get_temperature(temperatures, "2")
-                ),
-                timestamp=timestamp,
-                source_path=str(log_file),
+                error=(
+                    "No valid JSON status entry found in the newest "
+                    f"{WEBMONITOR_TAIL_SCAN_BYTES} bytes of any "
+                    f"{WEBMONITOR_LOG_PATTERN} file in {self.log_dir}"
+                )
             )
         except OSError as exc:
             return SolenoidTemperatureSnapshot(
                 error=f"Unable to read WebMonitor log directory {self.log_dir}: {exc}"
             )
 
-    def _find_latest_log_file(self) -> Optional[Path]:
+    def _find_log_files_newest_first(self) -> List[Path]:
         if not self.log_dir.exists() or not self.log_dir.is_dir():
-            return None
+            return []
 
         candidates = []
         for path in self.log_dir.glob(WEBMONITOR_LOG_PATTERN):
@@ -101,28 +100,63 @@ class WebMonitorSolenoidTemperatureReader:
                 continue
 
         if not candidates:
-            return None
+            return []
 
         candidates.sort(reverse=True)
-        return candidates[0][2]
+        return [candidate[2] for candidate in candidates]
 
     def _read_last_valid_entry(self, path: Path) -> Optional[dict]:
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                lines = handle.readlines()
-        except (OSError, UnicodeDecodeError):
+            with path.open("rb") as handle:
+                handle.seek(0, 2)
+                file_size = handle.tell()
+                bytes_remaining = min(file_size, WEBMONITOR_TAIL_SCAN_BYTES)
+                position = file_size
+                pending_prefix = b""
+
+                while position > 0 and bytes_remaining > 0:
+                    read_size = min(
+                        WEBMONITOR_TAIL_CHUNK_BYTES,
+                        position,
+                        bytes_remaining,
+                    )
+                    position -= read_size
+                    bytes_remaining -= read_size
+                    handle.seek(position)
+                    chunk = handle.read(read_size)
+                    lines = (chunk + pending_prefix).splitlines()
+
+                    if position > 0 and lines:
+                        pending_prefix = lines[0]
+                        lines = lines[1:]
+                    else:
+                        pending_prefix = b""
+
+                    for raw_line in reversed(lines):
+                        entry = self._parse_status_line(raw_line)
+                        if entry is not None:
+                            return entry
+        except OSError:
             return None
 
-        for raw_line in reversed(lines):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(entry, dict) and self._extract_temperatures(entry) is not None:
-                return entry
+        return None
+
+    def _parse_status_line(self, raw_line: bytes) -> Optional[dict]:
+        try:
+            line = raw_line.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+
+        if not line:
+            return None
+
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(entry, dict) and self._extract_temperatures(entry) is not None:
+            return entry
 
         return None
 
