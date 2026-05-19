@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 import ipaddress
+import datetime
 from tkinter import messagebox, filedialog
 
 # -- GUI + plotting ----------------------------------------------------------
@@ -2462,12 +2463,18 @@ class DashboardApp:
         if not text:
             return None
 
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                return time.mktime(time.strptime(text[:19], fmt))
-            except ValueError:
-                pass
-        return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+
+        try:
+            parsed = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return time.mktime(parsed.timetuple()) + parsed.microsecond / 1_000_000
+
+        return parsed.timestamp()
 
     def _pmon_stale_age_seconds(self):
         timestamp = self.solenoid_temperature_timestamp
