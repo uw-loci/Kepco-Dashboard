@@ -10,6 +10,15 @@ Hardware Constraints (BIT 802E manual):
   - Dwell time: 0.0005 s (500 us) to 10 s
   - For >1000 points: sequential multi-list upload required
   - Use the active mode's RANG 1 to avoid quarter-scale transients
+
+Maintenance Map:
+  - KepcoController owns SCPI transport, pacing, Telnet echo cleanup, and
+    hardware verification.
+  - Discovery and WaveformGen are small stateless helpers.
+  - DashboardApp owns UI state, background workers, waveform request assembly,
+    output safety checks, and live status/data logging.
+  - Worker threads must never touch Tk widgets directly; route UI changes
+    through DashboardApp._call_on_ui().
 """
 
 import socket
@@ -34,6 +43,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from solenoid_temperature_reader import WebMonitorSolenoidTemperatureReader
 
 # -- Constants ---------------------------------------------------------------
+# These values encode hardware limits and transport timing assumptions. Keep
+# them centralized so UI validation, upload chunking, and safety interlocks stay
+# aligned with the BIT/BOP behavior documented in the manual.
 MIN_DWELL        = 0.0005    # 500 us - hardware minimum
 MAX_DWELL        = 10.0      # hardware maximum
 MAX_LIST_POINTS  = 1000      # per single LIST upload
@@ -469,6 +481,9 @@ class KepcoController:
             return self.send_query(cmd)
         return self.send_cmd(cmd)
 
+    # -- SCPI formatting and limit helpers -----------------------------------
+    # The BOP is bipolar, so limit setup is usually expressed as a positive and
+    # negative value. These helpers normalize UI/request data into command pairs.
     @staticmethod
     def format_scpi_value(value):
         return f"{float(value):.6g}"
@@ -832,6 +847,7 @@ class KepcoController:
                 return False, str(e)
 
 #  Network Discovery
+#  Stateless helper used by the Scan Network button.
 class Discovery:
     """Scan a /24 subnet for Kepco devices (Telnet 5024 first, then 5025)."""
 
@@ -867,7 +883,8 @@ class Discovery:
         try:
             net = ipaddress.IPv4Network(base_ip + "/24", strict=False)
         except Exception:
-            net = ipaddress.IPv4Network("192.168.50.0/24") #let's use 50
+            # Fall back to the lab subnet used by the default IP field.
+            net = ipaddress.IPv4Network("192.168.50.0/24")
 
         hosts = [str(h) for h in net.hosts()]
         results = []
@@ -901,6 +918,7 @@ class Discovery:
 
 # ===========================================================================
 #  Waveform Mathematics
+#  Pure helpers for UI preview and LIST upload payload generation.
 # ===========================================================================
 class WaveformGen:
     """Generate waveform points with hardware-aware timing constraints."""
@@ -962,6 +980,14 @@ class WaveformGen:
 #  Application  (Material-themed, customtkinter)
 # ===========================================================================
 class DashboardApp:
+    """Tk application shell around the Kepco controller.
+
+    The app keeps hardware I/O on background threads, mirrors device state into
+    UI widgets on the main thread, and stores the latest waveform as a request
+    dictionary. That request object is the handoff contract between preview,
+    upload, output toggling, and multi-chunk streaming.
+    """
+
     def __init__(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -974,6 +1000,8 @@ class DashboardApp:
         self.kepco = KepcoController()
         self.stop_event = threading.Event()
 
+        # Current waveform/session state. uploaded_request is the canonical
+        # staged payload used by output toggling and status-panel rendering.
         self.csv_points = None
         self.csv_name = ""
         self.preview_points = []
@@ -983,6 +1011,8 @@ class DashboardApp:
         self.sequence_active = False
         self.is_running = False
 
+        # Background work flags. They prevent duplicate button actions and help
+        # status polling yield while command sequences own the hardware.
         self._connect_in_flight = False
         self._upload_in_flight = False
         self._output_toggle_in_flight = False
@@ -995,6 +1025,7 @@ class DashboardApp:
         self._last_solenoid_temperature_error_logged = None
         self._last_solenoid_temperature_source_logged = None
 
+        # Operator-facing session logs and optional readback CSV collection.
         self.log_file_handle = None
         self.log_file_path = ""
         self.data_collection_file_handle = None
@@ -1009,6 +1040,8 @@ class DashboardApp:
         self.solenoid_temperature_source_path = None
         self.solenoid_temperature_error = None
 
+        # UI-thread handoff state. Worker callbacks are queued here and drained
+        # by a short root.after loop so Tk widgets stay on the main thread.
         self.current_control_mode = "VOLT"
         self.control_mode_var = ctk.StringVar(value="VOLT")
         self._ui_queue = queue.SimpleQueue()
@@ -1028,6 +1061,9 @@ class DashboardApp:
             self.log(f"Session log file: {self.log_file_path}", "info")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # -- UI construction -----------------------------------------------------
+    # The UI is split into a waveform/control tab, a manual SCPI tab, and a
+    # status panel. Widget callbacks delegate to the behavioral sections below.
     def _build_ui(self):
         conn = ctk.CTkFrame(self.root, corner_radius=10)
         conn.pack(fill="x", padx=12, pady=(10, 4))
@@ -1558,6 +1594,9 @@ class DashboardApp:
             pill.pack(side="left", padx=(0, 8))
             self.status_mode_labels[mode] = pill
 
+    # -- Plot rendering ------------------------------------------------------
+    # Both preview and status plots share the same renderer so chunk boundaries,
+    # active upload highlighting, and empty-state behavior stay consistent.
     def _build_plot(self, parent, figsize):
         fig = Figure(figsize=figsize, dpi=100, facecolor=C["graph_bg"])
         ax = fig.add_subplot(111)
@@ -1653,6 +1692,9 @@ class DashboardApp:
         label.pack(anchor="w", padx=14, pady=(6, 1))
         return label
 
+    # -- Session logging and readback collection -----------------------------
+    # The visible log mirrors into logs/*.log, while data collection writes live
+    # polling samples to CSV only when the operator enables it.
     def _init_log_file(self):
         try:
             log_dir = os.path.join(os.getcwd(), "logs")
@@ -1880,6 +1922,10 @@ class DashboardApp:
 
         self._schedule_solenoid_temperature_poll()
 
+    # -- UI thread dispatcher ------------------------------------------------
+    # Tk/customtkinter widgets are not thread-safe. Background workers enqueue
+    # closures with _call_on_ui(), and this dispatcher drains them on the main
+    # loop at a modest cadence.
     def _start_ui_dispatcher(self):
         if self._ui_shutdown or self._ui_queue_job is not None:
             return
@@ -1944,6 +1990,9 @@ class DashboardApp:
     def _log_safe(self, msg, tag="info"):
         self._call_on_ui(lambda: self.log(msg, tag))
 
+    # -- Connection, reset, and status mirroring -----------------------------
+    # These helpers keep the app's local flags, status panel, and output button
+    # synchronized whenever the device connects, drops, resets, or polls.
     def _set_connected_state(self, connected, idn=""):
         if connected:
             self.conn_btn.configure(
@@ -2000,6 +2049,7 @@ class DashboardApp:
         self._update_output_controls()
 
     def _refresh_uploaded_status_panel(self):
+        """Mirror the staged waveform request into the right-side status card."""
         req = self.uploaded_request
         if not req:
             self._reset_uploaded_state()
@@ -2047,6 +2097,9 @@ class DashboardApp:
             fg_color=C["green"] if is_on else C["red"],
             text_color="#ffffff")
 
+    # -- Output button rendering --------------------------------------------
+    # The output button has several logical locks: disconnected, no waveform,
+    # in-flight command sequence, streamed waveform active, and ready/armed.
     def _refresh_output_toggle_button(self, can_toggle=None):
         if can_toggle is None:
             can_toggle = (
@@ -2193,6 +2246,10 @@ class DashboardApp:
             fg_color=C["input_bg"] if enabled else "#2d2d3a",
             text_color=C["text"] if enabled else C["text2"])
 
+    # -- Waveform input and request assembly ---------------------------------
+    # All waveform types are normalized into the same request dictionary. Later
+    # upload/output code should read from that request instead of re-reading UI
+    # widgets, except when deliberately re-validating current software limits.
     def _on_wave_change(self, _=None):
         wave = self.wave_var.get()
         if wave == "CSV Custom (untested)":
@@ -2578,6 +2635,7 @@ class DashboardApp:
         }
 
     def _read_waveform_request(self):
+        """Build the canonical request dict used by preview/upload/output."""
         mode = self.control_mode_var.get().upper()
         wave = self.wave_var.get()
         if wave == "DC":
@@ -2606,6 +2664,9 @@ class DashboardApp:
             f"({req['point_count']} point(s))",
             "info")
 
+    # -- Manual SCPI controls ------------------------------------------------
+    # Manual actions use the same safety/state helpers as the main workflow so
+    # the status panel and connection-loss behavior remain coherent.
     def _man_require_conn(self):
         if not self.kepco.connected:
             self.log("Not connected - connect first.", "warn")
@@ -2774,6 +2835,10 @@ class DashboardApp:
         else:
             self._schedule_status_poll(150)
 
+    # -- Live status polling -------------------------------------------------
+    # Polling runs continuously while connected, but pauses during uploads,
+    # streaming transitions, output toggles, and disconnect safety checks so
+    # command sequences do not interleave unexpectedly on the SCPI connection.
     def _schedule_status_poll(self, delay_ms=1000):
         if self._status_poll_timer:
             try:
@@ -2832,6 +2897,7 @@ class DashboardApp:
         threading.Thread(target=self._status_poll_worker, daemon=True).start()
 
     def _status_poll_worker(self):
+        """Collect one readback snapshot on a worker thread."""
         v = self.kepco.send("MEAS:VOLT?", query=True)
         c = self.kepco.send("MEAS:CURR?", query=True)
         outp = self.kepco.send("OUTP?", query=True)
@@ -2839,6 +2905,7 @@ class DashboardApp:
         self._call_on_ui(lambda: self._status_poll_done(v, c, outp, mode))
 
     def _status_poll_done(self, v, c, outp, mode):
+        """Apply one poll result and schedule the next cycle."""
         self._status_poll_in_flight = False
         if any(item is None for item in (v, c, outp, mode)):
             self._handle_comm_failure("status polling")
@@ -2875,6 +2942,7 @@ class DashboardApp:
             self._schedule_status_poll(1000)
 
     def _apply_live_status(self, v, c, outp, mode):
+        """Normalize raw SCPI status replies and update local/UI state."""
         try:
             v_str = f"{float(v):.4f}"
         except Exception:
@@ -2912,7 +2980,12 @@ class DashboardApp:
         self._refresh_live_measurement_warning()
         self._update_output_controls()
 
+    # -- Upload and multi-chunk streaming ------------------------------------
+    # Upload prepares or primes the selected waveform. DC and <=1000-point LISTs
+    # fit in a single device state; larger LISTs stream chunk-by-chunk because
+    # the BIT card exposes only one active LIST buffer at a time.
     def _upload_waveform(self):
+        """Start upload/preparation for the current waveform request."""
         if self._upload_in_flight:
             return
         if self.sequence_active:
@@ -2938,6 +3011,7 @@ class DashboardApp:
         threading.Thread(target=self._upload_request_worker, args=(req,), daemon=True).start()
 
     def _upload_request_worker(self, req):
+        """Run the upload path off the UI thread, then report completion."""
         start_sequence = False
         try:
             self._wait_for_status_poll_idle()
@@ -2953,6 +3027,7 @@ class DashboardApp:
         self._call_on_ui(lambda: self._upload_request_done(req, ok, msg, start_sequence))
 
     def _apply_dc_request(self, req):
+        """Stage or live-update a fixed DC setpoint with safe limit setup."""
         self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
@@ -3003,6 +3078,7 @@ class DashboardApp:
         return True, f"DC setpoint staged at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
+        """Upload one LIST buffer and optionally re-arm it while output is live."""
         voltage_compliance, current_limit = self._get_request_limits(req)
 
         def progress_cb(sent, total):
@@ -3034,6 +3110,7 @@ class DashboardApp:
         return True, msg
 
     def _prime_multi_chunk_request(self, req):
+        """Upload the first LIST chunk; remaining chunks stream on output ON."""
         voltage_compliance, current_limit = self._get_request_limits(req)
         chunks = [
             req["points"][i:i + MAX_LIST_POINTS]
@@ -3107,6 +3184,7 @@ class DashboardApp:
         self._schedule_status_poll(100)
 
     def _begin_uploaded_sequence(self, req, output_already_on=False, skip_first_upload=False):
+        """Begin background streaming for a staged multi-chunk LIST waveform."""
         if not self.kepco.connected:
             return False, "Connect to a device first."
         if self.sequence_active:
@@ -3130,6 +3208,7 @@ class DashboardApp:
         return True, "Streaming multi-chunk waveform."
 
     def _sequence_worker(self, req, output_already_on=False, skip_first_upload=False):
+        """Upload/run LIST chunks until loop count completes or stop is requested."""
         ok = True
         final_msg = "Waveform sequence complete."
         stopped = False
@@ -3177,6 +3256,9 @@ class DashboardApp:
                             final_msg = f"Chunk {chunk_idx + 1} upload failed: {msg}"
                             break
 
+                    # Each uploaded chunk is armed as a one-count LIST run. Once
+                    # the output is already on, later chunks avoid another OUTP ON
+                    # transition to keep live streaming as smooth as possible.
                     enable_output = not output_already_on
                     ok, msg = self.kepco.run_list(
                         mode,
@@ -3196,6 +3278,9 @@ class DashboardApp:
                             self.prog_lbl.configure(
                                 text=f"Running chunk {c + 1}/{n} (loop {i})"))
 
+                    # The hardware does not signal chunk completion back to the
+                    # UI, so estimate from dwell time and chunk size, plus a
+                    # small guard interval for command processing.
                     wait_time = len(chunk) * req["dwell"] + 0.10
                     end_time = time.time() + wait_time
                     while time.time() < end_time:
@@ -3253,7 +3338,12 @@ class DashboardApp:
         self._update_output_controls()
         self._schedule_status_poll(100)
 
+    # -- Output control ------------------------------------------------------
+    # The Output button is a router: DC uses fixed setpoint commands, single
+    # LIST waveforms arm directly, and multi-chunk LISTs hand off to the
+    # streaming worker above.
     def _toggle_output(self):
+        """Turn output on/off while preserving interlocks and staged limits."""
         if self._output_toggle_in_flight:
             return
         target_on = not self.current_output_on
@@ -3268,6 +3358,8 @@ class DashboardApp:
             self.log("Upload a waveform before enabling output.", "warn")
             return
         if target_on:
+            # Re-check limits at the moment output is enabled because the
+            # operator can edit software-limit fields after upload.
             req = self._request_with_latest_ui_limits(req)
             if not req:
                 self._set_output_ui_state(False)
@@ -3298,6 +3390,7 @@ class DashboardApp:
             daemon=True).start()
 
     def _enable_dc_output(self, req):
+        """Enable output for a DC request after zeroed safe preparation."""
         mode = req["mode"]
         value = req["amplitude"]
         voltage_compliance, current_limit = self._get_request_limits(req)
@@ -3322,6 +3415,7 @@ class DashboardApp:
         return True, f"Output ON; {mode} setpoint {value:.4f} {unit}"
 
     def _output_toggle_worker(self, target_on, req):
+        """Apply one output transition on a worker thread."""
         try:
             self._wait_for_status_poll_idle()
             mode = (req or {}).get("mode") or self.current_control_mode
@@ -3369,6 +3463,9 @@ class DashboardApp:
         if not self.kepco.connected:
             self._handle_comm_failure("output toggle")
 
+    # -- Discovery and connection lifecycle ----------------------------------
+    # Network scan, connect, disconnect, and application close all end by
+    # reconciling local UI state with the controller's connection state.
     def _start_scan(self):
         self.scan_btn.configure(state="disabled", text="Scanning...")
         self.log(
@@ -3424,6 +3521,7 @@ class DashboardApp:
             threading.Thread(target=self._disconnect_worker, daemon=True).start()
 
     def _connect_worker(self, ip):
+        """Connect and validate identity away from the Tk event loop."""
         ok, msg = self.kepco.connect(ip, validate_identity=True)
         idn = self.kepco.last_identity or None
         self._call_on_ui(lambda: self._connect_done(ok, msg, ip, idn))
@@ -3448,6 +3546,7 @@ class DashboardApp:
             self.log(f"Connection failed: {msg}", "err")
 
     def _disconnect_worker(self):
+        """Verify output is safe before closing the socket."""
         self._wait_for_status_poll_idle()
         ok, err_msg = self._safe_output_off_before_disconnect()
         if ok:
@@ -3455,6 +3554,7 @@ class DashboardApp:
         self._call_on_ui(lambda: self._disconnect_done(ok, err_msg))
 
     def _safe_output_off_before_disconnect(self):
+        """Return True only after output OFF and near-zero V/I are verified."""
         if not self.kepco.connected:
             return True, ""
 
@@ -3469,6 +3569,8 @@ class DashboardApp:
             if self.uploaded_request else self.current_control_mode
         )
 
+        # Be deliberately conservative: try the full stop/zero/off sequence
+        # twice, and keep the app connected if readback cannot verify safety.
         for attempt in range(2):
             errors = []
             ok_stop, stop_msg = self.kepco.stop(base_mode=base_mode)
@@ -3527,6 +3629,9 @@ class DashboardApp:
         self._reset_uploaded_state()
         self.log("Disconnected.", "info")
 
+    # -- Shutdown ------------------------------------------------------------
+    # Closing the window follows the same safety gate as Disconnect, then tears
+    # down polling, data collection, session logging, and queued UI callbacks.
     def _on_close(self):
         self.stop_event.set()
         if self.kepco.connected:
