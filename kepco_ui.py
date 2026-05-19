@@ -67,8 +67,8 @@ DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
 PMON_STALE_SECONDS = 10.0
-DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V = 1.0
-DEFAULT_CURRENT_MONITOR_THRESHOLD_MA = 5.0
+DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 1.0
+DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -1054,6 +1054,9 @@ class DashboardApp:
         self._ui_queue_job = None
         self._ui_shutdown = False
 
+        self.vmon_threshold_pct = DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT
+        self.imon_threshold_pct = DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT
+
         self._init_log_file()
         self.kepco.set_debug_logger(self._controller_debug_log)
         self._build_ui()
@@ -1487,7 +1490,7 @@ class DashboardApp:
         monitor_card.grid(
             row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ctk.CTkLabel(
-            monitor_card, text="DC Current Monitor Thresholds",
+            monitor_card, text="DC Monitor Thresholds",
             font=ctk.CTkFont(size=14, weight="bold")).pack(
             anchor="w", padx=14, pady=(12, 6))
 
@@ -1497,22 +1500,29 @@ class DashboardApp:
         v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
         v_ctrl.pack(side="left", padx=(0, 18))
         ctk.CTkLabel(
-            v_ctrl, text="Voltage tolerance (V):",
+            v_ctrl, text="Voltage tolerance (%):",
             text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
             anchor="w")
         self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=120)
-        self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V))
+        self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
         self.vmon_threshold_entry.pack(anchor="w", pady=(3, 0))
 
         i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
         i_ctrl.pack(side="left")
         ctk.CTkLabel(
-            i_ctrl, text="Current tolerance (mA):",
+            i_ctrl, text="Current tolerance (%):",
             text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
             anchor="w")
         self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=120)
-        self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_MA))
+        self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT))
         self.imon_threshold_entry.pack(anchor="w", pady=(3, 0))
+
+        btn_wrap = ctk.CTkFrame(monitor_row, fg_color="transparent")
+        btn_wrap.pack(side="right")
+        ctk.CTkButton(
+            btn_wrap, text="Set", width=60,
+            command=self._set_monitor_thresholds,
+            fg_color="#374151", hover_color="#4b5563").pack()
 
         self._update_mode_buttons(self.control_mode_var.get())
 
@@ -2350,19 +2360,19 @@ class DashboardApp:
         self._refresh_pmon_console_lines()
 
     def _read_monitor_thresholds(self):
-        voltage_threshold = DEFAULT_VOLTAGE_MONITOR_THRESHOLD_V
-        current_threshold_ma = DEFAULT_CURRENT_MONITOR_THRESHOLD_MA
+        return self.vmon_threshold_pct, self.imon_threshold_pct
 
-        if hasattr(self, "vmon_threshold_entry"):
-            value = self._as_float(self.vmon_threshold_entry.get())
-            if value is not None and value > 0:
-                voltage_threshold = value
-        if hasattr(self, "imon_threshold_entry"):
-            value = self._as_float(self.imon_threshold_entry.get())
-            if value is not None and value > 0:
-                current_threshold_ma = value
+    def _set_monitor_thresholds(self):
+        voltage_pct = self._as_float(self.vmon_threshold_entry.get())
+        current_pct = self._as_float(self.imon_threshold_entry.get())
+        if voltage_pct is None or voltage_pct <= 0 or current_pct is None or current_pct <= 0:
+            messagebox.showerror(
+                "Invalid Monitor Thresholds",
+                "Please enter positive percentage values for both voltage and current thresholds.")
+            return
 
-        return voltage_threshold, current_threshold_ma / 1000.0
+        self.vmon_threshold_pct = voltage_pct
+        self.imon_threshold_pct = current_pct
 
     def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
         req = self.uploaded_request or {}
@@ -2380,10 +2390,10 @@ class DashboardApp:
         iset = self._as_float(req.get("amplitude"))
         live_current = self._as_float(current)
         live_voltage = self._as_float(voltage)
-        voltage_threshold, current_threshold = self._read_monitor_thresholds()
+        voltage_threshold_pct, current_threshold_pct = self._read_monitor_thresholds()
 
         if iset is not None and live_current is not None:
-            current_ok = abs(live_current - iset) <= current_threshold
+            current_ok = abs(live_current - iset) <= abs(iset) * current_threshold_pct / 100.0
         else:
             current_ok = False
         self._set_live_console_line(
@@ -2402,7 +2412,8 @@ class DashboardApp:
             return
 
         expected_voltage = iset * (20.95 + 0.0470 * (temp_a + temp_b))
-        voltage_ok = abs(live_voltage - expected_voltage) <= voltage_threshold
+        voltage_ok = abs(live_voltage - expected_voltage) <= (
+            abs(expected_voltage) * voltage_threshold_pct / 100.0)
         self._set_live_console_line(
             "voltage",
             "Voltage within expected range"
