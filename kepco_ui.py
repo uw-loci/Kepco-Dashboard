@@ -2405,7 +2405,9 @@ class DashboardApp:
         voltage_ok = abs(live_voltage - expected_voltage) <= voltage_threshold
         self._set_live_console_line(
             "voltage",
-            "Voltage within expected range" if voltage_ok else "Voltage outside expected range",
+            "Voltage within expected range"
+            if voltage_ok
+            else f"Voltage outside expected range (expected {expected_voltage:.2f} V)",
             C["green"] if voltage_ok else C["red"])
         self.dc_current_monitor_state["voltage"] = "ok" if voltage_ok else "triggered"
         self._refresh_pmon_console_lines()
