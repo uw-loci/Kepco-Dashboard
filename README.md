@@ -12,6 +12,7 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 - Supports voltage (`VOLT`) and current (`CURR`) control modes with signed software limits
 - Provides manual SCPI controls, quick diagnostic queries, range control, health check, and reset
 - Shows the uploaded waveform, live output state, control mode, and voltage/current readback
+- Monitors DC current-mode setpoints against live current and temperature-adjusted voltage expectations
 - Optionally records live readback samples to CSV
 - Logs session and communication activity to `logs/`
 - Attempts a safe shutdown on disconnect or close by stopping output and verifying `OFF` at approximately `0 V` and `0 A`
@@ -19,8 +20,10 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 ## Main Files
 
 - `kepco_ui.py`: main desktop application, SCPI controller, waveform generation, discovery, and UI orchestration
+- `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM WebMonitor JSONL logs for DC current monitoring
 - `requirements.txt`: Python dependencies
 - `docs/802e_manual.md`: device reference material
+- [`docs/KEPCO LAN IP Configuration Steps 2026-3-15-CMov.pdf`](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf): Kepco LAN/IP setup reference for configuring network access to the supply
 
 The main code paths in `kepco_ui.py` are organized around four classes:
 
@@ -30,6 +33,8 @@ The main code paths in `kepco_ui.py` are organized around four classes:
 - `WaveformGen`: calculates dwell timing and generates waveform point lists
 
 ## Getting Started
+New Kepco devices must be configured for LAN/IP access before the dashboard can connect to them. Follow the steps in the [Kepco LAN/IP configuration guide](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf) before using **Scan Network** or **Connect** with a new supply.
+
 
 Create a virtual environment and install dependencies:
 
@@ -90,6 +95,36 @@ While connected, the dashboard polls:
 - `OUTP?`
 - `FUNC:MODE?`
 
+The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM WebMonitor log directory:
+
+```text
+~/EBEAM_dashboard/EBEAM-Dashboard-WMLogs/webMonitor_log_*.txt
+```
+
+The newest valid JSONL status entry is used. If the file cannot be found, cannot be parsed, or no longer updates, the live console shows a WebMonitor warning. WebMonitor values are polled every `3 s`; values older than `10 s` are marked stale.
+
+## DC Current Monitoring
+
+The **DC Monitor Thresholds** controls set percentage tolerances for the DC current monitor. The default voltage and current tolerances are both `5%`.
+
+The monitor is active only during this stage:
+
+- The app is connected to the Kepco
+- Output is enabled
+- The uploaded/staged request is `DC`
+- The selected uploaded control mode is `CURR`
+- The device status poll reports `CURR` mode
+
+In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload, LIST waveform output, AC waveform streaming, and output transitions, the voltage and current monitor lines are set to inactive.
+
+When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two WebMonitor solenoid temperatures:
+
+```text
+expected voltage = Iset * (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
+```
+
+Measured voltage is then compared with that expected voltage using the configured voltage tolerance. If either temperature, the setpoint, or the live voltage is unavailable, the voltage monitor reports that it cannot compute the expected voltage. These monitor messages are indicators in the live console; they do not replace the upload-time limit checks or the disconnect/close safety interlock.
+
 Session logs are written to:
 
 ```text
@@ -121,6 +156,7 @@ Preview is local-only. Upload, output toggle, manual SCPI commands, status polli
 
 ## Troubleshooting
 
+- When connecting the Kepco to a new laptop/device, set a manual IP address for the Ethernet adapter on the same subnet. See step 7 in the [Kepco LAN/IP configuration guide](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf).
 - If connection fails, confirm the IP address and check ports `5024` and `5025`.
 - If scan finds nothing, enter an IP in the expected subnet first; scan uses that `/24`.
 - If upload is rejected, check waveform point count, dwell warnings, and the configured V/I limits.
