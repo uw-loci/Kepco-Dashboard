@@ -1409,36 +1409,36 @@ class DashboardApp:
             anchor="w", padx=4, pady=(2, 6))
 
         console = ctk.CTkFrame(outer, corner_radius=12)
-        console.pack(fill="x", pady=(0, 8))
+        console.pack(fill="x", pady=(0, 5))
 
         ctk.CTkLabel(
             console, text="Manual Command Console",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(
-            anchor="w", padx=10, pady=(8, 3))
+            font=ctk.CTkFont(size=12, weight="bold")).pack(
+            anchor="w", padx=8, pady=(6, 2))
         ctk.CTkLabel(
             console,
             text="Enter any SCPI command/query, or use quick commands below.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
-            anchor="w", padx=10, pady=(0, 5))
+            text_color=C["text2"], font=ctk.CTkFont(size=9)).pack(
+            anchor="w", padx=8, pady=(0, 3))
 
         scpi_row = ctk.CTkFrame(console, fg_color="transparent")
-        scpi_row.pack(fill="x", padx=10, pady=(0, 4))
+        scpi_row.pack(fill="x", padx=8, pady=(0, 3))
         ctk.CTkLabel(
             scpi_row, text="CMD:",
             font=ctk.CTkFont(family="Consolas", size=11)).pack(
             side="left", padx=(0, 4))
         self.scpi_entry = ctk.CTkEntry(
             scpi_row, placeholder_text="e.g. *IDN? or FUNC:MODE CURR",
-            height=28, font=ctk.CTkFont(family="Consolas", size=11))
+            height=26, font=ctk.CTkFont(family="Consolas", size=11))
         self.scpi_entry.pack(side="left", fill="x", expand=True, padx=4)
         self.scpi_entry.bind("<Return>", lambda _e: self._man_send_scpi())
         ctk.CTkButton(
-            scpi_row, text="Send", width=64, height=28, command=self._man_send_scpi,
+            scpi_row, text="Send", width=60, height=26, command=self._man_send_scpi,
             fg_color=C["primary"], hover_color=C["primary_h"]).pack(
             side="left", padx=4)
 
         quick_row = ctk.CTkFrame(console, fg_color="transparent")
-        quick_row.pack(fill="x", padx=10, pady=(0, 3))
+        quick_row.pack(fill="x", padx=8, pady=(0, 2))
         for label, cmd in [
             ("*IDN?", "*IDN?"),
             ("SYST:ERR?", "SYST:ERR?"),
@@ -1447,13 +1447,13 @@ class DashboardApp:
             ("MEAS:CURR?", "MEAS:CURR?"),
         ]:
             ctk.CTkButton(
-                quick_row, text=label, width=86, height=26,
+                quick_row, text=label, width=82, height=24,
                 command=lambda c=cmd: self._man_send_preset(c),
                 fg_color="#374151", hover_color="#4b5563").pack(
                 side="left", padx=(0, 5))
 
         quick_row2 = ctk.CTkFrame(console, fg_color="transparent")
-        quick_row2.pack(fill="x", padx=10, pady=(0, 4))
+        quick_row2.pack(fill="x", padx=8, pady=(0, 2))
         for label, cmd in [
             ("*OPC?", "*OPC?"),
             ("FUNC:MODE?", "FUNC:MODE?"),
@@ -1461,36 +1461,44 @@ class DashboardApp:
             ("LIST:CURR:POIN?", "LIST:CURR:POIN?"),
         ]:
             ctk.CTkButton(
-                quick_row2, text=label, width=106, height=26,
+                quick_row2, text=label, width=102, height=24,
                 command=lambda c=cmd: self._man_send_preset(c),
                 fg_color="#374151", hover_color="#4b5563").pack(
                 side="left", padx=(0, 5))
 
         scpi_ctrl = ctk.CTkFrame(console, fg_color="transparent")
-        scpi_ctrl.pack(fill="x", padx=10, pady=(0, 3))
+        scpi_ctrl.pack(fill="x", padx=8, pady=(0, 2))
         ctk.CTkButton(
-            scpi_ctrl, text="Health Check", width=104, height=26,
+            scpi_ctrl, text="Health Check", width=98, height=24,
             command=self._man_health_check,
             fg_color="#374151", hover_color="#4b5563").pack(
             side="left", padx=(0, 6))
         ctk.CTkButton(
-            scpi_ctrl, text="Clear Console", width=104, height=26,
+            scpi_ctrl, text="Clear Console", width=98, height=24,
             command=self._man_clear_scpi,
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
         self.scpi_resp = ctk.CTkTextbox(
-            console, height=105,
+            console, height=68,
             font=ctk.CTkFont(family="Consolas", size=10),
             activate_scrollbars=True)
-        self.scpi_resp.pack(fill="x", padx=10, pady=(3, 10))
+        self.scpi_resp.pack(fill="x", padx=8, pady=(2, 6))
 
         cards = ctk.CTkFrame(outer, fg_color="transparent")
         cards.pack(fill="x")
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
+        cards.grid_rowconfigure(0, weight=0)
+        cards.grid_rowconfigure(1, weight=0)
 
-        mode_card = ctk.CTkFrame(cards, corner_radius=12)
-        mode_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 3))
+        left_controls = ctk.CTkFrame(cards, fg_color="transparent")
+        left_controls.grid(row=0, column=0, sticky="new", padx=(0, 4), pady=(0, 6))
+
+        right_controls = ctk.CTkFrame(cards, fg_color="transparent")
+        right_controls.grid(row=0, column=1, sticky="new", padx=(4, 0), pady=(0, 6))
+
+        mode_card = ctk.CTkFrame(right_controls, corner_radius=12)
+        mode_card.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(
             mode_card, text="Set Control Mode",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1511,8 +1519,8 @@ class DashboardApp:
             justify="left", wraplength=220).pack(
             anchor="w", padx=10, pady=(0, 8))
 
-        limits_card = ctk.CTkFrame(cards, corner_radius=12)
-        limits_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 6))
+        limits_card = ctk.CTkFrame(left_controls, corner_radius=12)
+        limits_card.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(
             limits_card, text="Set V/I Limits",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1560,51 +1568,8 @@ class DashboardApp:
             command=lambda: self._set_software_limit("CURR"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
-        monitor_card = ctk.CTkFrame(cards, corner_radius=12)
-        monitor_card.grid(
-            row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 0))
-        ctk.CTkLabel(
-            monitor_card, text="DC Monitor Thresholds",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(
-            anchor="w", padx=10, pady=(8, 4))
-
-        monitor_row = ctk.CTkFrame(monitor_card, fg_color="transparent")
-        monitor_row.pack(fill="x", padx=10, pady=(0, 8))
-        monitor_row.grid_columnconfigure(0, weight=1)
-        monitor_row.grid_columnconfigure(1, weight=1)
-        monitor_row.grid_columnconfigure(2, weight=0)
-
-        v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        v_ctrl.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ctk.CTkLabel(
-            v_ctrl, text="Voltage tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
-            justify="left", wraplength=92).pack(
-            anchor="w")
-        self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=82, height=26)
-        self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
-        self.vmon_threshold_entry.pack(anchor="w", pady=(2, 0))
-
-        i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        i_ctrl.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        ctk.CTkLabel(
-            i_ctrl, text="Current tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
-            justify="left", wraplength=92).pack(
-            anchor="w")
-        self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=82, height=26)
-        self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT))
-        self.imon_threshold_entry.pack(anchor="w", pady=(2, 0))
-
-        btn_wrap = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        btn_wrap.grid(row=0, column=2, sticky="s", pady=(16, 0))
-        ctk.CTkButton(
-            btn_wrap, text="Set", width=46, height=26,
-            command=self._set_monitor_thresholds,
-            fg_color="#374151", hover_color="#4b5563").pack()
-
-        range_card = ctk.CTkFrame(cards, corner_radius=12)
-        range_card.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(0, 0))
+        range_card = ctk.CTkFrame(right_controls, corner_radius=12)
+        range_card.pack(fill="x")
         ctk.CTkLabel(
             range_card, text="Range Control",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1634,6 +1599,46 @@ class DashboardApp:
             fg_color=C["red"], hover_color="#dc2626",
             height=30, font=ctk.CTkFont(size=12, weight="bold")).pack(
             fill="x", padx=10, pady=(0, 8))
+
+        monitor_card = ctk.CTkFrame(left_controls, corner_radius=12)
+        monitor_card.pack(fill="x")
+        ctk.CTkLabel(
+            monitor_card, text="DC Monitor Thresholds",
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
+
+        monitor_row = ctk.CTkFrame(monitor_card, fg_color="transparent")
+        monitor_row.pack(fill="x", padx=10, pady=(0, 8))
+        monitor_row.grid_columnconfigure(0, weight=1)
+        monitor_row.grid_columnconfigure(1, weight=1)
+
+        v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
+        v_ctrl.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkLabel(
+            v_ctrl, text="Voltage tolerance (%):",
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=150).pack(anchor="w")
+        self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=92, height=26)
+        self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
+        self.vmon_threshold_entry.pack(anchor="w", pady=(2, 0))
+
+        i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
+        i_ctrl.grid(row=0, column=1, sticky="ew")
+        ctk.CTkLabel(
+            i_ctrl, text="Current tolerance (%):",
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=150).pack(anchor="w")
+        current_threshold_row = ctk.CTkFrame(i_ctrl, fg_color="transparent")
+        current_threshold_row.pack(anchor="w", pady=(2, 0))
+        self.imon_threshold_entry = ctk.CTkEntry(
+            current_threshold_row, width=92, height=26)
+        self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT))
+        self.imon_threshold_entry.pack(side="left")
+        ctk.CTkButton(
+            current_threshold_row, text="Set", width=46, height=26,
+            command=self._set_monitor_thresholds,
+            fg_color="#374151", hover_color="#4b5563").pack(
+            side="left", padx=(6, 0))
 
         self._update_mode_buttons(self.control_mode_var.get())
 
