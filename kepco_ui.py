@@ -999,7 +999,7 @@ class DashboardApp:
         self.root = ctk.CTk()
         self.root.title("Kepco BIT 802E - Waveform Generator")
         self.root.geometry("1440x900")
-        self.root.minsize(1100, 760)
+        self.root.minsize(1000, 680)
 
         self.kepco = KepcoController()
         self.stop_event = threading.Event()
@@ -1143,8 +1143,8 @@ class DashboardApp:
             0, weight=7 if compact else 6, minsize=285 if compact else 0)
         self.status_content.grid_columnconfigure(
             1, weight=1, minsize=140 if compact else 155)
-        self.status_content.grid_rowconfigure(0, weight=2)
-        self.status_content.grid_rowconfigure(1, weight=3)
+        self.status_content.grid_rowconfigure(0, weight=1)
+        self.status_content.grid_rowconfigure(1, weight=4)
         self.status_cfg_title.configure(wraplength=108 if compact else 122)
         self.temp_values.grid_configure(
             row=1,
@@ -1239,7 +1239,7 @@ class DashboardApp:
         log_wrap = ctk.CTkFrame(self.root, corner_radius=10)
         log_wrap.pack(fill="both", padx=8, pady=(0, 8))
         self.log_text = ctk.CTkTextbox(
-            log_wrap, height=105,
+            log_wrap, height=82,
             font=ctk.CTkFont(family="Consolas", size=11),
             activate_scrollbars=True)
         self.log_text.pack(fill="both", padx=6, pady=6, expand=True)
@@ -1270,7 +1270,7 @@ class DashboardApp:
             preview_card, corner_radius=10, fg_color=C["graph_bg"])
         preview_plot_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.preview_fig, self.preview_ax, self.preview_canvas = self._build_plot(
-            preview_plot_wrap, (6.6, 3.8))
+            preview_plot_wrap, (6.2, 2.65))
 
         self.wave_cfg = ctk.CTkFrame(self.wave_body, width=205, corner_radius=12)
         self.wave_cfg.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
@@ -1490,7 +1490,7 @@ class DashboardApp:
         cards.grid_columnconfigure(1, weight=1)
 
         mode_card = ctk.CTkFrame(cards, corner_radius=12)
-        mode_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 6))
+        mode_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 3))
         ctk.CTkLabel(
             mode_card, text="Set Control Mode",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1560,41 +1560,9 @@ class DashboardApp:
             command=lambda: self._set_software_limit("CURR"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
-        range_card = ctk.CTkFrame(cards, corner_radius=12)
-        range_card.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 0))
-        ctk.CTkLabel(
-            range_card, text="Range Control",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(
-            anchor="w", padx=10, pady=(8, 4))
-        ctk.CTkLabel(
-            range_card, text="Full-scale avoids quarter-scale transients.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
-            justify="left", wraplength=220).pack(
-            anchor="w", padx=10, pady=(0, 5))
-        range_row = ctk.CTkFrame(range_card, fg_color="transparent")
-        range_row.pack(fill="x", padx=10, pady=(0, 6))
-        self.man_range_var = ctk.StringVar(value="Auto")
-        self.man_range_combo = ctk.CTkComboBox(
-            range_row, variable=self.man_range_var,
-            values=["Auto", "Full Scale", "Quarter Scale"],
-            width=126, height=28)
-        self.man_range_combo.pack(side="left", padx=(0, 6))
-        ctk.CTkButton(
-            range_row, text="Set", width=46, height=28,
-            command=self._man_set_range,
-            fg_color="#374151", hover_color="#4b5563").pack(side="left")
-        ctk.CTkFrame(range_card, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=10, pady=(2, 6))
-        ctk.CTkButton(
-            range_card, text="Reset Device (*RST)",
-            command=self._man_reset,
-            fg_color=C["red"], hover_color="#dc2626",
-            height=30, font=ctk.CTkFont(size=12, weight="bold")).pack(
-            fill="x", padx=10, pady=(0, 8))
-
         monitor_card = ctk.CTkFrame(cards, corner_radius=12)
         monitor_card.grid(
-            row=1, column=1, sticky="nsew", padx=(4, 0), pady=(0, 0))
+            row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 0))
         ctk.CTkLabel(
             monitor_card, text="DC Monitor Thresholds",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1635,6 +1603,38 @@ class DashboardApp:
             command=self._set_monitor_thresholds,
             fg_color="#374151", hover_color="#4b5563").pack()
 
+        range_card = ctk.CTkFrame(cards, corner_radius=12)
+        range_card.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(0, 0))
+        ctk.CTkLabel(
+            range_card, text="Range Control",
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(
+            range_card, text="Full-scale avoids quarter-scale transients.",
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=220).pack(
+            anchor="w", padx=10, pady=(0, 5))
+        range_row = ctk.CTkFrame(range_card, fg_color="transparent")
+        range_row.pack(fill="x", padx=10, pady=(0, 6))
+        self.man_range_var = ctk.StringVar(value="Auto")
+        self.man_range_combo = ctk.CTkComboBox(
+            range_row, variable=self.man_range_var,
+            values=["Auto", "Full Scale", "Quarter Scale"],
+            width=126, height=28)
+        self.man_range_combo.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            range_row, text="Set", width=46, height=28,
+            command=self._man_set_range,
+            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+        ctk.CTkFrame(range_card, height=2, fg_color=C["border"]).pack(
+            fill="x", padx=10, pady=(2, 6))
+        ctk.CTkButton(
+            range_card, text="Reset Device (*RST)",
+            command=self._man_reset,
+            fg_color=C["red"], hover_color="#dc2626",
+            height=30, font=ctk.CTkFont(size=12, weight="bold")).pack(
+            fill="x", padx=10, pady=(0, 8))
+
         self._update_mode_buttons(self.control_mode_var.get())
 
     def _build_status_panel(self, parent):
@@ -1653,25 +1653,25 @@ class DashboardApp:
         content.grid(row=1, column=0, sticky="nsew")
         content.grid_columnconfigure(0, weight=6)
         content.grid_columnconfigure(1, weight=1, minsize=155)
-        content.grid_rowconfigure(0, weight=2)
-        content.grid_rowconfigure(1, weight=3)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_rowconfigure(1, weight=4)
 
         self.status_plot_card = ctk.CTkFrame(content, corner_radius=12)
         plot_card = self.status_plot_card
-        plot_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        plot_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 6))
         ctk.CTkLabel(
             plot_card, text="Active/Uploaded Waveform",
-            font=ctk.CTkFont(size=15, weight="bold")).pack(
-            anchor="w", padx=12, pady=(10, 6))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(7, 3))
         status_plot_wrap = ctk.CTkFrame(
             plot_card, corner_radius=10, fg_color=C["graph_bg"])
-        status_plot_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        status_plot_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.status_fig, self.status_ax, self.status_canvas = self._build_plot(
-            status_plot_wrap, (5.3, 3.2))
+            status_plot_wrap, (5.0, 1.85))
 
         self.status_cfg_card = ctk.CTkFrame(content, corner_radius=12)
         cfg_card = self.status_cfg_card
-        cfg_card.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
+        cfg_card.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
         self.status_cfg_title = ctk.CTkLabel(
             cfg_card, text="Waveform\nConfiguration",
             font=ctk.CTkFont(size=13, weight="bold"),
