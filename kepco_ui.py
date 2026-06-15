@@ -1121,17 +1121,20 @@ class DashboardApp:
         self._responsive_layout = layout
         compact = layout == "compact"
 
-        self.main.grid_columnconfigure(0, weight=4 if compact else 11)
-        self.main.grid_columnconfigure(1, weight=3 if compact else 9)
+        self.main.grid_columnconfigure(
+            0, weight=4 if compact else 11, uniform="main_columns")
+        self.main.grid_columnconfigure(
+            1, weight=3 if compact else 9, uniform="main_columns")
 
         self.wave_body.grid_columnconfigure(
             0, weight=7, minsize=0)
         self.wave_body.grid_columnconfigure(
-            1, weight=0, minsize=205 if compact else 220)
-        self.wave_cfg.configure(width=205 if compact else 220)
+            1, weight=0, minsize=190 if compact else 205)
+        self.wave_cfg.configure(width=190 if compact else 205)
         self.output_card.configure(width=248 if compact else 290)
-        self.wave_cfg_title.configure(wraplength=175 if compact else 190)
-        self.timing_lbl.configure(wraplength=175 if compact else 190)
+        self.wave_cfg_title.configure(wraplength=155 if compact else 170)
+        self.csv_lbl.configure(wraplength=58 if compact else 72)
+        self.timing_lbl.configure(wraplength=155 if compact else 170)
         self.output_hint_lbl.configure(wraplength=205 if compact else 250)
         self.upload_btn.configure(width=120 if compact else 150)
         self.idn_lbl.configure(width=250 if compact else 360)
@@ -1139,8 +1142,10 @@ class DashboardApp:
         self.status_content.grid_columnconfigure(
             0, weight=7 if compact else 6, minsize=285 if compact else 0)
         self.status_content.grid_columnconfigure(
-            1, weight=1, minsize=130 if compact else 150)
-        self.status_cfg_title.configure(wraplength=110 if compact else 125)
+            1, weight=1, minsize=140 if compact else 155)
+        self.status_content.grid_rowconfigure(0, weight=2)
+        self.status_content.grid_rowconfigure(1, weight=3)
+        self.status_cfg_title.configure(wraplength=108 if compact else 122)
         self.temp_values.grid_configure(
             row=1,
             column=0,
@@ -1148,16 +1153,22 @@ class DashboardApp:
             padx=(0, 0),
             pady=(6, 0))
         for label in getattr(self, "status_cfg_name_labels", []):
-            label.configure(width=110 if compact else 130, wraplength=105 if compact else 125)
+            label.configure(width=58 if compact else 64, wraplength=56 if compact else 62)
         for value in getattr(self, "status_cfg_labels", {}).values():
-            value.configure(wraplength=105 if compact else 125)
+            value.configure(wraplength=60 if compact else 68)
 
-        meas_font_size = 16 if compact else 18
+        meas_font_size = 14 if compact else 15
         meas_font = ctk.CTkFont(family="Consolas", size=meas_font_size)
         self.status_meas_volt_lbl.configure(font=meas_font)
         self.status_meas_curr_lbl.configure(font=meas_font)
         self.status_solenoid_temp_1_lbl.configure(font=meas_font)
         self.status_solenoid_temp_2_lbl.configure(font=meas_font)
+        live_font = ctk.CTkFont(family="Consolas", size=10, weight="bold")
+        for label in getattr(self, "status_live_console_labels", {}).values():
+            label.configure(
+                font=live_font,
+                height=16,
+                wraplength=230 if compact else 300)
 
         self._pack_status_mode_pills(compact)
         self._place_ac_operation_notice()
@@ -1202,8 +1213,8 @@ class DashboardApp:
 
         self.main = ctk.CTkFrame(self.root, corner_radius=12)
         self.main.pack(fill="both", expand=True, padx=8, pady=4)
-        self.main.grid_columnconfigure(0, weight=11)
-        self.main.grid_columnconfigure(1, weight=9)
+        self.main.grid_columnconfigure(0, weight=11, uniform="main_columns")
+        self.main.grid_columnconfigure(1, weight=9, uniform="main_columns")
         self.main.grid_rowconfigure(0, weight=1)
 
         left = ctk.CTkFrame(self.main, corner_radius=12)
@@ -1245,7 +1256,7 @@ class DashboardApp:
         self.wave_body = ctk.CTkFrame(outer, fg_color="transparent")
         self.wave_body.pack(fill="both", expand=True)
         self.wave_body.grid_columnconfigure(0, weight=7)
-        self.wave_body.grid_columnconfigure(1, weight=0, minsize=220)
+        self.wave_body.grid_columnconfigure(1, weight=0, minsize=205)
         self.wave_body.grid_rowconfigure(0, weight=1)
         self.wave_body.grid_rowconfigure(1, weight=0)
 
@@ -1261,14 +1272,14 @@ class DashboardApp:
         self.preview_fig, self.preview_ax, self.preview_canvas = self._build_plot(
             preview_plot_wrap, (6.6, 3.8))
 
-        self.wave_cfg = ctk.CTkFrame(self.wave_body, width=220, corner_radius=12)
+        self.wave_cfg = ctk.CTkFrame(self.wave_body, width=205, corner_radius=12)
         self.wave_cfg.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
 
         self.wave_cfg_title = ctk.CTkLabel(
             self.wave_cfg, text="Waveform\nConfiguration",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            justify="left", anchor="w", wraplength=190)
-        self.wave_cfg_title.pack(fill="x", padx=10, pady=(12, 8))
+            font=ctk.CTkFont(size=13, weight="bold"),
+            justify="left", anchor="w", wraplength=170)
+        self.wave_cfg_title.pack(fill="x", padx=8, pady=(8, 4))
 
         self._lbl(self.wave_cfg, "Waveform Type")
         self.wave_var = ctk.StringVar(value="Sine")
@@ -1277,55 +1288,55 @@ class DashboardApp:
             values=["DC", "Sine", "Square", "Triangle",
                     "Sawtooth", "CSV Custom (untested)"],
             command=self._on_wave_change)
-        self.wave_combo.pack(fill="x", padx=10, pady=(0, 5))
+        self.wave_combo.pack(fill="x", padx=8, pady=(0, 3))
 
         self.csv_frame = ctk.CTkFrame(self.wave_cfg, fg_color="transparent")
         self.csv_btn = ctk.CTkButton(
-            self.csv_frame, text="Load CSV", width=96,
+            self.csv_frame, text="Load CSV", width=82, height=26,
             command=self._load_csv,
             fg_color="#374151", hover_color="#4b5563")
-        self.csv_btn.pack(side="left", padx=(0, 8))
+        self.csv_btn.pack(side="left", padx=(0, 6))
         self.csv_lbl = ctk.CTkLabel(
             self.csv_frame, text="No file",
-            text_color=C["text2"], font=ctk.CTkFont(size=11),
-            anchor="w", justify="left", wraplength=80)
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            anchor="w", justify="left", wraplength=72)
         self.csv_lbl.pack(side="left", fill="x", expand=True)
 
         self.freq_label = self._lbl(self.wave_cfg, "Frequency (Hz)")
         self.freq_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="40.0")
         self.freq_entry.insert(0, "40.0")
-        self.freq_entry.pack(fill="x", padx=10, pady=(0, 5))
+        self.freq_entry.pack(fill="x", padx=8, pady=(0, 3))
 
         self.amp_label = self._lbl(self.wave_cfg, "Amplitude (V / A)")
         self.amp_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="10.0")
         self.amp_entry.insert(0, "10.0")
-        self.amp_entry.pack(fill="x", padx=10, pady=(0, 5))
+        self.amp_entry.pack(fill="x", padx=8, pady=(0, 3))
 
         self.off_label = self._lbl(self.wave_cfg, "Offset (V / A)")
         self.off_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="0.0")
         self.off_entry.insert(0, "0.0")
-        self.off_entry.pack(fill="x", padx=10, pady=(0, 5))
+        self.off_entry.pack(fill="x", padx=8, pady=(0, 3))
 
         self.pts_label = self._lbl(self.wave_cfg, "Total Points (max 4000)")
         self.pts_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="1000")
         self.pts_entry.insert(0, "1000")
-        self.pts_entry.pack(fill="x", padx=10, pady=(0, 5))
+        self.pts_entry.pack(fill="x", padx=8, pady=(0, 3))
 
         self.loop_label = self._lbl(self.wave_cfg, "Loop Count (0 = infinite)")
         self.loop_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="0")
         self.loop_entry.insert(0, "0")
-        self.loop_entry.pack(fill="x", padx=10, pady=(0, 6))
+        self.loop_entry.pack(fill="x", padx=8, pady=(0, 4))
 
         ctk.CTkButton(
             self.wave_cfg, text="Preview Waveform", command=self._preview,
             fg_color="#374151", hover_color="#4b5563",
-            font=ctk.CTkFont(size=12)).pack(
-            fill="x", padx=10, pady=(3, 4))
+            height=28, font=ctk.CTkFont(size=11)).pack(
+            fill="x", padx=8, pady=(2, 3))
 
         self.timing_lbl = ctk.CTkLabel(
             self.wave_cfg, text="", text_color=C["amber"],
-            font=ctk.CTkFont(size=11), wraplength=190, justify="left")
-        self.timing_lbl.pack(fill="x", padx=10, pady=(3, 10))
+            font=ctk.CTkFont(size=10), wraplength=170, justify="left")
+        self.timing_lbl.pack(fill="x", padx=8, pady=(2, 6))
 
         self.wave_footer = ctk.CTkFrame(self.wave_body, corner_radius=14)
         self.wave_footer.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 2))
@@ -1389,45 +1400,45 @@ class DashboardApp:
         self.output_hint_lbl.pack(fill="x", padx=14, pady=(8, 12))
 
     def _build_manual_tab(self, parent):
-        outer = ctk.CTkFrame(parent, fg_color="transparent")
+        outer = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=6, pady=6)
 
         ctk.CTkLabel(
             outer, text="Config/Override Panel",
-            font=ctk.CTkFont(size=18, weight="bold")).pack(
+            font=ctk.CTkFont(size=16, weight="bold")).pack(
             anchor="w", padx=4, pady=(2, 6))
 
         console = ctk.CTkFrame(outer, corner_radius=12)
-        console.pack(fill="both", expand=True, pady=(0, 10))
+        console.pack(fill="x", pady=(0, 8))
 
         ctk.CTkLabel(
             console, text="Manual Command Console",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(12, 4))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 3))
         ctk.CTkLabel(
             console,
             text="Enter any SCPI command/query, or use quick commands below.",
             text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
-            anchor="w", padx=14, pady=(0, 8))
+            anchor="w", padx=10, pady=(0, 5))
 
         scpi_row = ctk.CTkFrame(console, fg_color="transparent")
-        scpi_row.pack(fill="x", padx=14, pady=(0, 6))
+        scpi_row.pack(fill="x", padx=10, pady=(0, 4))
         ctk.CTkLabel(
             scpi_row, text="CMD:",
-            font=ctk.CTkFont(family="Consolas", size=12)).pack(
+            font=ctk.CTkFont(family="Consolas", size=11)).pack(
             side="left", padx=(0, 4))
         self.scpi_entry = ctk.CTkEntry(
             scpi_row, placeholder_text="e.g. *IDN? or FUNC:MODE CURR",
-            font=ctk.CTkFont(family="Consolas", size=12))
+            height=28, font=ctk.CTkFont(family="Consolas", size=11))
         self.scpi_entry.pack(side="left", fill="x", expand=True, padx=4)
         self.scpi_entry.bind("<Return>", lambda _e: self._man_send_scpi())
         ctk.CTkButton(
-            scpi_row, text="Send", width=80, command=self._man_send_scpi,
+            scpi_row, text="Send", width=64, height=28, command=self._man_send_scpi,
             fg_color=C["primary"], hover_color=C["primary_h"]).pack(
             side="left", padx=4)
 
         quick_row = ctk.CTkFrame(console, fg_color="transparent")
-        quick_row.pack(fill="x", padx=14, pady=(0, 4))
+        quick_row.pack(fill="x", padx=10, pady=(0, 3))
         for label, cmd in [
             ("*IDN?", "*IDN?"),
             ("SYST:ERR?", "SYST:ERR?"),
@@ -1436,13 +1447,13 @@ class DashboardApp:
             ("MEAS:CURR?", "MEAS:CURR?"),
         ]:
             ctk.CTkButton(
-                quick_row, text=label, width=98,
+                quick_row, text=label, width=86, height=26,
                 command=lambda c=cmd: self._man_send_preset(c),
                 fg_color="#374151", hover_color="#4b5563").pack(
-                side="left", padx=(0, 6))
+                side="left", padx=(0, 5))
 
         quick_row2 = ctk.CTkFrame(console, fg_color="transparent")
-        quick_row2.pack(fill="x", padx=14, pady=(0, 6))
+        quick_row2.pack(fill="x", padx=10, pady=(0, 4))
         for label, cmd in [
             ("*OPC?", "*OPC?"),
             ("FUNC:MODE?", "FUNC:MODE?"),
@@ -1450,171 +1461,177 @@ class DashboardApp:
             ("LIST:CURR:POIN?", "LIST:CURR:POIN?"),
         ]:
             ctk.CTkButton(
-                quick_row2, text=label, width=118,
+                quick_row2, text=label, width=106, height=26,
                 command=lambda c=cmd: self._man_send_preset(c),
                 fg_color="#374151", hover_color="#4b5563").pack(
-                side="left", padx=(0, 6))
+                side="left", padx=(0, 5))
 
         scpi_ctrl = ctk.CTkFrame(console, fg_color="transparent")
-        scpi_ctrl.pack(fill="x", padx=14, pady=(0, 4))
+        scpi_ctrl.pack(fill="x", padx=10, pady=(0, 3))
         ctk.CTkButton(
-            scpi_ctrl, text="Health Check", width=120,
+            scpi_ctrl, text="Health Check", width=104, height=26,
             command=self._man_health_check,
             fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 8))
+            side="left", padx=(0, 6))
         ctk.CTkButton(
-            scpi_ctrl, text="Clear Console", width=120,
+            scpi_ctrl, text="Clear Console", width=104, height=26,
             command=self._man_clear_scpi,
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
         self.scpi_resp = ctk.CTkTextbox(
-            console, height=150,
-            font=ctk.CTkFont(family="Consolas", size=11),
+            console, height=105,
+            font=ctk.CTkFont(family="Consolas", size=10),
             activate_scrollbars=True)
-        self.scpi_resp.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+        self.scpi_resp.pack(fill="x", padx=10, pady=(3, 10))
 
         cards = ctk.CTkFrame(outer, fg_color="transparent")
         cards.pack(fill="x")
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
-        cards.grid_columnconfigure(2, weight=1)
 
         mode_card = ctk.CTkFrame(cards, corner_radius=12)
-        mode_card.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        mode_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 6))
         ctk.CTkLabel(
             mode_card, text="Set Control Mode",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(12, 6))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
         mode_row = ctk.CTkFrame(mode_card, fg_color="transparent")
-        mode_row.pack(fill="x", padx=14, pady=(0, 10))
+        mode_row.pack(fill="x", padx=10, pady=(0, 6))
         self.mode_buttons = {}
         for mode in ("VOLT", "CURR"):
             btn = ctk.CTkButton(
                 mode_row, text="Voltage" if mode == "VOLT" else "Current",
-                width=100,
+                width=78, height=28,
                 command=lambda m=mode: self._select_control_mode(m))
-            btn.pack(side="left", padx=(0, 8))
+            btn.pack(side="left", padx=(0, 6))
             self.mode_buttons[mode] = btn
         ctk.CTkLabel(
             mode_card, text="Waveform uploads use the selected mode.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
-            anchor="w", padx=14, pady=(0, 12))
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=220).pack(
+            anchor="w", padx=10, pady=(0, 8))
 
         limits_card = ctk.CTkFrame(cards, corner_radius=12)
-        limits_card.grid(row=0, column=0, sticky="nsew", padx=4)
+        limits_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 6))
         ctk.CTkLabel(
             limits_card, text="Set V/I Limits",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(12, 6))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
 
         v_row = ctk.CTkFrame(limits_card, fg_color="transparent")
-        v_row.pack(fill="x", padx=14, pady=(0, 6))
+        v_row.pack(fill="x", padx=10, pady=(0, 4))
         ctk.CTkLabel(v_row, text="Voltage limit (V):",
-                     anchor="w", wraplength=175).pack(fill="x")
+                     font=ctk.CTkFont(size=10), anchor="w", wraplength=175).pack(fill="x")
         v_ctrl = ctk.CTkFrame(v_row, fg_color="transparent")
-        v_ctrl.pack(fill="x", pady=(3, 0))
-        ctk.CTkLabel(v_ctrl, text="+", width=14).pack(side="left")
-        self.soft_volt_pos_limit_entry = ctk.CTkEntry(v_ctrl, width=46)
+        v_ctrl.pack(fill="x", pady=(2, 0))
+        ctk.CTkLabel(v_ctrl, text="+", width=12).pack(side="left")
+        self.soft_volt_pos_limit_entry = ctk.CTkEntry(v_ctrl, width=42, height=26)
         self.soft_volt_pos_limit_entry.insert(
             0, str(DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE))
         self.soft_volt_pos_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkLabel(v_ctrl, text="-", width=14).pack(side="left")
-        self.soft_volt_neg_limit_entry = ctk.CTkEntry(v_ctrl, width=46)
+        ctk.CTkLabel(v_ctrl, text="-", width=12).pack(side="left")
+        self.soft_volt_neg_limit_entry = ctk.CTkEntry(v_ctrl, width=42, height=26)
         self.soft_volt_neg_limit_entry.insert(
             0, str(abs(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE)))
         self.soft_volt_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            v_ctrl, text="Set", width=40,
+            v_ctrl, text="Set", width=38, height=26,
             command=lambda: self._set_software_limit("VOLT"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
         c_row = ctk.CTkFrame(limits_card, fg_color="transparent")
-        c_row.pack(fill="x", padx=14, pady=(0, 12))
+        c_row.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkLabel(c_row, text="Current limit (A):",
-                     anchor="w", wraplength=175).pack(fill="x")
+                     font=ctk.CTkFont(size=10), anchor="w", wraplength=175).pack(fill="x")
         c_ctrl = ctk.CTkFrame(c_row, fg_color="transparent")
-        c_ctrl.pack(fill="x", pady=(3, 0))
-        ctk.CTkLabel(c_ctrl, text="+", width=14).pack(side="left")
-        self.soft_curr_pos_limit_entry = ctk.CTkEntry(c_ctrl, width=46)
+        c_ctrl.pack(fill="x", pady=(2, 0))
+        ctk.CTkLabel(c_ctrl, text="+", width=12).pack(side="left")
+        self.soft_curr_pos_limit_entry = ctk.CTkEntry(c_ctrl, width=42, height=26)
         self.soft_curr_pos_limit_entry.insert(
             0, str(DEFAULT_POSITIVE_CURRENT_LIMIT))
         self.soft_curr_pos_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkLabel(c_ctrl, text="-", width=14).pack(side="left")
-        self.soft_curr_neg_limit_entry = ctk.CTkEntry(c_ctrl, width=46)
+        ctk.CTkLabel(c_ctrl, text="-", width=12).pack(side="left")
+        self.soft_curr_neg_limit_entry = ctk.CTkEntry(c_ctrl, width=42, height=26)
         self.soft_curr_neg_limit_entry.insert(
             0, str(abs(DEFAULT_NEGATIVE_CURRENT_LIMIT)))
         self.soft_curr_neg_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            c_ctrl, text="Set", width=40,
+            c_ctrl, text="Set", width=38, height=26,
             command=lambda: self._set_software_limit("CURR"),
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
 
         range_card = ctk.CTkFrame(cards, corner_radius=12)
-        range_card.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        range_card.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 0))
         ctk.CTkLabel(
             range_card, text="Range Control",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(12, 6))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
         ctk.CTkLabel(
             range_card, text="Full-scale avoids quarter-scale transients.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10)).pack(
-            anchor="w", padx=14, pady=(0, 8))
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=220).pack(
+            anchor="w", padx=10, pady=(0, 5))
         range_row = ctk.CTkFrame(range_card, fg_color="transparent")
-        range_row.pack(fill="x", padx=14, pady=(0, 10))
+        range_row.pack(fill="x", padx=10, pady=(0, 6))
         self.man_range_var = ctk.StringVar(value="Auto")
         self.man_range_combo = ctk.CTkComboBox(
             range_row, variable=self.man_range_var,
             values=["Auto", "Full Scale", "Quarter Scale"],
-            width=150)
-        self.man_range_combo.pack(side="left", padx=(0, 8))
+            width=126, height=28)
+        self.man_range_combo.pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            range_row, text="Set", width=60,
+            range_row, text="Set", width=46, height=28,
             command=self._man_set_range,
             fg_color="#374151", hover_color="#4b5563").pack(side="left")
         ctk.CTkFrame(range_card, height=2, fg_color=C["border"]).pack(
-            fill="x", padx=14, pady=(2, 10))
+            fill="x", padx=10, pady=(2, 6))
         ctk.CTkButton(
             range_card, text="Reset Device (*RST)",
             command=self._man_reset,
             fg_color=C["red"], hover_color="#dc2626",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(
-            fill="x", padx=14, pady=(0, 14))
+            height=30, font=ctk.CTkFont(size=12, weight="bold")).pack(
+            fill="x", padx=10, pady=(0, 8))
 
         monitor_card = ctk.CTkFrame(cards, corner_radius=12)
         monitor_card.grid(
-            row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            row=1, column=1, sticky="nsew", padx=(4, 0), pady=(0, 0))
         ctk.CTkLabel(
             monitor_card, text="DC Monitor Thresholds",
-            font=ctk.CTkFont(size=14, weight="bold")).pack(
-            anchor="w", padx=14, pady=(12, 6))
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
 
         monitor_row = ctk.CTkFrame(monitor_card, fg_color="transparent")
-        monitor_row.pack(fill="x", padx=14, pady=(0, 14))
+        monitor_row.pack(fill="x", padx=10, pady=(0, 8))
+        monitor_row.grid_columnconfigure(0, weight=1)
+        monitor_row.grid_columnconfigure(1, weight=1)
+        monitor_row.grid_columnconfigure(2, weight=0)
 
         v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        v_ctrl.pack(side="left", padx=(0, 18))
+        v_ctrl.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkLabel(
             v_ctrl, text="Voltage tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=92).pack(
             anchor="w")
-        self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=120)
+        self.vmon_threshold_entry = ctk.CTkEntry(v_ctrl, width=82, height=26)
         self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
-        self.vmon_threshold_entry.pack(anchor="w", pady=(3, 0))
+        self.vmon_threshold_entry.pack(anchor="w", pady=(2, 0))
 
         i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        i_ctrl.pack(side="left")
+        i_ctrl.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         ctk.CTkLabel(
             i_ctrl, text="Current tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=11)).pack(
+            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            justify="left", wraplength=92).pack(
             anchor="w")
-        self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=120)
+        self.imon_threshold_entry = ctk.CTkEntry(i_ctrl, width=82, height=26)
         self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT))
-        self.imon_threshold_entry.pack(anchor="w", pady=(3, 0))
+        self.imon_threshold_entry.pack(anchor="w", pady=(2, 0))
 
         btn_wrap = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        btn_wrap.pack(side="left", padx=(16, 0), pady=(16, 0))
+        btn_wrap.grid(row=0, column=2, sticky="s", pady=(16, 0))
         ctk.CTkButton(
-            btn_wrap, text="Set", width=60,
+            btn_wrap, text="Set", width=46, height=26,
             command=self._set_monitor_thresholds,
             fg_color="#374151", hover_color="#4b5563").pack()
 
@@ -1635,9 +1652,9 @@ class DashboardApp:
         content = self.status_content
         content.grid(row=1, column=0, sticky="nsew")
         content.grid_columnconfigure(0, weight=6)
-        content.grid_columnconfigure(1, weight=1, minsize=150)
-        content.grid_rowconfigure(0, weight=3)
-        content.grid_rowconfigure(1, weight=2)
+        content.grid_columnconfigure(1, weight=1, minsize=155)
+        content.grid_rowconfigure(0, weight=2)
+        content.grid_rowconfigure(1, weight=3)
 
         self.status_plot_card = ctk.CTkFrame(content, corner_radius=12)
         plot_card = self.status_plot_card
@@ -1657,41 +1674,41 @@ class DashboardApp:
         cfg_card.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
         self.status_cfg_title = ctk.CTkLabel(
             cfg_card, text="Waveform\nConfiguration",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            justify="left", anchor="w", wraplength=125)
-        self.status_cfg_title.pack(fill="x", padx=10, pady=(10, 6))
+            font=ctk.CTkFont(size=13, weight="bold"),
+            justify="left", anchor="w", wraplength=122)
+        self.status_cfg_title.pack(fill="x", padx=8, pady=(8, 4))
         self.status_cfg_labels = {}
         self.status_cfg_name_labels = []
         for key, title in [
-            ("wave", "Waveform Type"),
-            ("mode", "Control Mode"),
-            ("frequency", "Frequency"),
-            ("amplitude", "Amplitude / Value"),
+            ("wave", "Waveform"),
+            ("mode", "Mode"),
+            ("frequency", "Freq"),
+            ("amplitude", "Amp/Val"),
             ("offset", "Offset"),
-            ("points", "Total Points"),
-            ("loop", "Loop Count"),
-            ("device_state", "Device State"),
+            ("points", "Points"),
+            ("loop", "Loops"),
+            ("device_state", "State"),
         ]:
             row = ctk.CTkFrame(cfg_card, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=(0, 5))
+            row.pack(fill="x", padx=8, pady=(0, 2))
             name = ctk.CTkLabel(
                 row, text=title, text_color=C["text2"],
-                font=ctk.CTkFont(size=11), width=130,
-                anchor="w", justify="left", wraplength=125)
-            name.pack(fill="x")
+                font=ctk.CTkFont(size=10), width=64,
+                anchor="w", justify="left", wraplength=62)
+            name.pack(side="left")
             value = ctk.CTkLabel(
-                row, text="--", font=ctk.CTkFont(size=11),
-                justify="left", anchor="w", wraplength=125)
-            value.pack(fill="x")
+                row, text="--", font=ctk.CTkFont(size=10),
+                justify="left", anchor="w", wraplength=68)
+            value.pack(side="left", fill="x", expand=True)
             self.status_cfg_name_labels.append(name)
             self.status_cfg_labels[key] = value
 
         self.status_meas_card = ctk.CTkFrame(content, corner_radius=12, fg_color=C["graph_bg"])
         meas_card = self.status_meas_card
         meas_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        title_font = ctk.CTkFont(size=15, weight="bold")
+        title_font = ctk.CTkFont(size=13, weight="bold")
         meas_title_row = ctk.CTkFrame(meas_card, fg_color="transparent")
-        meas_title_row.pack(fill="x", padx=14, pady=(10, 6))
+        meas_title_row.pack(fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(
             meas_title_row, text="Live Measurements",
             font=title_font).pack(side="left")
@@ -1702,7 +1719,7 @@ class DashboardApp:
 
         meas_values = ctk.CTkFrame(meas_card, fg_color="transparent")
         self.meas_values = meas_values
-        meas_values.pack(fill="x", padx=14, pady=(4, 8))
+        meas_values.pack(fill="x", padx=10, pady=(2, 5))
         meas_values.grid_columnconfigure(0, weight=1)
 
         vi_values = ctk.CTkFrame(meas_values, fg_color="transparent")
@@ -1710,43 +1727,44 @@ class DashboardApp:
         vi_values.grid(row=0, column=0, sticky="w")
         self.status_meas_volt_lbl = ctk.CTkLabel(
             vi_values, text="Voltage:  ---.----  V",
-            font=ctk.CTkFont(family="Consolas", size=18),
+            font=ctk.CTkFont(family="Consolas", size=15),
             text_color="#60a5fa")
-        self.status_meas_volt_lbl.pack(anchor="w", pady=(0, 4))
+        self.status_meas_volt_lbl.pack(anchor="w", pady=(0, 2))
         self.status_meas_curr_lbl = ctk.CTkLabel(
             vi_values, text="Current:  ---.----  A",
-            font=ctk.CTkFont(family="Consolas", size=18),
+            font=ctk.CTkFont(family="Consolas", size=15),
             text_color="#34d399")
-        self.status_meas_curr_lbl.pack(anchor="w", pady=(4, 0))
+        self.status_meas_curr_lbl.pack(anchor="w", pady=(2, 0))
 
         temp_values = ctk.CTkFrame(meas_values, fg_color="transparent")
         self.temp_values = temp_values
-        temp_values.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        temp_font = ctk.CTkFont(family="Consolas", size=18)
+        temp_values.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        temp_font = ctk.CTkFont(family="Consolas", size=15)
         self.status_solenoid_temp_1_lbl = ctk.CTkLabel(
             temp_values, text="Solenoid 1:  --.-  \N{DEGREE SIGN}C",
             font=temp_font, text_color="#facc15")
-        self.status_solenoid_temp_1_lbl.pack(anchor="w", pady=(0, 4))
+        self.status_solenoid_temp_1_lbl.pack(anchor="w", pady=(0, 2))
         self.status_solenoid_temp_2_lbl = ctk.CTkLabel(
             temp_values, text="Solenoid 2:  --.-  \N{DEGREE SIGN}C",
             font=temp_font, text_color="#facc15")
-        self.status_solenoid_temp_2_lbl.pack(anchor="w", pady=(4, 0))
+        self.status_solenoid_temp_2_lbl.pack(anchor="w", pady=(2, 0))
 
         self.status_live_console = ctk.CTkFrame(
             meas_card, corner_radius=6, fg_color="#111827",
             border_width=1, border_color=C["border"])
-        self.status_live_console.pack(fill="x", padx=14, pady=(0, 10))
+        self.status_live_console.pack(fill="x", padx=10, pady=(0, 8))
         self.status_live_console_labels = {}
         for key in ("voltage", "current", "pmon", "stale"):
             label = ctk.CTkLabel(
                 self.status_live_console,
                 text="",
-                height=20,
+                height=16,
                 justify="left",
                 anchor="w",
+                wraplength=300,
                 text_color=C["text2"],
-                font=ctk.CTkFont(family="Consolas", size=12, weight="bold"))
-            label.pack(fill="x", padx=10, pady=(6 if key == "voltage" else 0, 6))
+                font=ctk.CTkFont(family="Consolas", size=10, weight="bold"))
+            label.pack(fill="x", padx=8, pady=(4 if key == "voltage" else 0, 4))
             self.status_live_console_labels[key] = label
         self.status_live_console_labels["stale"].pack_forget()
 
@@ -1876,8 +1894,8 @@ class DashboardApp:
     def _lbl(parent, text):
         label = ctk.CTkLabel(
             parent, text=text, text_color=C["text2"],
-            font=ctk.CTkFont(size=12), justify="left", wraplength=180)
-        label.pack(fill="x", padx=10, pady=(6, 1))
+            font=ctk.CTkFont(size=10), justify="left", wraplength=170)
+        label.pack(fill="x", padx=8, pady=(4, 0))
         return label
 
     # -- Session logging and readback collection -----------------------------
@@ -2435,7 +2453,7 @@ class DashboardApp:
             except Exception:
                 packed = False
             if not packed:
-                label.pack(fill="x", padx=10, pady=(0, 6))
+                label.pack(fill="x", padx=8, pady=(0, 4))
             label.configure(text=text, text_color=color)
         else:
             label.pack_forget()
@@ -2619,7 +2637,7 @@ class DashboardApp:
     def _on_wave_change(self, _=None):
         wave = self.wave_var.get()
         if wave == "CSV Custom (untested)":
-            self.csv_frame.pack(fill="x", padx=10, pady=(0, 6), after=self.wave_combo)
+            self.csv_frame.pack(fill="x", padx=8, pady=(0, 4), after=self.wave_combo)
         else:
             self.csv_frame.pack_forget()
 
