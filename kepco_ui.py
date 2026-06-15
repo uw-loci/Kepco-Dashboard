@@ -1125,30 +1125,32 @@ class DashboardApp:
         self.main.grid_columnconfigure(1, weight=3 if compact else 9)
 
         self.wave_body.grid_columnconfigure(
-            0, weight=5, minsize=0)
+            0, weight=7, minsize=0)
         self.wave_body.grid_columnconfigure(
-            1, weight=0 if compact else 3, minsize=235 if compact else 280)
-        self.wave_cfg.configure(width=238 if compact else 280)
+            1, weight=0, minsize=205 if compact else 220)
+        self.wave_cfg.configure(width=205 if compact else 220)
         self.output_card.configure(width=248 if compact else 290)
-        self.timing_lbl.configure(wraplength=205 if compact else 250)
+        self.wave_cfg_title.configure(wraplength=175 if compact else 190)
+        self.timing_lbl.configure(wraplength=175 if compact else 190)
         self.output_hint_lbl.configure(wraplength=205 if compact else 250)
         self.upload_btn.configure(width=120 if compact else 150)
         self.idn_lbl.configure(width=250 if compact else 360)
 
         self.status_content.grid_columnconfigure(
-            0, weight=5 if compact else 4, minsize=285 if compact else 0)
+            0, weight=7 if compact else 6, minsize=285 if compact else 0)
         self.status_content.grid_columnconfigure(
-            1, weight=2, minsize=150 if compact else 0)
+            1, weight=1, minsize=130 if compact else 150)
+        self.status_cfg_title.configure(wraplength=110 if compact else 125)
         self.temp_values.grid_configure(
-            row=1 if compact else 0,
-            column=0 if compact else 1,
+            row=1,
+            column=0,
             sticky="w",
-            padx=(0, 0) if compact else (12, 0),
-            pady=(6, 0) if compact else (0, 0))
+            padx=(0, 0),
+            pady=(6, 0))
         for label in getattr(self, "status_cfg_name_labels", []):
-            label.configure(width=78 if compact else 96)
+            label.configure(width=110 if compact else 130, wraplength=105 if compact else 125)
         for value in getattr(self, "status_cfg_labels", {}).values():
-            value.configure(wraplength=78 if compact else 150)
+            value.configure(wraplength=105 if compact else 125)
 
         meas_font_size = 16 if compact else 18
         meas_font = ctk.CTkFont(family="Consolas", size=meas_font_size)
@@ -1242,8 +1244,8 @@ class DashboardApp:
 
         self.wave_body = ctk.CTkFrame(outer, fg_color="transparent")
         self.wave_body.pack(fill="both", expand=True)
-        self.wave_body.grid_columnconfigure(0, weight=5)
-        self.wave_body.grid_columnconfigure(1, weight=3, minsize=245)
+        self.wave_body.grid_columnconfigure(0, weight=7)
+        self.wave_body.grid_columnconfigure(1, weight=0, minsize=220)
         self.wave_body.grid_rowconfigure(0, weight=1)
         self.wave_body.grid_rowconfigure(1, weight=0)
 
@@ -1259,13 +1261,14 @@ class DashboardApp:
         self.preview_fig, self.preview_ax, self.preview_canvas = self._build_plot(
             preview_plot_wrap, (6.6, 3.8))
 
-        self.wave_cfg = ctk.CTkFrame(self.wave_body, width=260, corner_radius=12)
+        self.wave_cfg = ctk.CTkFrame(self.wave_body, width=220, corner_radius=12)
         self.wave_cfg.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
 
-        ctk.CTkLabel(
-            self.wave_cfg, text="Waveform Configuration",
-            font=ctk.CTkFont(size=15, weight="bold")).pack(
-            padx=12, pady=(12, 8))
+        self.wave_cfg_title = ctk.CTkLabel(
+            self.wave_cfg, text="Waveform\nConfiguration",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            justify="left", anchor="w", wraplength=190)
+        self.wave_cfg_title.pack(fill="x", padx=10, pady=(12, 8))
 
         self._lbl(self.wave_cfg, "Waveform Type")
         self.wave_var = ctk.StringVar(value="Sine")
@@ -1274,54 +1277,55 @@ class DashboardApp:
             values=["DC", "Sine", "Square", "Triangle",
                     "Sawtooth", "CSV Custom (untested)"],
             command=self._on_wave_change)
-        self.wave_combo.pack(fill="x", padx=12, pady=(0, 5))
+        self.wave_combo.pack(fill="x", padx=10, pady=(0, 5))
 
         self.csv_frame = ctk.CTkFrame(self.wave_cfg, fg_color="transparent")
         self.csv_btn = ctk.CTkButton(
-            self.csv_frame, text="Load CSV", width=110,
+            self.csv_frame, text="Load CSV", width=96,
             command=self._load_csv,
             fg_color="#374151", hover_color="#4b5563")
         self.csv_btn.pack(side="left", padx=(0, 8))
         self.csv_lbl = ctk.CTkLabel(
             self.csv_frame, text="No file",
-            text_color=C["text2"], font=ctk.CTkFont(size=11))
-        self.csv_lbl.pack(side="left")
+            text_color=C["text2"], font=ctk.CTkFont(size=11),
+            anchor="w", justify="left", wraplength=80)
+        self.csv_lbl.pack(side="left", fill="x", expand=True)
 
         self.freq_label = self._lbl(self.wave_cfg, "Frequency (Hz)")
         self.freq_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="40.0")
         self.freq_entry.insert(0, "40.0")
-        self.freq_entry.pack(fill="x", padx=12, pady=(0, 5))
+        self.freq_entry.pack(fill="x", padx=10, pady=(0, 5))
 
         self.amp_label = self._lbl(self.wave_cfg, "Amplitude (V / A)")
         self.amp_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="10.0")
         self.amp_entry.insert(0, "10.0")
-        self.amp_entry.pack(fill="x", padx=12, pady=(0, 5))
+        self.amp_entry.pack(fill="x", padx=10, pady=(0, 5))
 
         self.off_label = self._lbl(self.wave_cfg, "Offset (V / A)")
         self.off_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="0.0")
         self.off_entry.insert(0, "0.0")
-        self.off_entry.pack(fill="x", padx=12, pady=(0, 5))
+        self.off_entry.pack(fill="x", padx=10, pady=(0, 5))
 
         self.pts_label = self._lbl(self.wave_cfg, "Total Points (max 4000)")
         self.pts_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="1000")
         self.pts_entry.insert(0, "1000")
-        self.pts_entry.pack(fill="x", padx=12, pady=(0, 5))
+        self.pts_entry.pack(fill="x", padx=10, pady=(0, 5))
 
         self.loop_label = self._lbl(self.wave_cfg, "Loop Count (0 = infinite)")
         self.loop_entry = ctk.CTkEntry(self.wave_cfg, placeholder_text="0")
         self.loop_entry.insert(0, "0")
-        self.loop_entry.pack(fill="x", padx=12, pady=(0, 6))
+        self.loop_entry.pack(fill="x", padx=10, pady=(0, 6))
 
         ctk.CTkButton(
             self.wave_cfg, text="Preview Waveform", command=self._preview,
             fg_color="#374151", hover_color="#4b5563",
             font=ctk.CTkFont(size=12)).pack(
-            fill="x", padx=12, pady=(3, 4))
+            fill="x", padx=10, pady=(3, 4))
 
         self.timing_lbl = ctk.CTkLabel(
             self.wave_cfg, text="", text_color=C["amber"],
-            font=ctk.CTkFont(size=11), wraplength=220, justify="left")
-        self.timing_lbl.pack(fill="x", padx=12, pady=(3, 10))
+            font=ctk.CTkFont(size=11), wraplength=190, justify="left")
+        self.timing_lbl.pack(fill="x", padx=10, pady=(3, 10))
 
         self.wave_footer = ctk.CTkFrame(self.wave_body, corner_radius=14)
         self.wave_footer.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 2))
@@ -1630,8 +1634,8 @@ class DashboardApp:
         self.status_content = ctk.CTkFrame(outer, fg_color="transparent")
         content = self.status_content
         content.grid(row=1, column=0, sticky="nsew")
-        content.grid_columnconfigure(0, weight=4)
-        content.grid_columnconfigure(1, weight=2)
+        content.grid_columnconfigure(0, weight=6)
+        content.grid_columnconfigure(1, weight=1, minsize=150)
         content.grid_rowconfigure(0, weight=3)
         content.grid_rowconfigure(1, weight=2)
 
@@ -1651,10 +1655,11 @@ class DashboardApp:
         self.status_cfg_card = ctk.CTkFrame(content, corner_radius=12)
         cfg_card = self.status_cfg_card
         cfg_card.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
-        ctk.CTkLabel(
-            cfg_card, text="Waveform Configuration",
-            font=ctk.CTkFont(size=15, weight="bold")).pack(
-            anchor="w", padx=12, pady=(10, 6))
+        self.status_cfg_title = ctk.CTkLabel(
+            cfg_card, text="Waveform\nConfiguration",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            justify="left", anchor="w", wraplength=125)
+        self.status_cfg_title.pack(fill="x", padx=10, pady=(10, 6))
         self.status_cfg_labels = {}
         self.status_cfg_name_labels = []
         for key, title in [
@@ -1668,15 +1673,16 @@ class DashboardApp:
             ("device_state", "Device State"),
         ]:
             row = ctk.CTkFrame(cfg_card, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=(0, 4))
+            row.pack(fill="x", padx=10, pady=(0, 5))
             name = ctk.CTkLabel(
                 row, text=title, text_color=C["text2"],
-                font=ctk.CTkFont(size=11), width=86, anchor="w")
-            name.pack(side="left")
+                font=ctk.CTkFont(size=11), width=130,
+                anchor="w", justify="left", wraplength=125)
+            name.pack(fill="x")
             value = ctk.CTkLabel(
                 row, text="--", font=ctk.CTkFont(size=11),
-                justify="left", anchor="w", wraplength=120)
-            value.pack(side="left", fill="x", expand=True)
+                justify="left", anchor="w", wraplength=125)
+            value.pack(fill="x")
             self.status_cfg_name_labels.append(name)
             self.status_cfg_labels[key] = value
 
@@ -1698,7 +1704,6 @@ class DashboardApp:
         self.meas_values = meas_values
         meas_values.pack(fill="x", padx=14, pady=(4, 8))
         meas_values.grid_columnconfigure(0, weight=1)
-        meas_values.grid_columnconfigure(1, weight=1)
 
         vi_values = ctk.CTkFrame(meas_values, fg_color="transparent")
         self.vi_values = vi_values
@@ -1716,7 +1721,7 @@ class DashboardApp:
 
         temp_values = ctk.CTkFrame(meas_values, fg_color="transparent")
         self.temp_values = temp_values
-        temp_values.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        temp_values.grid(row=1, column=0, sticky="w", pady=(6, 0))
         temp_font = ctk.CTkFont(family="Consolas", size=18)
         self.status_solenoid_temp_1_lbl = ctk.CTkLabel(
             temp_values, text="Solenoid 1:  --.-  \N{DEGREE SIGN}C",
@@ -1871,8 +1876,8 @@ class DashboardApp:
     def _lbl(parent, text):
         label = ctk.CTkLabel(
             parent, text=text, text_color=C["text2"],
-            font=ctk.CTkFont(size=12))
-        label.pack(anchor="w", padx=14, pady=(6, 1))
+            font=ctk.CTkFont(size=12), justify="left", wraplength=180)
+        label.pack(fill="x", padx=10, pady=(6, 1))
         return label
 
     # -- Session logging and readback collection -----------------------------
@@ -2614,7 +2619,7 @@ class DashboardApp:
     def _on_wave_change(self, _=None):
         wave = self.wave_var.get()
         if wave == "CSV Custom (untested)":
-            self.csv_frame.pack(fill="x", padx=14, pady=(0, 6), after=self.wave_combo)
+            self.csv_frame.pack(fill="x", padx=10, pady=(0, 6), after=self.wave_combo)
         else:
             self.csv_frame.pack_forget()
 
