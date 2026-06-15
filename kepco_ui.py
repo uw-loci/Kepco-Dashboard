@@ -1078,6 +1078,9 @@ class DashboardApp:
     # -- UI construction -----------------------------------------------------
     # The UI is split into a waveform/control tab, a manual SCPI tab, and a
     # status panel. Widget callbacks delegate to the behavioral sections below.
+
+    # -- Responsive resize debounce -----------------------------------------
+    # Coalesce window resize events before recalculating compact/wide layout.
     def _on_root_configure(self, event):
         if event.widget is not self.root:
             return
@@ -1089,6 +1092,8 @@ class DashboardApp:
         self._resize_job = self.root.after(
             80, apply_resize)
 
+    # -- Responsive status mode controls -------------------------------------
+    # Re-pack mode pills so compact widths stack without horizontal clipping.
     def _pack_status_mode_pills(self, compact):
         if not hasattr(self, "status_mode_labels"):
             return
@@ -1100,6 +1105,8 @@ class DashboardApp:
             else:
                 pill.pack(side="left", padx=(0, 8))
 
+    # -- Responsive AC notice placement --------------------------------------
+    # Preserve the AC warning label when the measurement header changes layout.
     def _place_ac_operation_notice(self):
         if (
             not hasattr(self, "status_ac_invalid_lbl")
@@ -1112,6 +1119,8 @@ class DashboardApp:
         else:
             self.status_ac_invalid_lbl.pack(side="left", padx=(16, 0))
 
+    # -- Responsive dashboard layout -----------------------------------------
+    # Tune widths, wrapping, and measurement density for wide and compact use.
     def _apply_responsive_layout(self, width):
         if width <= 1:
             width = 1440
