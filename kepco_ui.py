@@ -41,7 +41,7 @@ import matplotlib.lines as mlines
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from solenoid_temperature_reader import WebMonitorSolenoidTemperatureReader
+from solenoid_temperature_reader import DatalogSolenoidTemperatureReader
 
 # -- Constants ---------------------------------------------------------------
 # These values encode hardware limits and transport timing assumptions. Keep
@@ -67,7 +67,7 @@ DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
 DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
 DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
-PMON_STALE_SECONDS = 10.0
+DATALOG_STALE_SECONDS = 10.0
 DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
 DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
 
@@ -1038,13 +1038,13 @@ class DashboardApp:
         self.data_collection_started_at = None
         self.data_collection_enabled = False
         self._data_collection_switch_updating = False
-        self.solenoid_temperature_reader = WebMonitorSolenoidTemperatureReader()
+        self.solenoid_temperature_reader = DatalogSolenoidTemperatureReader()
         self.solenoid_temperatures = {"1": None, "2": None}
         self.solenoid_temperature_timestamp = None
         self.solenoid_temperature_source_path = None
         self.solenoid_temperature_error = None
-        self._last_unique_pmon_timestamp = None
-        self._last_unique_pmon_seen_at = None
+        self._last_unique_datalog_timestamp = None
+        self._last_unique_datalog_seen_at = None
         self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
 
         # UI-thread handoff state. Worker callbacks are queued here and drained
@@ -1787,7 +1787,7 @@ class DashboardApp:
             border_width=1, border_color=C["border"])
         self.status_live_console.pack(fill="x", padx=8, pady=(0, 6))
         self.status_live_console_labels = {}
-        for key in ("voltage", "current", "pmon", "stale"):
+        for key in ("voltage", "current", "datalog", "stale"):
             label = ctk.CTkLabel(
                 self.status_live_console,
                 text="",
@@ -2134,12 +2134,12 @@ class DashboardApp:
         self.solenoid_temperature_error = snapshot.error
         self.solenoid_temperature_source_path = snapshot.source_path
         self.solenoid_temperature_timestamp = snapshot.timestamp
-        self._note_pmon_timestamp(snapshot.timestamp)
+        self._note_datalog_timestamp(snapshot.timestamp)
 
         if snapshot.error:
             self.solenoid_temperatures = {"1": None, "2": None}
             self._update_solenoid_temperature_display()
-            self._refresh_pmon_console_lines()
+            self._refresh_datalog_console_lines()
             if snapshot.error != self._last_solenoid_temperature_error_logged:
                 self.log(
                     f"Solenoid temperature read unavailable: {snapshot.error}",
@@ -2153,7 +2153,7 @@ class DashboardApp:
             "2": snapshot.solenoid_2,
         }
         self._update_solenoid_temperature_display()
-        self._refresh_pmon_console_lines()
+        self._refresh_datalog_console_lines()
 
         if (
             snapshot.source_path
@@ -2495,21 +2495,21 @@ class DashboardApp:
         else:
             label.pack_forget()
 
-    def _refresh_pmon_console_lines(self):
+    def _refresh_datalog_console_lines(self):
         if self.solenoid_temperature_error:
             self._set_live_console_line(
-                "pmon", "WebMonitor Log File Not Found/Invalid", C["amber"])
+                "datalog", "Datalog File Not Found/Invalid", C["amber"])
             self._set_live_console_line(
-                "stale", "Warning: stale values from PMON",
+                "stale", "Warning: stale values from datalog",
                 C["amber"], visible=False)
             return
 
-        self._set_live_console_line("pmon", "WebMonitor Log File valid", C["green"])
-        stale_age = self._pmon_stale_age_seconds()
-        stale = stale_age is not None and stale_age > PMON_STALE_SECONDS
+        self._set_live_console_line("datalog", "Datalog file valid", C["green"])
+        stale_age = self._datalog_stale_age_seconds()
+        stale = stale_age is not None and stale_age > DATALOG_STALE_SECONDS
         self._set_live_console_line(
             "stale",
-            "Warning: stale values from PMON",
+            "Warning: stale values from datalog",
             C["amber"],
             visible=stale)
 
@@ -2519,7 +2519,7 @@ class DashboardApp:
         self._set_live_console_line(
             "current", "Current monitor inactive", C["text2"])
         self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
-        self._refresh_pmon_console_lines()
+        self._refresh_datalog_console_lines()
 
     def _read_monitor_thresholds(self):
         return self.vmon_threshold_pct, self.imon_threshold_pct
@@ -2570,7 +2570,7 @@ class DashboardApp:
             self._set_live_console_line(
                 "voltage", "Cannot compute expected voltage", C["amber"])
             self.dc_current_monitor_state["voltage"] = "unavailable"
-            self._refresh_pmon_console_lines()
+            self._refresh_datalog_console_lines()
             return
 
         expected_voltage = iset * (20.95 + 0.0470 * (temp_a + temp_b))
@@ -2583,7 +2583,7 @@ class DashboardApp:
             else f"Voltage outside expected range (expected {expected_voltage:.2f} V)",
             C["green"] if voltage_ok else C["red"])
         self.dc_current_monitor_state["voltage"] = "ok" if voltage_ok else "triggered"
-        self._refresh_pmon_console_lines()
+        self._refresh_datalog_console_lines()
 
     @staticmethod
     def _as_float(value):
@@ -2611,12 +2611,12 @@ class DashboardApp:
         self.status_solenoid_temp_2_lbl.configure(
             text=f"Solenoid 2:  {temp_2}  \N{DEGREE SIGN}C")
 
-    def _note_pmon_timestamp(self, timestamp):
+    def _note_datalog_timestamp(self, timestamp):
         if not timestamp:
             return
-        if timestamp != self._last_unique_pmon_timestamp:
-            self._last_unique_pmon_timestamp = timestamp
-            self._last_unique_pmon_seen_at = time.time()
+        if timestamp != self._last_unique_datalog_timestamp:
+            self._last_unique_datalog_timestamp = timestamp
+            self._last_unique_datalog_seen_at = time.time()
 
     @staticmethod
     def _timestamp_to_epoch(timestamp):
@@ -2637,7 +2637,7 @@ class DashboardApp:
 
         return parsed.timestamp()
 
-    def _pmon_stale_age_seconds(self):
+    def _datalog_stale_age_seconds(self):
         timestamp = self.solenoid_temperature_timestamp
         if not timestamp:
             return None
@@ -2646,10 +2646,10 @@ class DashboardApp:
         if epoch is not None:
             return max(0.0, time.time() - epoch)
 
-        self._note_pmon_timestamp(timestamp)
-        if self._last_unique_pmon_seen_at is None:
+        self._note_datalog_timestamp(timestamp)
+        if self._last_unique_datalog_seen_at is None:
             return None
-        return max(0.0, time.time() - self._last_unique_pmon_seen_at)
+        return max(0.0, time.time() - self._last_unique_datalog_seen_at)
 
     def _set_live_measurement_axis(self, mode, value):
         if self._is_ac_operation_active():

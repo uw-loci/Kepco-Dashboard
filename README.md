@@ -20,7 +20,7 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 ## Main Files
 
 - `kepco_ui.py`: main desktop application, SCPI controller, waveform generation, discovery, and UI orchestration
-- `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM WebMonitor JSONL logs for DC current monitoring
+- `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM datalog JSONL files for DC current monitoring
 - `requirements.txt`: Python dependencies
 - `docs/802e_manual.md`: device reference material
 - [`docs/KEPCO LAN IP Configuration Steps 2026-3-15-CMov.pdf`](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf): Kepco LAN/IP setup reference for configuring network access to the supply
@@ -95,13 +95,13 @@ While connected, the dashboard polls:
 - `OUTP?`
 - `FUNC:MODE?`
 
-The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM WebMonitor log directory:
+The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM datalog directory:
 
 ```text
-~/EBEAM_dashboard/EBEAM-Dashboard-WMLogs/webMonitor_log_*.txt
+~/EBEAM_dashboard/EBEAM-Dashboard-Datalogs/datalog_*.txt
 ```
 
-The newest valid JSONL status entry is used. If the file cannot be found, cannot be parsed, or no longer updates, the live console shows a WebMonitor warning. WebMonitor values are polled every `3 s`; values older than `10 s` are marked stale.
+The newest valid JSONL status entry is used. If the file cannot be found, cannot be parsed, or no longer updates, the live console shows a Datalog warning. Datalog values are polled every `3 s`; values older than `10 s` are marked stale.
 
 ## DC Current Monitoring
 
@@ -117,7 +117,7 @@ The monitor is active only during this stage:
 
 In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload, LIST waveform output, AC waveform streaming, and output transitions, the voltage and current monitor lines are set to inactive.
 
-When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two WebMonitor solenoid temperatures:
+When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two datalog solenoid temperatures:
 
 ```text
 expected voltage = Iset * (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
