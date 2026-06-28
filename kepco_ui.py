@@ -2352,15 +2352,34 @@ class DashboardApp:
     # -- Output button rendering --------------------------------------------
     # The output button has several logical locks: disconnected, no waveform,
     # in-flight command sequence, streamed waveform active, and ready/armed.
+    @staticmethod
+    def _output_toggle_allowed(
+            connected,
+            uploaded_waveform_ready,
+            current_output_on,
+            sequence_active,
+            output_toggle_in_flight):
+        return (
+            bool(connected)
+            and not output_toggle_in_flight
+            and (
+                uploaded_waveform_ready
+                or current_output_on
+                or sequence_active
+            )
+        )
+
+    def _can_toggle_output(self):
+        return self._output_toggle_allowed(
+            self.kepco.connected,
+            self.uploaded_waveform_ready,
+            self.current_output_on,
+            self.sequence_active,
+            self._output_toggle_in_flight)
+
     def _refresh_output_toggle_button(self, can_toggle=None):
         if can_toggle is None:
-            can_toggle = (
-                self.kepco.connected
-                and self.uploaded_waveform_ready
-                and not self._output_toggle_in_flight
-            )
-            if self.sequence_active:
-                can_toggle = True
+            can_toggle = self._can_toggle_output()
 
         badge_text = "OFFLINE"
         badge_color = C["red"]
@@ -2371,35 +2390,36 @@ class DashboardApp:
         button_hover = "#4b5563"
         button_text_color = "#e5e7eb"
 
-        if self.kepco.connected and not self.uploaded_waveform_ready:
-            badge_text = "LOCKED"
-            badge_color = C["amber"]
-            badge_text_color = "#111827"
-            summary = "Awaiting waveform upload"
-            button_text = "Upload Waveform First"
-        elif self._output_toggle_in_flight:
-            badge_text = "APPLYING"
-            badge_color = C["amber"]
-            badge_text_color = "#111827"
-            summary = "Applying output change"
-            button_text = "Applying..."
-            button_color = "#475569"
-            button_hover = "#475569"
-        elif self.current_output_on:
-            badge_text = "LIVE"
-            badge_color = C["green"]
-            summary = "Streaming waveform" if self.sequence_active else "Output enabled"
-            button_text = "Disable Output"
-            button_color = C["red"]
-            button_hover = "#dc2626"
-        elif self.kepco.connected and self.uploaded_waveform_ready:
-            badge_text = "READY"
-            badge_color = C["primary"]
-            summary = "Waveform uploaded and armed"
-            button_text = "Enable Output"
-            button_color = C["green"]
-            button_hover = "#059669"
-            button_text_color = "#000000"
+        if self.kepco.connected:
+            if self._output_toggle_in_flight:
+                badge_text = "APPLYING"
+                badge_color = C["amber"]
+                badge_text_color = "#111827"
+                summary = "Applying output change"
+                button_text = "Applying..."
+                button_color = "#475569"
+                button_hover = "#475569"
+            elif self.current_output_on or self.sequence_active:
+                badge_text = "LIVE"
+                badge_color = C["green"]
+                summary = "Streaming waveform" if self.sequence_active else "Output enabled"
+                button_text = "Disable Output"
+                button_color = C["red"]
+                button_hover = "#dc2626"
+            elif not self.uploaded_waveform_ready:
+                badge_text = "LOCKED"
+                badge_color = C["amber"]
+                badge_text_color = "#111827"
+                summary = "Awaiting waveform upload"
+                button_text = "Upload Waveform First"
+            elif self.uploaded_waveform_ready:
+                badge_text = "READY"
+                badge_color = C["primary"]
+                summary = "Waveform uploaded and armed"
+                button_text = "Enable Output"
+                button_color = C["green"]
+                button_hover = "#059669"
+                button_text_color = "#000000"
 
         self.output_state_badge.configure(
             text=badge_text,
@@ -2417,24 +2437,19 @@ class DashboardApp:
         upload_state = "disabled" if (self._upload_in_flight or self.sequence_active) else "normal"
         self.upload_btn.configure(state=upload_state)
 
-        can_toggle = (
-            self.kepco.connected
-            and self.uploaded_waveform_ready
-            and not self._output_toggle_in_flight
-        )
-        if self.sequence_active:
-            can_toggle = True
-
+        can_toggle = self._can_toggle_output()
         self._refresh_output_toggle_button(can_toggle)
 
         if not self.kepco.connected:
             hint = "Connect to a Kepco to control output."
-        elif not self.uploaded_waveform_ready:
-            hint = "Upload a waveform to enable output."
-        elif self.sequence_active:
-            hint = "Streaming multi-chunk waveform."
         elif self._output_toggle_in_flight:
             hint = "Applying output change..."
+        elif self.sequence_active:
+            hint = "Streaming multi-chunk waveform."
+        elif self.current_output_on and not self.uploaded_waveform_ready:
+            hint = "Output is ON; disable output before uploading a waveform."
+        elif not self.uploaded_waveform_ready:
+            hint = "Upload a waveform to enable output."
         else:
             hint = "Output follows the last uploaded waveform."
         self.output_hint_lbl.configure(text=hint)
