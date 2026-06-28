@@ -1,4 +1,6 @@
 802E opr-r2 operating manual.*
-__pycache__
+__pycache__/
+*.pyc
 logs/
 .venv/
+.vscode/
