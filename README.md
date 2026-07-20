@@ -61,7 +61,7 @@ python kepco_ui.py
 7. Use **Enable Output** to run the uploaded output.
 8. Use **Disable Output**, **Disconnect**, or close the app when finished.
 
-The output control remains locked until a waveform or DC setpoint has been uploaded.
+Enabling output remains locked until a waveform or DC setpoint has been uploaded. If the app connects to a Kepco that is already reporting output ON, the output control remains available so the operator can disable it without uploading a waveform first.
 
 ## Waveforms And Uploads
 
@@ -160,7 +160,7 @@ Preview is local-only. Upload, output toggle, manual SCPI commands, status polli
 - If connection fails, confirm the IP address and check ports `5024` and `5025`.
 - If scan finds nothing, enter an IP in the expected subnet first; scan uses that `/24`.
 - If upload is rejected, check waveform point count, dwell warnings, and the configured V/I limits.
-- If output is locked, upload a waveform or DC setpoint first.
+- If output is OFF and the output control is locked, upload a waveform or DC setpoint before enabling it. If the connected Kepco is already reporting output ON, use **Disable Output** without uploading a waveform first.
 - Review the on-screen log or the saved session log for SCPI-level details.
 
 ## Known Limitations
