@@ -3284,9 +3284,9 @@ class DashboardApp:
         self._set_live_console_line("output", "", C["amber"], visible=False)
 
     # -- Output button rendering --------------------------------------------
-    # The output button has several logical locks: disconnected, no waveform,
-    # waveform upload, in-flight command sequence, streamed waveform active,
-    # and ready/armed.
+    # The output button has several logical locks: disconnected, unknown output
+    # state, no waveform, waveform upload, in-flight command sequence, streamed
+    # waveform active, and ready/armed.
     @staticmethod
     def _output_toggle_allowed(
             connected,
@@ -3297,6 +3297,7 @@ class DashboardApp:
             output_toggle_in_flight):
         return (
             bool(connected)
+            and isinstance(current_output_on, bool)
             and not upload_in_flight
             and not output_toggle_in_flight
             and (
@@ -3335,6 +3336,14 @@ class DashboardApp:
                 badge_text_color = "#111827"
                 summary = "Applying output change"
                 button_text = "Applying..."
+                button_color = "#475569"
+                button_hover = "#475569"
+            elif self.current_output_on is None:
+                badge_text = "UNKNOWN"
+                badge_color = C["amber"]
+                badge_text_color = "#111827"
+                summary = "Waiting for verified output state"
+                button_text = "Output State Unknown"
                 button_color = "#475569"
                 button_hover = "#475569"
             elif self.current_output_on or self.sequence_active:
@@ -3389,6 +3398,8 @@ class DashboardApp:
             )
         elif self._output_toggle_in_flight:
             hint = "Applying output change..."
+        elif self.current_output_on is None:
+            hint = "Output state is unknown; waiting for verified device status."
         elif self.sequence_active:
             hint = "Streaming multi-chunk waveform."
         elif self.current_output_on and not self.uploaded_waveform_ready:
@@ -4937,7 +4948,9 @@ class DashboardApp:
         if self.uploaded_request:
             self.uploaded_request["first_chunk_primed"] = False
 
-        self._set_output_ui_state(False)
+        # A failed stop may still have reached the device. Preserve uncertainty
+        # until the resumed status poll authoritatively reconciles OUTP?.
+        self._set_output_ui_state(False if stop_ok else None)
         self.progress.set(0)
         self.prog_lbl.configure(text="Idle")
         self._update_status_plot(req["plot_points"])
@@ -4965,13 +4978,19 @@ class DashboardApp:
                 "Output control is locked until the waveform upload completes.",
                 "warn")
             return
-        target_on = not self.current_output_on
-        req = self.uploaded_request
-
         if not self.kepco.is_verified:
             self._set_output_ui_state(None)
             self.log("Device state is not verified; output control is locked.", "warn")
             return
+        if not isinstance(self.current_output_on, bool):
+            self.log(
+                "Output state is unknown; waiting for verified device status.",
+                "warn")
+            return
+
+        target_on = not self.current_output_on
+        req = self.uploaded_request
+
         if target_on and not self.uploaded_waveform_ready:
             self._set_output_ui_state(False)
             self.log("Upload a waveform before enabling output.", "warn")
