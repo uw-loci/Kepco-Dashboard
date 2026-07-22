@@ -3285,16 +3285,19 @@ class DashboardApp:
 
     # -- Output button rendering --------------------------------------------
     # The output button has several logical locks: disconnected, no waveform,
-    # in-flight command sequence, streamed waveform active, and ready/armed.
+    # waveform upload, in-flight command sequence, streamed waveform active,
+    # and ready/armed.
     @staticmethod
     def _output_toggle_allowed(
             connected,
             uploaded_waveform_ready,
             current_output_on,
             sequence_active,
+            upload_in_flight,
             output_toggle_in_flight):
         return (
             bool(connected)
+            and not upload_in_flight
             and not output_toggle_in_flight
             and (
                 uploaded_waveform_ready
@@ -3309,6 +3312,7 @@ class DashboardApp:
             self.uploaded_waveform_ready,
             self.current_output_on,
             self.sequence_active,
+            self._upload_in_flight,
             self._output_toggle_in_flight)
 
     def _refresh_output_toggle_button(self, can_toggle=None):
@@ -4955,6 +4959,11 @@ class DashboardApp:
     def _toggle_output(self):
         """Turn output on/off while preserving interlocks and staged limits."""
         if self._output_toggle_in_flight:
+            return
+        if self._upload_in_flight:
+            self.log(
+                "Output control is locked until the waveform upload completes.",
+                "warn")
             return
         target_on = not self.current_output_on
         req = self.uploaded_request
