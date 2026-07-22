@@ -12,8 +12,8 @@ Hardware Constraints (BIT 802E manual):
   - Use the active mode's RANG 1 to avoid quarter-scale transients
 
 Maintenance Map:
-  - KepcoController owns SCPI transport, pacing, Telnet echo cleanup, and
-    hardware verification.
+  - KepcoController owns the socket-worker queue, SCPI transport, pacing,
+    Telnet echo cleanup, and hardware verification.
   - Discovery and WaveformGen are small stateless helpers.
   - DashboardApp owns UI state, background workers, waveform request assembly,
     output safety checks, and live status/data logging.
@@ -30,6 +30,8 @@ import threading
 import time
 import ipaddress
 import datetime
+from dataclasses import dataclass
+from enum import Enum
 from tkinter import messagebox, filedialog
 
 # -- GUI + plotting ----------------------------------------------------------
@@ -51,25 +53,139 @@ MIN_DWELL        = 0.0005    # 500 us - hardware minimum
 MAX_DWELL        = 10.0      # hardware maximum
 MAX_LIST_POINTS  = 1000      # per single LIST upload
 MAX_TOTAL_POINTS = 4000      # 4 x 1000 chunks
-TELNET_PORT      = 5024      # manual 2.4.2 / 4.5: Telnet first
-SCPI_SOCKET_PORT = 5025      # alternate direct socket endpoint
+TELNET_PORT      = 5024      # Telnet fallback endpoint
+SCPI_SOCKET_PORT = 5025      # preferred raw SCPI socket endpoint
 DISCOVERY_TIMEOUT = 0.25
 CHUNK_CMD_LIMIT  = 200       # safe margin for 253-byte SCPI buffer
 SCPI_CMD_GAP     = 0.035     # > 25ms spec throughput (PAR 1.2.2)
 LIST_VALUES_PER_CMD = 10     # manual examples show max 11 (PAR B.45/B.31)
-RECV_TIMEOUT     = 3.0       # socket recv timeout for queries
+RECV_TIMEOUT     = 6.0       # socket recv timeout for queries
+STATUS_POLL_INTERVAL_MS = 5000
 BOP_MAX_VOLTAGE  = 100.0     # BOP 100-2ML voltage rating
 BOP_MAX_CURRENT  = 2.0       # BOP 100-2ML current rating
-DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE = 20.0
-DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE = -20.0
+# BIT 802E manual Table 1-4: the signed main channel has 15 magnitude
+# bits, while the complementary limit channel has 12 programming bits.
+MAIN_CHANNEL_MAGNITUDE_BITS = 15
+LIMIT_CHANNEL_PROGRAMMING_BITS = 12
+PROGRAMMED_VALUE_LSB_MARGIN = 2.0
+PROGRAMMED_VALUE_RELATIVE_TOLERANCE = 1e-4
+DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE = 40.0
+DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE = -40.0
 DEFAULT_POSITIVE_CURRENT_LIMIT = 2.0
 DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
-DEFAULT_VOLTAGE_COMPLIANCE = DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE
-DEFAULT_CURRENT_LIMIT = DEFAULT_POSITIVE_CURRENT_LIMIT
 SOLENOID_TEMPERATURE_POLL_MS = 3000
 PMON_STALE_SECONDS = 10.0
 DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
 DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
+VERIFY_SNAPSHOT_COUNT = 3
+
+
+class CommState(Enum):
+    """Trust level of the dashboard's current view of the BIT 802E."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    VERIFYING = "verifying"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    FAULTED = "faulted"
+
+
+class ProtocolError(ValueError):
+    """A syntactically valid transport reply that is unsafe to trust as SCPI."""
+
+
+class ConnectionLostError(ConnectionError):
+    """The SCPI session is unavailable or no longer trusted for this transaction."""
+
+
+@dataclass(frozen=True)
+class StatusSnapshot:
+    """One all-or-nothing, validated status-poll result."""
+
+    voltage: float
+    current: float
+    output_on: bool
+    mode: str
+
+
+@dataclass
+class _SocketWorkItem:
+    """One synchronous request executed by the sole SCPI socket owner."""
+
+    operation: object
+    args: tuple
+    kwargs: dict
+    done: threading.Event
+    result: object = None
+    error: BaseException | None = None
+
+
+def validate_voltage(raw):
+    """Validate and normalize a `MEAS:VOLT?` reply."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(f"Voltage response is not numeric: {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ProtocolError("Voltage response is not finite")
+    if abs(value) > BOP_MAX_VOLTAGE * 1.10:
+        raise ProtocolError(
+            f"Voltage response exceeds configured capability: {value:g} V")
+    return value
+
+
+def validate_current(raw):
+    """Validate and normalize a `MEAS:CURR?` reply."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(f"Current response is not numeric: {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ProtocolError("Current response is not finite")
+    if abs(value) > BOP_MAX_CURRENT * 1.10:
+        raise ProtocolError(
+            f"Current response exceeds configured capability: {value:g} A")
+    return value
+
+
+def validate_output(raw):
+    """Validate and normalize an `OUTP?` reply to a boolean."""
+    value = str(raw).strip().upper()
+    if value not in {"0", "1", "OFF", "ON"}:
+        raise ProtocolError(f"Invalid OUTP? response: {raw!r}")
+    return value in {"1", "ON"}
+
+
+def validate_mode(raw):
+    """Validate and normalize a `FUNC:MODE?` reply."""
+    value = str(raw).strip().upper()
+    mapping = {
+        "0": "VOLT",
+        "VOLT": "VOLT",
+        "1": "CURR",
+        "CURR": "CURR",
+    }
+    if value not in mapping:
+        raise ProtocolError(f"Invalid FUNC:MODE? response: {raw!r}")
+    return mapping[value]
+
+
+def validate_identity(raw):
+    """Validate and normalize the mandatory `*IDN?` verification reply."""
+    value = str(raw).strip()
+    if not value or "KEPCO" not in value.upper():
+        raise ProtocolError(f"Invalid *IDN? response: {raw!r}")
+    return value
+
+
+def validate_operation_complete(raw):
+    """Require the exact SCPI completion response required by the BIT gate."""
+    value = str(raw).strip()
+    if value != "1":
+        raise ProtocolError(f"Invalid *OPC? response (expected '1'): {raw!r}")
+    return True
+
 
 # -- Material colour palette -------------------------------------------------
 C = dict(
@@ -90,15 +206,19 @@ class KepcoController:
     """Thread-safe SCPI control for a Kepco BIT 802E.
 
     Protocol notes (BIT 802E manual):
-      - PAR 2.4.2 / 4.5: Telnet-first on port 5024, socket fallback 5025
+      - Prefer raw SCPI socket port 5025; use Telnet 5024 only as fallback
       - PAR 1.2.2: connection throughput ~25 ms per command
       - PAR 4.5.2: *WAI / *OPC? to ensure command completion
       - 253-byte input buffer limit per SCPI message
       - List: max 1002 steps, dwell 500 us ... 10 s
 
     Design:
-      - Every non-query command sleeps SCPI_CMD_GAP (35 ms) *inside* the
-        lock so no other thread can violate the pacing constraint.
+      - One dedicated worker thread owns the SCPI socket. Every connection,
+        query, command, recovery, and disconnect operation enters its queue.
+      - Multi-command operations re-enter directly from the owner thread, so
+        status snapshots and other transactions remain indivisible.
+      - Every non-query command sleeps SCPI_CMD_GAP (35 ms) on the owner
+        thread so no other operation can violate the pacing constraint.
       - *OPC? sync is used only at key checkpoints (after LIST:CLE, after
         all values sent, after DWEL) - NOT after every single LIST:VOLT.
       - Post-upload, LIST:{mode}:POIN? verifies the card accepted all
@@ -108,16 +228,88 @@ class KepcoController:
     def __init__(self):
         self.sock = None
         self.ip = ""
-        self.port = TELNET_PORT
-        self.transport = "TELNET"
-        self.connected = False
+        self.port = SCPI_SOCKET_PORT
+        self.transport = "SOCKET"
+        self.comm_state = CommState.DISCONNECTED
         self.last_error = ""
         self.last_identity = ""
-        self._query_timeout_count = 0
-        # Re-entrant so higher-level upload/run/stop transactions can hold the
-        # device lock while individual send_cmd/send_query helpers re-enter it.
+        self.last_verified_state = None
+        self._recv_buffer = b""
+        self._telnet_iac_pending = b""
+        self._last_receive_issue = ""
+        # The lock remains as a defensive invariant for nested controller
+        # methods. Actual cross-thread serialization happens through the sole
+        # socket-owner queue below.
         self._lock = threading.RLock()
         self._debug_logger = None
+        self._socket_queue = queue.Queue()
+        self._socket_worker_ident = None
+        self._socket_worker_ready = threading.Event()
+        self._socket_worker_state_lock = threading.Lock()
+        self._socket_worker_stopping = False
+        self._socket_worker = threading.Thread(
+            target=self._socket_worker_loop,
+            name="kepco-socket-owner",
+            daemon=True,
+        )
+        self._socket_worker.start()
+        self._socket_worker_ready.wait()
+
+    def _socket_worker_loop(self):
+        """Own the socket and execute queued operations one at a time."""
+        self._socket_worker_ident = threading.get_ident()
+        self._socket_worker_ready.set()
+        while True:
+            item = self._socket_queue.get()
+            try:
+                if item is None:
+                    return
+                try:
+                    item.result = item.operation(*item.args, **item.kwargs)
+                except BaseException as exc:
+                    item.error = exc
+                finally:
+                    item.done.set()
+            finally:
+                self._socket_queue.task_done()
+
+    def _is_socket_worker(self):
+        return threading.get_ident() == self._socket_worker_ident
+
+    def run_transaction(self, operation, *args, **kwargs):
+        """Run one indivisible operation on the SCPI socket-owner thread.
+
+        Calls made by an operation already running on the owner execute
+        directly. This permits high-level transactions to call send_query and
+        send_cmd without deadlocking or creating nested queue entries.
+        """
+        if self._is_socket_worker():
+            return operation(*args, **kwargs)
+
+        item = _SocketWorkItem(
+            operation=operation,
+            args=args,
+            kwargs=kwargs,
+            done=threading.Event(),
+        )
+        with self._socket_worker_state_lock:
+            if self._socket_worker_stopping:
+                raise RuntimeError("SCPI socket worker has stopped")
+            self._socket_queue.put(item)
+        item.done.wait()
+        if item.error is not None:
+            raise item.error
+        return item.result
+
+    def shutdown_socket_worker(self):
+        """Drain accepted work and stop the socket-owner worker."""
+        with self._socket_worker_state_lock:
+            if self._socket_worker_stopping:
+                return
+            self._socket_worker_stopping = True
+            self._socket_queue.put(None)
+        if not self._is_socket_worker():
+            self._socket_worker.join()
 
     def set_debug_logger(self, logger_cb):
         """Register callback(level, message) for comm/network debug logs."""
@@ -132,25 +324,93 @@ class KepcoController:
         except Exception:
             pass
 
+    @property
+    def is_transport_connected(self):
+        """True only while a TCP socket is still owned by this controller."""
+        return self.sock is not None
+
+    @property
+    def is_verified(self):
+        """True only when the socket has passed the full health verification gate."""
+        return self.comm_state is CommState.HEALTHY and self.is_transport_connected
+
+    def _set_comm_state(self, state, reason=""):
+        old_state = self.comm_state
+        self.comm_state = state
+        if old_state is not state:
+            detail = f" ({reason})" if reason else ""
+            self._dbg("info", f"COMM STATE {old_state.value} -> {state.value}{detail}")
+
+    def _close_socket(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.sock = None
+        self._recv_buffer = b""
+        self._telnet_iac_pending = b""
+        self._last_receive_issue = ""
+
+    def mark_degraded(self, reason):
+        """Revoke permission to control an untrusted SCPI session."""
+        if not self._is_socket_worker():
+            return self.run_transaction(self.mark_degraded, reason)
+        self.last_error = reason
+        self._set_comm_state(CommState.DEGRADED, reason)
+        self._dbg("warn", f"Communication degraded: {reason}")
+
+    def _reject_invalid_response(self, reason):
+        """Reject a malformed/misattributed reply and revoke session trust."""
+        self.mark_degraded(reason)
+        return False, reason
+
+    def connection_lost(self, reason):
+        """Retire a failed transport without silently creating a replacement."""
+        if not self._is_socket_worker():
+            return self.run_transaction(self.connection_lost, reason)
+        self.last_error = reason
+        self._close_socket()
+        self._set_comm_state(CommState.DEGRADED, reason)
+        self._dbg("err", f"Connection lost: {reason}")
+
+    def fault(self, reason):
+        """End a failed recovery attempt; a new operator connection is required."""
+        if not self._is_socket_worker():
+            return self.run_transaction(self.fault, reason)
+        self.last_error = reason
+        self._close_socket()
+        self._set_comm_state(CommState.FAULTED, reason)
+        self._dbg("err", f"Communication faulted: {reason}")
+
     # -- connect / disconnect -----------------------------------------------
     def connect(self, ip, port=None, validate_identity=False):
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.connect, ip, port=port,
+                validate_identity=validate_identity)
         attempts = [(port, "CUSTOM")] if port is not None else [
-            (TELNET_PORT, "TELNET"),
             (SCPI_SOCKET_PORT, "SOCKET"),
+            (TELNET_PORT, "TELNET"),
         ]
         last_err = ""
         self.last_identity = ""
+        self.last_verified_state = None
+        self._close_socket()
+        self._set_comm_state(CommState.CONNECTING, f"connecting to {ip}")
         for target_port, transport in attempts:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 self._dbg("info", f"Connect attempt {ip}:{target_port} ({transport})")
                 s.settimeout(5)
                 s.connect((ip, target_port))
-                # Drain Telnet IAC negotiation the card sends on connect
+                # Capture any greeting/negotiation bytes; the transport parser
+                # owns them once the socket becomes the active session.
                 time.sleep(0.1)
                 s.setblocking(False)
+                initial_data = b""
                 try:
-                    s.recv(1024)
+                    initial_data = s.recv(1024)
                 except BlockingIOError:
                     pass
                 s.setblocking(True)
@@ -160,9 +420,16 @@ class KepcoController:
                 self.ip = ip
                 self.port = target_port
                 self.transport = transport
-                self.connected = True
+                self._recv_buffer = b""
+                self._telnet_iac_pending = b""
+                self._last_receive_issue = ""
+                if initial_data:
+                    self._append_received(initial_data)
                 self.last_error = ""
-                self._query_timeout_count = 0
+                # A TCP connection is not a trusted device state. Identity
+                # validation below is deliberately insufficient to mark this
+                # controller healthy; verify_device_state does that.
+                self._set_comm_state(CommState.VERIFYING, "socket established")
                 self._dbg("ok", f"Connected {ip}:{target_port} via {transport}")
                 if validate_identity:
                     idn = self.identity()
@@ -183,68 +450,136 @@ class KepcoController:
                     s.close()
                 except Exception:
                     pass
-        self.connected = False
+        self._close_socket()
         self.last_error = last_err
+        self._set_comm_state(CommState.FAULTED, "all connection attempts failed")
         self._dbg("err", f"All connect attempts failed for {ip}: {last_err}")
         return False, last_err
 
     def disconnect(self):
+        if not self._is_socket_worker():
+            return self.run_transaction(self.disconnect)
         self._dbg("info", f"Disconnecting from {self.ip}:{self.port} ({self.transport})")
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-        self.sock = None
-        self.connected = False
-        self._query_timeout_count = 0
+        self._close_socket()
+        self.last_verified_state = None
+        self._set_comm_state(CommState.DISCONNECTED, "socket closed")
         self._dbg("info", "Disconnected")
 
-    def _safe_reconnect(self):
-        if not self.ip:
-            return False
-        self._dbg("warn", f"Attempting reconnect to {self.ip} (all transports)")
-        ok, _ = self.connect(self.ip, validate_identity=True)
-        if ok:
-            self._dbg("ok", f"Reconnect succeeded to {self.ip}:{self.port}")
-        else:
-            self._dbg("err", f"Reconnect failed to {self.ip}")
-        return ok
-
     # -- Telnet IAC filtering ----------------------------------------------
-    @staticmethod
-    def _strip_iac(data: bytes) -> bytes:
-        """Remove Telnet IAC (0xFF) negotiation sequences from raw bytes."""
-        if 0xFF not in data:
-            return data
+    def _decode_telnet_chunk(self, data: bytes) -> bytes:
+        """Statefully remove Telnet negotiation bytes from one TCP chunk."""
+        data = self._telnet_iac_pending + data
+        self._telnet_iac_pending = b""
         out = bytearray()
         i = 0
         n = len(data)
         while i < n:
             b = data[i]
-            if b == 0xFF and i + 1 < n:
+            if b == 0xFF:
+                if i + 1 >= n:
+                    self._telnet_iac_pending = data[i:]
+                    break
                 nxt = data[i + 1]
-                if nxt in (0xFB, 0xFC, 0xFD, 0xFE):   # WILL/WONT/DO/DONT
+                if nxt in (0xFB, 0xFC, 0xFD, 0xFE):
+                    if i + 2 >= n:
+                        self._telnet_iac_pending = data[i:]
+                        break
                     i += 3
                     continue
-                elif nxt == 0xFA:                        # SB sub-negotiation
+                if nxt == 0xFA:
                     end = data.find(b"\xff\xf0", i + 2)
-                    i = (end + 2) if end >= 0 else (i + 2)
+                    if end < 0:
+                        self._telnet_iac_pending = data[i:]
+                        break
+                    i = end + 2
                     continue
-                elif nxt == 0xFF:                        # escaped 0xFF
+                if nxt == 0xFF:
                     out.append(0xFF)
                     i += 2
                     continue
-                else:
-                    i += 2
-                    continue
+                i += 2
+                continue
             out.append(b)
             i += 1
         return bytes(out)
 
+    def _append_received(self, chunk):
+        if self.port == TELNET_PORT:
+            chunk = self._decode_telnet_chunk(chunk)
+        self._recv_buffer += chunk
+
+    def _pop_complete_line(self):
+        """Pop one CR/LF-terminated protocol line, preserving any tail."""
+        if self.port == SCPI_SOCKET_PORT:
+            lf = self._recv_buffer.find(b"\n")
+            if lf < 0:
+                return None
+            line = self._recv_buffer[:lf].rstrip(b"\r")
+            self._recv_buffer = self._recv_buffer[lf + 1:]
+            return self._decode_response_line(line)
+
+        cr = self._recv_buffer.find(b"\r")
+        lf = self._recv_buffer.find(b"\n")
+        endings = [index for index in (cr, lf) if index >= 0]
+        if not endings:
+            return None
+        end = min(endings)
+        consume = end + 1
+        if (self._recv_buffer[end:end + 1] == b"\r"
+                and self._recv_buffer[end + 1:end + 2] == b"\n"):
+            consume += 1
+        line = self._recv_buffer[:end]
+        self._recv_buffer = self._recv_buffer[consume:]
+        return self._decode_response_line(line)
+
+    def _decode_response_line(self, line):
+        """Decode one framed response without hiding protocol corruption."""
+        try:
+            return line.decode("ascii")
+        except UnicodeDecodeError as exc:
+            self._last_receive_issue = (
+                f"Non-ASCII byte in {self.transport} response frame")
+            raise ProtocolError(self._last_receive_issue) from exc
+
+    @staticmethod
+    def _looks_like_scpi_command(text):
+        t = text.strip()
+        if not t:
+            return False
+        up = t.upper()
+        if up in ("ON", "OFF", "LIST", "FIX", "VOLT", "CURR", "TRAN"):
+            return False
+        if "NO ERROR" in up or ("," in up and '"' in up):
+            return False
+        tok = up.split()[0]
+        if tok.endswith("?"):
+            return True
+        if tok.startswith("*") or ":" in tok:
+            return True
+        return tok in (
+            "OUTP", "VOLT", "CURR", "FUNC", "LIST", "SYST",
+            "MEAS", "INIT", "TRIG", "STAT", "FORM", "SOUR",
+            "LOAD", "RANG",
+        )
+
+    def _clean_response_line(self, line, echo=None):
+        line = line.strip()
+        if not line:
+            return None
+        if self.port == TELNET_PORT and ">" in line:
+            tail = line.rsplit(">", 1)[1].strip()
+            if not tail:
+                return None
+            line = tail
+        if echo and line == echo:
+            return None
+        if self.port == TELNET_PORT and self._looks_like_scpi_command(line):
+            return None
+        return line
+
     # -- socket helpers -----------------------------------------------------
     def _drain_echo(self):
-        """Quick non-blocking drain of Telnet echo after every send_cmd.
+        """Move Telnet echo bytes into the persistent receive buffer.
 
         The BIT 802E Telnet server echoes every command back verbatim.
         If these echo bytes are never read they accumulate in the card's
@@ -262,7 +597,10 @@ class KepcoController:
             self.sock.settimeout(0.02)          # 20 ms
             try:
                 data = self.sock.recv(1024)
-                return bool(data)
+                if not data:
+                    raise ConnectionError("Connection closed by peer")
+                self._append_received(data)
+                return True
             except (socket.timeout, OSError):
                 return False
         finally:
@@ -271,95 +609,31 @@ class KepcoController:
             except Exception:
                 pass
 
-    def _drain_stale(self):
-        """Drain all stale data (accumulated echoes) from the socket.
-
-        Uses a short timeout so we wait long enough for any in-flight
-        bytes to arrive but don't block indefinitely.
-        """
-        prev = self.sock.gettimeout()
-        try:
-            self.sock.settimeout(0.05)          # 50 ms
-            while True:
-                try:
-                    data = self.sock.recv(4096)
-                    if not data:
-                        break
-                except socket.timeout:
-                    break
-                except OSError:
-                    break
-        except Exception:
-            pass
-        finally:
-            try:
-                self.sock.settimeout(prev)
-            except Exception:
-                pass
-
     def _recv_response(self, sent_cmd=None, timeout=None):
-        """Receive one SCPI response line, skipping Telnet echo lines.
-
-        The BIT 802E Telnet server echoes every command back before
-        sending the actual response.  If *sent_cmd* is provided, any
-        complete line that exactly matches it is silently discarded.
-        """
+        """Receive exactly one complete, transport-framed SCPI response."""
         timeout = timeout or RECV_TIMEOUT
         echo = sent_cmd.strip() if sent_cmd else None
         prev = self.sock.gettimeout()
         self.sock.settimeout(timeout)
-
-        def _clean_line(line: str):
-            """Normalize one line by removing Telnet prompt noise.
-
-            Real BIT Telnet responses can include shell-style prompt prefixes
-            like 'KEPCO ... >CMD?' or 'KEPCO ... >0,"No error"'.
-            """
-            line = line.strip()
-            if not line:
-                return None
-
-            # If a device prompt prefix exists, keep only the payload
-            # right of the last prompt marker.
-            if ">" in line:
-                tail = line.rsplit(">", 1)[1].strip()
-                if tail:
-                    line = tail
-
-            def _looks_like_scpi_command(text: str):
-                t = text.strip()
-                if not t:
-                    return False
-                up = t.upper()
-                # Keep common non-command responses.
-                if up in ("ON", "OFF", "LIST", "FIX", "VOLT", "CURR", "TRAN"):
-                    return False
-                if "NO ERROR" in up or ("," in up and '"' in up):
-                    return False
-                tok = up.split()[0]
-                if tok.endswith("?"):
-                    return True
-                if tok.startswith("*") or ":" in tok:
-                    return True
-                if tok in (
-                    "OUTP", "VOLT", "CURR", "FUNC", "LIST", "SYST",
-                    "MEAS", "INIT", "TRIG", "STAT", "FORM", "SOUR",
-                    "LOAD", "RANG",
-                ):
-                    return True
-                return False
-
-            if echo and line == echo:
-                return None
-            if _looks_like_scpi_command(line):
-                return None
-            return line or None
-
         try:
-            raw = b""
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                remaining = deadline - time.time()
+            self._last_receive_issue = ""
+            deadline = time.monotonic() + timeout
+            while True:
+                while True:
+                    framed = self._pop_complete_line()
+                    if framed is None:
+                        break
+                    cleaned = self._clean_response_line(framed, echo=echo)
+                    if cleaned is None:
+                        continue
+                    if self.port == SCPI_SOCKET_PORT and self._recv_buffer.strip(b"\r\n"):
+                        self._last_receive_issue = (
+                            f"Multiple raw SCPI response frames received for "
+                            f"'{sent_cmd or 'query'}'")
+                        return None
+                    return cleaned
+
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self.sock.settimeout(min(remaining, timeout))
@@ -369,30 +643,20 @@ class KepcoController:
                     break
                 if not chunk:
                     raise ConnectionError("Connection closed by peer")
-                raw += chunk
-                # Strip Telnet IAC sequences then decode
-                clean = (self._strip_iac(raw)
-                         if self.port == TELNET_PORT else raw)
-                text = clean.decode("ascii", errors="ignore")
-                parts = text.replace("\r\n", "\n").replace(
-                    "\r", "\n").split("\n")
-                trailing = parts[-1]
-                complete = parts[:-1]
-                for line in complete:
-                    line = _clean_line(line)
-                    if line is not None:
-                        return line
-                # Only echo / empty lines so far - keep the tail
-                raw = trailing.encode("ascii", errors="ignore")
-                if len(raw) > 8192:
+                self._append_received(chunk)
+                if len(self._recv_buffer) > 65536:
+                    self._last_receive_issue = "Receive frame exceeded 65536 bytes"
                     break
-            # Timeout - check anything left in buffer
-            if raw:
-                text = raw.decode("ascii", errors="ignore")
-                for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-                    cleaned = _clean_line(line)
-                    if cleaned is not None:
-                        return cleaned
+            if not self._last_receive_issue:
+                if self._recv_buffer:
+                    preview = self._recv_buffer[:80].decode(
+                        "ascii", errors="backslashreplace")
+                    self._last_receive_issue = (
+                        f"Incomplete {self.transport} response frame for "
+                        f"'{sent_cmd or 'query'}': {preview!r}")
+                else:
+                    self._last_receive_issue = (
+                        f"No complete response frame for '{sent_cmd or 'query'}'")
             return None
         except ConnectionError:
             raise
@@ -407,17 +671,33 @@ class KepcoController:
                 pass
 
     # -- SCPI primitive: command (no response) ------------------------------
+    def _ensure_verified_for_io(self, allow_unverified=False):
+        """Authorize one I/O operation without ever reconnecting the session."""
+        if self.is_verified:
+            return True
+        if (allow_unverified and self.is_transport_connected
+                and self.comm_state is CommState.VERIFYING):
+            return True
+        if not self.is_transport_connected:
+            self.last_error = "No active SCPI socket"
+        else:
+            self.last_error = (
+                f"Communication state is {self.comm_state.value}, not verified")
+        self._dbg("warn", self.last_error)
+        raise ConnectionLostError(self.last_error)
+
     def send_cmd(self, cmd):
         """Send a non-query SCPI command with mandatory pacing.
 
-        The SCPI_CMD_GAP sleep is *inside* the lock so that concurrent
-        threads cannot send a second command faster than the 25 ms
-        throughput limit.  After the gap, we drain the Telnet echo to
+        The SCPI_CMD_GAP sleep runs on the socket-owner thread so another
+        transaction cannot send a second command faster than the 25 ms
+        throughput limit. After the gap, we drain the Telnet echo to
         prevent the card's TCP send-buffer from filling up (which would
         deadlock the card).  Returns True / None.
         """
-        if not self.connected and not self._safe_reconnect():
-            return None
+        if not self._is_socket_worker():
+            return self.run_transaction(self.send_cmd, cmd)
+        self._ensure_verified_for_io()
         with self._lock:
             try:
                 self._dbg("info", f"TX CMD: {cmd}")
@@ -427,67 +707,55 @@ class KepcoController:
                     self._drain_echo()  # consume Telnet echo
                 return True
             except Exception as e:
-                self.last_error = str(e)
+                self.connection_lost(str(e))
                 self._dbg("err", f"CMD failed '{cmd}': {self.last_error}")
-                self.disconnect()
                 return None
 
     # -- SCPI primitive: query (expects response) --------------------------
-    def send_query(self, cmd, timeout=None):
+    def send_query(self, cmd, timeout=None, allow_unverified=False):
         """Send a SCPI query and return the response string (or None).
 
-        Before sending, any stale data in the socket (echoes from prior
-        send_cmd calls) is drained.  After sending, the response reader
-        skips the Telnet echo of this query.
+        The persistent receive buffer retains fragmented input until a full
+        transport frame is available. Telnet echoes are parsed as framed
+        protocol noise; raw SCPI bytes are never discarded before a query.
         """
-        if not self.connected and not self._safe_reconnect():
-            return None
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.send_query, cmd, timeout=timeout,
+                allow_unverified=allow_unverified)
+        self._ensure_verified_for_io(allow_unverified=allow_unverified)
         with self._lock:
             try:
-                self._drain_stale()
                 self._dbg("info", f"TX QRY: {cmd}")
                 self.sock.sendall((cmd + "\n").encode("ascii"))
                 resp = self._recv_response(sent_cmd=cmd, timeout=timeout)
                 if resp is None:
-                    self._query_timeout_count += 1
-                    self.last_error = f"No response to '{cmd}'"
-                    self._dbg("warn", f"RX timeout for '{cmd}' (streak={self._query_timeout_count})")
-                    if self._query_timeout_count >= 2:
-                        # Do a receive-only confirmation wait (no re-send), so
-                        # stateful queries like SYST:ERR? are not consumed twice.
-                        self._dbg("warn", f"Query timeout threshold hit; confirming link without re-send ({cmd})")
-                        confirm = self._recv_response(
-                            sent_cmd=cmd,
-                            timeout=min(timeout or RECV_TIMEOUT, 1.0),
-                        )
-                        if confirm is not None:
-                            self._query_timeout_count = 0
-                            self.last_error = ""
-                            self._dbg("ok", f"RX RESP (confirm): {cmd} -> {confirm}")
-                            return confirm
-                        self.last_error = (
-                            f"No response to '{cmd}' (connection lost)")
-                        self._dbg("err", f"Query timeout confirm failed; disconnecting ({cmd})")
-                        self.disconnect()
+                    receive_issue = self._last_receive_issue or "no complete response"
+                    reason = (
+                        f"Query framing failure for '{cmd}': {receive_issue}; "
+                        "session retired to prevent response-stream shift")
+                    self._dbg(
+                        "warn",
+                        f"RX framing failure for '{cmd}': {receive_issue}")
+                    self.connection_lost(reason)
                 else:
-                    self._query_timeout_count = 0
                     self._dbg("ok", f"RX RESP: {cmd} -> {resp}")
                 return resp
             except Exception as e:
-                self.last_error = str(e)
+                self.connection_lost(str(e))
                 self._dbg("err", f"QRY failed '{cmd}': {self.last_error}")
-                self.disconnect()
                 return None
 
     # -- backward-compat wrapper (used by Manual Override callbacks) --------
-    def send(self, cmd, query=False, post_delay=0.0):
+    def send(self, cmd, query=False):
         if query:
             return self.send_query(cmd)
         return self.send_cmd(cmd)
 
     # -- SCPI formatting and limit helpers -----------------------------------
-    # The BOP is bipolar, so limit setup is usually expressed as a positive and
-    # negative value. These helpers normalize UI/request data into command pairs.
+    # The UI retains signed bounds for request validation, but the BIT has one
+    # complementary hardware-limit channel.  Program that channel once with an
+    # absolute magnitude, as described in manual section 4.5.1.1.
     @staticmethod
     def format_scpi_value(value):
         return f"{float(value):.6g}"
@@ -506,26 +774,57 @@ class KepcoController:
         return magnitude, -magnitude
 
     @classmethod
-    def signed_limit_cmds(cls, channel, limits, negative_limit=None):
-        if negative_limit is None:
-            if isinstance(limits, dict):
-                pos, neg = cls.limit_pair(limits, 0.0, 0.0)
-            elif isinstance(limits, (list, tuple)) and len(limits) >= 2:
-                pos, neg = cls.limit_pair(limits, limits[0], limits[1])
-            else:
-                magnitude = abs(float(limits))
-                pos, neg = magnitude, -magnitude
-        else:
-            pos, neg = float(limits), float(negative_limit)
-        return [
-            f"{channel} {cls.format_scpi_value(pos)}",
-            f"{channel} {cls.format_scpi_value(neg)}",
-        ]
+    def device_limit_magnitude(cls, limits, default_positive, default_negative):
+        """Return the one absolute complementary limit supported by the BIT."""
+        positive, negative = cls.limit_pair(
+            limits, default_positive, default_negative)
+        return max(abs(positive), abs(negative))
 
     @classmethod
-    def bipolar_limit_cmds(cls, channel, magnitude):
-        magnitude = abs(float(magnitude))
-        return cls.signed_limit_cmds(channel, (magnitude, -magnitude))
+    def complementary_limit_cmd(cls, mode, voltage_compliance=None,
+                                current_limit=None):
+        """Build the manual-style single complementary-channel limit command."""
+        mode = (mode or "VOLT").upper()
+        if mode == "CURR":
+            magnitude = cls.device_limit_magnitude(
+                voltage_compliance,
+                DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
+                DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE)
+            return f"VOLT {cls.format_scpi_value(magnitude)}"
+        if mode == "VOLT":
+            magnitude = cls.device_limit_magnitude(
+                current_limit,
+                DEFAULT_POSITIVE_CURRENT_LIMIT,
+                DEFAULT_NEGATIVE_CURRENT_LIMIT)
+            return f"CURR {cls.format_scpi_value(magnitude)}"
+        raise ValueError(f"Unsupported FUNC:MODE '{mode}'")
+
+    @staticmethod
+    def programmed_value_tolerance(channel, expected_value,
+                                   limit_channel=False):
+        """Return a BIT-resolution-aware programmed-value tolerance.
+
+        Programmed-value queries include calibration and quantization.  The
+        manual specifies 15 magnitude bits for the main channel, 12 bits for
+        the limit channel, and up to two readback LSBs.  Verification must not
+        require accuracy finer than the hardware can represent.
+        """
+        channel = str(channel or "").strip().upper()
+        if channel == "VOLT":
+            full_scale = BOP_MAX_VOLTAGE
+        elif channel == "CURR":
+            full_scale = BOP_MAX_CURRENT
+        else:
+            raise ValueError(f"Unsupported programmed channel '{channel}'")
+        bits = (
+            LIMIT_CHANNEL_PROGRAMMING_BITS
+            if limit_channel else MAIN_CHANNEL_MAGNITUDE_BITS)
+        resolution_floor = (
+            PROGRAMMED_VALUE_LSB_MARGIN * full_scale / (1 << bits))
+        return max(
+            resolution_floor,
+            abs(float(expected_value)) * PROGRAMMED_VALUE_RELATIVE_TOLERANCE,
+        )
 
     @classmethod
     def default_voltage_limits(cls):
@@ -545,9 +844,14 @@ class KepcoController:
         self._dbg("info", f"{label}: {'; '.join(cmds)}")
 
     def send_sequence(self, cmds, label="SCPI sequence"):
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.send_sequence, cmds, label=label)
         cmds = [cmd for cmd in cmds if cmd]
-        if not self.connected and not self._safe_reconnect():
-            return False, "Not connected"
+        try:
+            self._ensure_verified_for_io()
+        except ConnectionLostError as exc:
+            return False, str(exc)
         with self._lock:
             self._log_sequence(label, cmds)
             for cmd in cmds:
@@ -555,28 +859,337 @@ class KepcoController:
                     return False, f"{label} failed at '{cmd}': {self.last_error}"
             return True, "OK"
 
-    def _limit_setup_cmds(self, mode, voltage_compliance=None,
-                          current_limit=None):
+    @staticmethod
+    def _normalize_source_mode(mode_resp):
+        text = str(mode_resp or "").strip().upper()
+        if text in ("0", "FIX", "FIXED"):
+            return "FIX"
+        if text == "1" or "LIST" in text:
+            return "LIST"
+        return None
+
+    def select_fixed_mode(self, mode, label="Fixed-mode transition"):
+        """Select FUNC:MODE and FIX state with query-verified barriers."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.select_fixed_mode, mode, label=label)
+
         mode = (mode or "VOLT").upper()
         if mode not in ("VOLT", "CURR"):
-            raise ValueError(f"Unsupported FUNC:MODE '{mode}'")
-        voltage_compliance = (
-            self.default_voltage_limits()
-            if voltage_compliance is None else voltage_compliance
-        )
-        current_limit = (
-            self.default_current_limits()
-            if current_limit is None else current_limit
-        )
-        cmds = [
-            f"FUNC:MODE {mode}",
-            f"{mode}:RANG 1",
-        ]
-        if mode == "CURR":
-            cmds.extend(self.signed_limit_cmds("VOLT", voltage_compliance))
-        else:
-            cmds.extend(self.signed_limit_cmds("CURR", current_limit))
-        return cmds
+            return False, f"Unsupported FUNC:MODE '{mode}'"
+
+        mode_resp = self.send_query("FUNC:MODE?")
+        if mode_resp is None:
+            return False, self.last_error or "FUNC:MODE? verification failed"
+        actual_mode = self._normalize_func_mode(mode_resp)
+        if actual_mode is None:
+            return self._reject_invalid_response(
+                f"{label}: invalid FUNC:MODE? response {mode_resp!r}")
+        if actual_mode != mode:
+            self._dbg("info", f"{label}: requesting FUNC:MODE {mode}")
+            if self.send_cmd(f"FUNC:MODE {mode}") is None:
+                return False, f"{label} failed to request FUNC:MODE {mode}"
+            if not self.sync():
+                return False, f"{label} failed waiting for FUNC:MODE {mode}"
+            mode_resp = self.send_query("FUNC:MODE?")
+            if mode_resp is None:
+                return False, self.last_error or "FUNC:MODE? verification failed"
+            actual_mode = self._normalize_func_mode(mode_resp)
+            if actual_mode is None:
+                return self._reject_invalid_response(
+                    f"{label}: invalid FUNC:MODE? response {mode_resp!r}")
+            if actual_mode != mode:
+                return False, (
+                    f"{label}: FUNC:MODE verification expected {mode} "
+                    f"but received {mode_resp!r}")
+        self._dbg("ok", f"{label}: FUNC:MODE verified as {mode_resp!r}")
+
+        source_resp = self.send_query(f"{mode}:MODE?")
+        if source_resp is None:
+            return False, self.last_error or f"{mode}:MODE? verification failed"
+        source_mode = self._normalize_source_mode(source_resp)
+        if source_mode is None:
+            return self._reject_invalid_response(
+                f"{label}: invalid {mode}:MODE? response {source_resp!r}")
+        if source_mode != "FIX":
+            self._dbg("info", f"{label}: requesting {mode}:MODE FIX")
+            if self.send_cmd(f"{mode}:MODE FIX") is None:
+                return False, f"{label} failed to request {mode}:MODE FIX"
+            if not self.sync():
+                return False, f"{label} failed waiting for {mode}:MODE FIX"
+            source_resp = self.send_query(f"{mode}:MODE?")
+            if source_resp is None:
+                return False, self.last_error or f"{mode}:MODE? verification failed"
+            source_mode = self._normalize_source_mode(source_resp)
+            if source_mode is None:
+                return self._reject_invalid_response(
+                    f"{label}: invalid {mode}:MODE? response {source_resp!r}")
+            if source_mode != "FIX":
+                return False, (
+                    f"{label}: {mode}:MODE verification expected FIX "
+                    f"but received {source_resp!r}")
+        self._dbg("ok", f"{label}: {mode}:MODE verified as {source_resp!r}")
+        return True, "Fixed mode verified"
+
+    def configure_fixed_mode(self, mode, voltage_compliance=None,
+                             current_limit=None, initial_setpoint=None,
+                             apply_complementary_limit=True,
+                             label="Fixed-mode setup"):
+        """Verify mode transitions before applying range, limits, or setpoint."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.configure_fixed_mode,
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                initial_setpoint=initial_setpoint,
+                apply_complementary_limit=apply_complementary_limit,
+                label=label)
+
+        mode = (mode or "VOLT").upper()
+        ok, transition_msg = self.select_fixed_mode(mode, label=label)
+        if not ok:
+            return False, transition_msg
+
+        # Fix the active range before changing its setpoint so automatic range
+        # selection cannot create a quarter/full-scale crossover transient.
+        # Then follow the manual's initial-programming rule: operating
+        # parameter at zero, followed by one complementary limit magnitude.
+        dependent_cmds = [f"{mode}:RANG 1"]
+        if initial_setpoint is not None:
+            dependent_cmds.append(
+                f"{mode} {self.format_scpi_value(initial_setpoint)}")
+        if apply_complementary_limit:
+            dependent_cmds.append(self.complementary_limit_cmd(
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit))
+        dependent_cmds.append("*WAI")
+        ok, reason = self.send_sequence(
+            dependent_cmds, label=f"{label} dependent range/limits")
+        if not ok:
+            return False, reason
+        return self.verify_programmed_configuration(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            expected_setpoint=initial_setpoint,
+            verify_limit=apply_complementary_limit,
+            label=f"{label} programmed-state verification")
+
+    def verify_fixed_mode(self, mode, label="Fixed-mode verification"):
+        """Verify an existing fixed-mode configuration without rewriting it."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.verify_fixed_mode, mode, label=label)
+        mode = (mode or "VOLT").upper()
+        mode_resp = self.send_query("FUNC:MODE?")
+        actual_mode = self._normalize_func_mode(mode_resp)
+        if actual_mode is None:
+            return self._reject_invalid_response(
+                f"{label}: invalid FUNC:MODE? response {mode_resp!r}")
+        if actual_mode != mode:
+            return False, (
+                f"{label}: expected FUNC:MODE {mode}, received {mode_resp!r}")
+        source_resp = self.send_query(f"{mode}:MODE?")
+        source_mode = self._normalize_source_mode(source_resp)
+        if source_mode is None:
+            return self._reject_invalid_response(
+                f"{label}: invalid {mode}:MODE? response {source_resp!r}")
+        if source_mode != "FIX":
+            return False, (
+                f"{label}: expected {mode}:MODE FIX, received {source_resp!r}")
+        return True, "Fixed mode verified"
+
+    def verify_programmed_configuration(
+            self, mode, voltage_compliance=None, current_limit=None,
+            expected_setpoint=None, verify_limit=True,
+            label="Programmed-state verification"):
+        """Verify fixed mode, full range, limit magnitude, and optional setpoint."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.verify_programmed_configuration,
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                expected_setpoint=expected_setpoint,
+                verify_limit=verify_limit,
+                label=label)
+        mode = (mode or "VOLT").upper()
+        ok, reason = self.verify_fixed_mode(mode, label=label)
+        if not ok:
+            return False, reason
+
+        range_resp = self.send_query(f"{mode}:RANG?")
+        try:
+            if int(float(str(range_resp).strip())) != 1:
+                return False, (
+                    f"{label}: expected {mode}:RANG 1, received {range_resp!r}")
+        except (TypeError, ValueError):
+            return self._reject_invalid_response(
+                f"{label}: invalid {mode}:RANG? response {range_resp!r}")
+
+        if verify_limit:
+            channel = "VOLT" if mode == "CURR" else "CURR"
+            expected_limit = float(
+                self.complementary_limit_cmd(
+                    mode,
+                    voltage_compliance=voltage_compliance,
+                    current_limit=current_limit).split()[1])
+            limit_resp = self.send_query(f"{channel}?")
+            try:
+                actual_limit = abs(float(str(limit_resp).strip()))
+                if not (math.isfinite(actual_limit)
+                        and math.isfinite(expected_limit)):
+                    raise ValueError("non-finite programmed limit")
+            except (TypeError, ValueError):
+                return self._reject_invalid_response(
+                    f"{label}: invalid {channel}? response {limit_resp!r}")
+            tolerance = self.programmed_value_tolerance(
+                channel, expected_limit, limit_channel=True)
+            difference = abs(actual_limit - expected_limit)
+            if difference > tolerance:
+                return False, (
+                    f"{label}: expected {channel} limit magnitude "
+                    f"{expected_limit:g}, received {limit_resp!r} "
+                    f"(difference {difference:.6g} exceeds hardware-aware "
+                    f"tolerance {tolerance:.6g})")
+            if difference > 0:
+                self._dbg(
+                    "info",
+                    f"{label}: accepted calibrated {channel} limit "
+                    f"{actual_limit:.9g} for requested {expected_limit:.9g} "
+                    f"(difference {difference:.6g}, tolerance "
+                    f"{tolerance:.6g})")
+
+        if expected_setpoint is not None:
+            setpoint_resp = self.send_query(f"{mode}?")
+            try:
+                actual_setpoint = float(str(setpoint_resp).strip())
+                expected_value = float(expected_setpoint)
+                if not (math.isfinite(actual_setpoint)
+                        and math.isfinite(expected_value)):
+                    raise ValueError("non-finite programmed setpoint")
+            except (TypeError, ValueError):
+                return self._reject_invalid_response(
+                    f"{label}: invalid {mode}? response {setpoint_resp!r}")
+            tolerance = self.programmed_value_tolerance(
+                mode, expected_value, limit_channel=False)
+            difference = abs(actual_setpoint - expected_value)
+            if difference > tolerance:
+                return False, (
+                    f"{label}: expected {mode} setpoint {expected_value:g}, "
+                    f"received {setpoint_resp!r} "
+                    f"(difference {difference:.6g} exceeds hardware-aware "
+                    f"tolerance {tolerance:.6g})")
+            if difference > 0:
+                self._dbg(
+                    "info",
+                    f"{label}: accepted calibrated {mode} setpoint "
+                    f"{actual_setpoint:.9g} for requested "
+                    f"{expected_value:.9g} (difference {difference:.6g}, "
+                    f"tolerance {tolerance:.6g})")
+        return True, "Programmed configuration verified"
+
+    def apply_complementary_limit(self, mode, voltage_compliance=None,
+                                  current_limit=None,
+                                  label="Complementary limit update"):
+        """Change only the one complementary limit after mode verification."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.apply_complementary_limit,
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                label=label)
+        ok, reason = self.verify_fixed_mode(mode, label=label)
+        if not ok:
+            return False, reason
+        command = self.complementary_limit_cmd(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit)
+        ok, reason = self.send_sequence(
+            [command, "*WAI"], label=label)
+        if not ok:
+            return False, reason
+        return self.verify_programmed_configuration(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            label=f"{label} verification")
+
+    @staticmethod
+    def _is_advisory_device_error(error):
+        """Return True for BIT errors that are logged but not state-fatal."""
+        code = str(error or "").strip().split(",", 1)[0].strip()
+        return code == "-221"
+
+    def _classify_device_errors(self, errors, label):
+        """Log every device error and separate advisory from blocking codes."""
+        advisory = []
+        blocking = []
+        for error in errors or []:
+            if self._is_advisory_device_error(error):
+                advisory.append(error)
+                self._dbg(
+                    "warn",
+                    f"{label}: advisory BIT error {error}; continuing to "
+                    "live state verification")
+            else:
+                blocking.append(error)
+                self._dbg("err", f"{label}: blocking BIT error {error}")
+        return advisory, blocking
+
+    def verify_dc_postflight(self, expected_mode=None, expected_output=None,
+                             label="DC transaction"):
+        """Require valid live state; log advisory -221 errors without locking."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.verify_dc_postflight,
+                expected_mode=expected_mode,
+                expected_output=expected_output,
+                label=label)
+
+        errors = self.drain_errors(fail_on_timeout=True)
+        if errors is None:
+            return False, self.last_error or f"{label}: error-queue timeout", None
+        advisory_errors, blocking_errors = self._classify_device_errors(
+            errors, label)
+        if blocking_errors:
+            reason = (
+                f"{label}: blocking device errors after transaction: "
+                f"{'; '.join(blocking_errors)}")
+            return False, reason, None
+
+        snapshot, reason = self.read_status_snapshot()
+        if snapshot is None:
+            return False, reason, None
+        if expected_mode and snapshot.mode != expected_mode:
+            reason = (
+                f"{label}: postflight mode expected {expected_mode}, "
+                f"received {snapshot.mode}")
+            return False, reason, None
+        if (expected_output is not None
+                and snapshot.output_on != bool(expected_output)):
+            reason = (
+                f"{label}: postflight output expected "
+                f"{'ON' if expected_output else 'OFF'}, received "
+                f"{'ON' if snapshot.output_on else 'OFF'}")
+            return False, reason, None
+        self.last_verified_state = snapshot
+        self._dbg(
+            "ok",
+            f"{label}: postflight verified V={snapshot.voltage:.6g}, "
+            f"I={snapshot.current:.6g}, "
+            f"OUTP={'ON' if snapshot.output_on else 'OFF'}, "
+            f"MODE={snapshot.mode}")
+        if advisory_errors:
+            self._dbg(
+                "warn",
+                f"{label}: verified expected live state despite advisory "
+                f"device error(s): {'; '.join(advisory_errors)}")
+        return True, "", snapshot
 
     # -- synchronization helpers --------------------------------------------
     def sync(self):
@@ -592,6 +1205,9 @@ class KepcoController:
 
     def drain_errors(self, fail_on_timeout=False):
         """Read and return all queued SYST:ERR entries (stops at '0,...')."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.drain_errors, fail_on_timeout=fail_on_timeout)
         errors = []
         for _ in range(20):
             resp = self.send_query("SYST:ERR?")
@@ -606,7 +1222,95 @@ class KepcoController:
         return errors
 
     def identity(self):
-        return self.send_query("*IDN?")
+        return self.send_query("*IDN?", allow_unverified=True)
+
+    def read_status_snapshot(self, allow_unverified=False):
+        """Read one status snapshot, aborting before any later query on failure."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.read_status_snapshot,
+                allow_unverified=allow_unverified)
+        query_validators = (
+            ("MEAS:VOLT?", validate_voltage),
+            ("MEAS:CURR?", validate_current),
+            ("OUTP?", validate_output),
+            ("FUNC:MODE?", validate_mode),
+        )
+        replies = []
+        for command, validator in query_validators:
+            try:
+                raw = self.send_query(command, allow_unverified=allow_unverified)
+            except ConnectionLostError as exc:
+                return None, str(exc)
+            if raw is None:
+                return None, self.last_error or f"No response to '{command}'"
+            try:
+                replies.append(validator(raw))
+            except ProtocolError as exc:
+                reason = str(exc)
+                self.mark_degraded(
+                    f"Status snapshot rejected: {reason}; "
+                    "session synchronization uncertain")
+                return None, reason
+        return StatusSnapshot(
+            voltage=replies[0],
+            current=replies[1],
+            output_on=replies[2],
+            mode=replies[3],
+        ), ""
+
+    def verify_device_state(self):
+        """Run the full multi-snapshot health gate before enabling control."""
+        if not self._is_socket_worker():
+            return self.run_transaction(self.verify_device_state)
+        if not self.is_transport_connected:
+            return False, "no active socket"
+        self._set_comm_state(CommState.VERIFYING, "validating device state")
+        try:
+            identity = validate_identity(self.identity())
+            self.last_identity = identity
+            opc = self.send_query("*OPC?", allow_unverified=True)
+            validate_operation_complete(opc)
+        except (ProtocolError, ConnectionLostError) as exc:
+            reason = str(exc)
+            self.mark_degraded(f"verification rejected: {reason}")
+            return False, reason
+
+        snapshots = []
+        for index in range(VERIFY_SNAPSHOT_COUNT):
+            snapshot, reason = self.read_status_snapshot(allow_unverified=True)
+            if snapshot is None:
+                self.mark_degraded(reason)
+                return False, reason
+            if snapshots:
+                baseline = snapshots[0]
+                if snapshot.output_on != baseline.output_on:
+                    reason = "OUTP? changed during verification"
+                    self.mark_degraded(reason)
+                    return False, reason
+                if snapshot.mode != baseline.mode:
+                    reason = "FUNC:MODE? changed during verification"
+                    self.mark_degraded(reason)
+                    return False, reason
+            snapshots.append(snapshot)
+            self._dbg(
+                "info",
+                f"Verification snapshot {index + 1}/{VERIFY_SNAPSHOT_COUNT}: "
+                f"V={snapshot.voltage:.6g}, I={snapshot.current:.6g}, "
+                f"OUTP={'ON' if snapshot.output_on else 'OFF'}, MODE={snapshot.mode}")
+
+        snapshot = snapshots[-1]
+        self.last_verified_state = snapshot
+        self.last_error = ""
+        self._set_comm_state(
+            CommState.HEALTHY,
+            f"*IDN?, *OPC?, and {VERIFY_SNAPSHOT_COUNT} stable snapshots verified")
+        self._dbg(
+            "ok",
+            "Device health verified: "
+            f"V={snapshot.voltage:.6g}, I={snapshot.current:.6g}, "
+            f"OUTP={'ON' if snapshot.output_on else 'OFF'}, MODE={snapshot.mode}")
+        return True, ""
 
     @staticmethod
     def _normalize_func_mode(mode_resp):
@@ -627,10 +1331,13 @@ class KepcoController:
         active FUNC:MODE instead, inspect only that source's mode, and disarm
         it only when a live LIST program is actually armed.
         """
+        if not self._is_socket_worker():
+            return self.run_transaction(self.disarm_active_list_mode)
         try:
             active_mode = self._normalize_func_mode(self.send_query("FUNC:MODE?"))
             if not active_mode:
-                return False, "Could not determine active FUNC:MODE"
+                return self._reject_invalid_response(
+                    "Could not determine active FUNC:MODE")
 
             mode_state = self.send_query(f"{active_mode}:MODE?")
             if mode_state is None:
@@ -638,12 +1345,51 @@ class KepcoController:
                     f"Could not query {active_mode}:MODE?: {self.last_error}")
 
             mode_text = str(mode_state).strip().upper()
-            if "LIST" not in mode_text:
+            normalized_source_mode = self._normalize_source_mode(mode_state)
+            if normalized_source_mode is None:
+                return self._reject_invalid_response(
+                    f"Invalid {active_mode}:MODE? response {mode_state!r}")
+            if normalized_source_mode != "LIST":
                 return True, "Active mode already fixed"
 
-            for cmd in [f"{active_mode} 0", f"{active_mode}:MODE FIX", "*WAI"]:
-                if self.send_cmd(cmd) is None:
-                    return False, f"Disarm '{cmd}' failed: {self.last_error}"
+            # Manual Figure B-3 stops LIST with MODE FIX before issuing a new
+            # fixed setpoint.  A source-level command sent while LIST is still
+            # executing can be rejected or leave the final list point active.
+            fix_cmd = f"{active_mode}:MODE FIX"
+            if self.send_cmd(fix_cmd) is None:
+                return False, f"Disarm '{fix_cmd}' failed: {self.last_error}"
+            if not self.sync():
+                return False, f"Disarm wait failed: {self.last_error}"
+            fixed_resp = self.send_query(f"{active_mode}:MODE?")
+            if fixed_resp is None:
+                return False, (
+                    f"Could not verify {active_mode}:MODE FIX: "
+                    f"{self.last_error}")
+            fixed_mode = self._normalize_source_mode(fixed_resp)
+            if fixed_mode is None:
+                return self._reject_invalid_response(
+                    f"Invalid {active_mode}:MODE? response {fixed_resp!r}")
+            if fixed_mode != "FIX":
+                reason = (
+                    f"Disarm verification expected {active_mode}:MODE FIX, "
+                    f"received {fixed_resp!r}")
+                return False, reason
+
+            zero_cmd = f"{active_mode} 0"
+            if self.send_cmd(zero_cmd) is None or not self.sync():
+                return False, (
+                    f"Disarm zero staging failed at '{zero_cmd}': "
+                    f"{self.last_error}")
+            zero_resp = self.send_query(f"{active_mode}?")
+            try:
+                if abs(float(str(zero_resp).strip())) > 1e-6:
+                    return False, (
+                        f"Disarm zero verification expected {active_mode} 0, "
+                        f"received {zero_resp!r}")
+            except (TypeError, ValueError):
+                return self._reject_invalid_response(
+                    f"Disarm zero verification received invalid "
+                    f"{active_mode}? response {zero_resp!r}")
             return True, f"{active_mode} LIST mode disarmed"
         except Exception as e:
             return False, str(e)
@@ -654,13 +1400,13 @@ class KepcoController:
                           current_limit=None):
         """Upload one chunk (<= 1000 points) with paced writes + verification.
 
-                Strategy:
-                    1. Disarm: switch the active LIST program back to FIX
-                    2. Setup: FUNC:MODE, RANG, LIST:CLE, *WAI
-          3. Values: send LIST:{mode} batches of <= 20 values each,
+        Strategy:
+          1. Disarm: switch the active LIST program back to FIX, then zero it
+          2. Setup: FUNC:MODE, RANG, zero, one limit, LIST:CLE, *WAI
+          3. Values: send LIST:{mode} batches of <= 10 values each,
              each followed only by the mandatory 35 ms gap
-                    4. Dwell: send LIST:DWEL once after values
-                    5. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
+          4. Dwell: send LIST:DWEL once after values
+          5. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
 
         Key change from previous revision: *OPC? is NOT used anywhere
         in the upload path.  The manual (PAR A.17) recommends *WAI for
@@ -669,9 +1415,17 @@ class KepcoController:
 
         progress_cb(sent, total) is called after each batch if provided.
         """
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.upload_list_chunk, points, dwell, mode,
+                progress_cb=progress_cb,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit)
         with self._lock:
-            if not self.connected and not self._safe_reconnect():
-                return False, "Not connected"
+            try:
+                self._ensure_verified_for_io()
+            except ConnectionLostError as exc:
+                return False, str(exc)
             if not points:
                 return False, "Empty point list"
             if len(points) > MAX_LIST_POINTS:
@@ -703,12 +1457,18 @@ class KepcoController:
                 # examples never use it for list operations, and it forces
                 # the card to "operation complete idle" which can confuse
                 # subsequent synchronisation on some firmware revisions.
-                setup_cmds = self._limit_setup_cmds(
-                    mode, voltage_compliance, current_limit)
-                setup_cmds.extend([
+                ok, setup_msg = self.configure_fixed_mode(
+                    mode,
+                    voltage_compliance=voltage_compliance,
+                    current_limit=current_limit,
+                    initial_setpoint=0.0,
+                    label=f"LIST upload fixed-mode setup ({mode})")
+                if not ok:
+                    return False, setup_msg
+                setup_cmds = [
                     "LIST:CLE",
                     "*WAI",                   # wait for LIST:CLE (PAR A.17)
-                ])
+                ]
                 ok, setup_msg = self.send_sequence(
                     setup_cmds, label=f"LIST upload setup ({mode})")
                 if not ok:
@@ -763,21 +1523,33 @@ class KepcoController:
                     return False, f"Post-upload *WAI failed: {self.last_error}"
 
                 pcount_str = self.send_query(f"LIST:{mode}:POIN?")
-                if pcount_str is not None:
-                    try:
-                        actual_count = int(pcount_str.strip())
-                        if actual_count != total:
-                            return False, (
-                                f"Point count mismatch: sent {total}, "
-                                f"device reports {actual_count}")
-                    except ValueError:
-                        pass  # non-numeric, skip verify
+                if pcount_str is None:
+                    return False, (
+                        f"LIST:{mode}:POIN? verification failed: "
+                        f"{self.last_error}")
+                try:
+                    actual_count = int(pcount_str.strip())
+                except (AttributeError, ValueError):
+                    return False, (
+                        f"Invalid LIST:{mode}:POIN? response {pcount_str!r}")
+                if actual_count != total:
+                    return False, (
+                        f"Point count mismatch: sent {total}, "
+                        f"device reports {actual_count}")
 
                 errors = self.drain_errors(fail_on_timeout=True)
                 if errors is None:
                     return False, "SYST:ERR? timeout during verification"
-                if errors:
-                    return False, f"Device errors: {'; '.join(errors)}"
+                advisory_errors, blocking_errors = self._classify_device_errors(
+                    errors, f"LIST upload verification ({mode})")
+                if blocking_errors:
+                    return False, (
+                        f"Blocking device errors: {'; '.join(blocking_errors)}")
+                if advisory_errors:
+                    self._dbg(
+                        "warn",
+                        "LIST point count verified despite advisory device "
+                        f"error(s): {'; '.join(advisory_errors)}")
 
                 return True, (
                     f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
@@ -791,13 +1563,21 @@ class KepcoController:
                  apply_limit_setup=True):
         """Start LIST execution.
 
-        When enable_output is True the standard sequence is:
-          setup limits -> zero fixed source -> COUNT -> OUTP ON -> {mode}:MODE LIST
+        When setup is requested, fixed/full-scale mode, zero, and the one
+        complementary limit are programmed and verified first.  A normal UI
+        upload has already done that work, so output enable only arms the list.
 
         When enable_output is False the current output state is preserved.  The
         upload path has already applied limits, so live re-arms can skip the
         fixed-source setup that can disturb an active AC waveform.
         """
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.run_list, mode, count=count,
+                enable_output=enable_output,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                apply_limit_setup=apply_limit_setup)
         mode = (mode or "VOLT").upper()
         if mode not in ("VOLT", "CURR"):
             return False, f"Unsupported list mode '{mode}'"
@@ -805,14 +1585,19 @@ class KepcoController:
             try:
                 cmds = []
                 if apply_limit_setup:
-                    cmds.extend(self._limit_setup_cmds(
-                        mode, voltage_compliance, current_limit))
-                if enable_output:
-                    cmds.append(f"{mode} 0")
+                    ok, setup_msg = self.configure_fixed_mode(
+                        mode,
+                        voltage_compliance=voltage_compliance,
+                        current_limit=current_limit,
+                        initial_setpoint=0.0,
+                        label=f"LIST run fixed-mode setup ({mode})")
+                    if not ok:
+                        return False, setup_msg
                 cmds.append(f"LIST:COUN {count}")
                 if enable_output:
                     cmds.append("OUTP ON")
                 cmds.append(f"{mode}:MODE LIST")
+                cmds.append("*WAI")
 
                 ok, run_msg = self.send_sequence(
                     cmds,
@@ -822,11 +1607,18 @@ class KepcoController:
                 if not ok:
                     return False, run_msg
 
-                outp = (self.send_query("OUTP?") or "").strip().upper()
-                mode_state = (self.send_query(f"{mode}:MODE?") or "").strip().upper()
+                outp_resp = self.send_query("OUTP?")
+                if outp_resp is None:
+                    return False, "Run verification failed: OUTP? unavailable"
+                outp = outp_resp.strip().upper()
+                mode_resp = self.send_query(f"{mode}:MODE?")
+                if mode_resp is None:
+                    return False, (
+                        f"Run verification failed: {mode}:MODE? unavailable")
+                mode_state = mode_resp.strip().upper()
                 if enable_output and outp not in ("1", "ON"):
                     return False, "Run verification failed: output not enabled"
-                if mode_state and "LIST" not in mode_state:
+                if self._normalize_source_mode(mode_state) != "LIST":
                     return False, (
                         f"Run verification failed: {mode}:MODE is '{mode_state}'")
                 return True, "Running"
@@ -835,17 +1627,25 @@ class KepcoController:
 
     def stop(self, base_mode="VOLT"):
         """Stop LIST, return to safe fixed-output state."""
+        if not self._is_socket_worker():
+            return self.run_transaction(self.stop, base_mode=base_mode)
         base_mode = (base_mode or "VOLT").upper()
+        if base_mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported FUNC:MODE '{base_mode}'"
         with self._lock:
             try:
-                for cmd in [
-                    "VOLT:MODE FIX",
-                    "CURR:MODE FIX",
-                    "OUTP OFF",
-                    f"FUNC:MODE {base_mode}",
-                ]:
-                    if self.send_cmd(cmd) is None:
-                        return False, f"Stop '{cmd}' failed: {self.last_error}"
+                # Only the source selected by FUNC:MODE can safely accept a
+                # mode command on BIT 802E hardware.  If LIST is active,
+                # disarm that source before switching the output off.
+                ok, msg = self.disarm_active_list_mode()
+                if not ok:
+                    return False, msg
+                if self.send_cmd("OUTP OFF") is None:
+                    return False, f"Stop 'OUTP OFF' failed: {self.last_error}"
+                ok, msg = self.select_fixed_mode(
+                    base_mode, label=f"Stop fixed-mode setup ({base_mode})")
+                if not ok:
+                    return False, msg
                 return True, "Stopped"
             except Exception as e:
                 return False, str(e)
@@ -853,11 +1653,11 @@ class KepcoController:
 #  Network Discovery
 #  Stateless helper used by the Scan Network button.
 class Discovery:
-    """Scan a /24 subnet for Kepco devices (Telnet 5024 first, then 5025)."""
+    """Scan a /24 subnet for Kepco devices (raw SCPI 5025, then Telnet 5024)."""
 
     @staticmethod
     def _probe(ip_str, timeout=DISCOVERY_TIMEOUT):
-        for port in (TELNET_PORT, SCPI_SOCKET_PORT):
+        for port in (SCPI_SOCKET_PORT, TELNET_PORT):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(timeout)
@@ -1011,19 +1811,24 @@ class DashboardApp:
         self.preview_points = []
         self.uploaded_request = None
         self.uploaded_waveform_ready = False
-        self.current_output_on = False
+        # None means the physical output has not been verified.  Never coerce
+        # this to False: a lost dashboard session does not turn off a BOP.
+        self.current_output_on: bool | None = None
         self.sequence_active = False
         self.is_running = False
 
         # Background work flags. They prevent duplicate button actions and help
         # status polling yield while command sequences own the hardware.
+        self._scan_in_flight = False
         self._connect_in_flight = False
         self._upload_in_flight = False
         self._output_toggle_in_flight = False
         self._status_poll_enabled = False
         self._status_poll_paused = False
         self._status_poll_in_flight = False
+        self._status_poll_in_flight_generation = None
         self._status_poll_timer = None
+        self._status_poll_generation = 0
         self._measurement_guard = None
         self._solenoid_temperature_poll_timer = None
         self._last_solenoid_temperature_error_logged = None
@@ -1548,6 +2353,12 @@ class DashboardApp:
             limits_card, text="Set V/I Limits",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
             anchor="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(
+            limits_card,
+            text="Signed software bounds; hardware uses the larger |limit|.",
+            text_color=C["text2"], font=ctk.CTkFont(size=9),
+            justify="left", wraplength=220).pack(
+            anchor="w", padx=10, pady=(0, 5))
 
         v_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         v_row.pack(fill="x", padx=10, pady=(0, 4))
@@ -1787,7 +2598,7 @@ class DashboardApp:
             border_width=1, border_color=C["border"])
         self.status_live_console.pack(fill="x", padx=8, pady=(0, 6))
         self.status_live_console_labels = {}
-        for key in ("voltage", "current", "pmon", "stale"):
+        for key in ("output", "voltage", "current", "pmon", "stale"):
             label = ctk.CTkLabel(
                 self.status_live_console,
                 text="",
@@ -1797,7 +2608,12 @@ class DashboardApp:
                 wraplength=300,
                 text_color=C["text2"],
                 font=ctk.CTkFont(family="Consolas", size=9, weight="bold"))
-            label.pack(fill="x", padx=6, pady=(3 if key == "voltage" else 0, 3))
+            # The first visible line needs top padding so its glyphs do not
+            # clip against the console border.  Output warnings can occupy
+            # that first position when communication is unverified.
+            label.pack(
+                fill="x", padx=6,
+                pady=(3 if key in ("output", "voltage") else 0, 3))
             self.status_live_console_labels[key] = label
         self.status_live_console_labels["stale"].pack_forget()
 
@@ -1811,12 +2627,11 @@ class DashboardApp:
         out_row = ctk.CTkFrame(info_card, fg_color="transparent")
         out_row.pack(fill="x", padx=10, pady=(0, 8))
         self.status_output_pill = ctk.CTkLabel(
-            out_row, text="OFF", width=56, height=24,
-            corner_radius=6, fg_color=C["red"],
-            text_color="#ffffff",
+            out_row, text="Output: UNKNOWN", width=120, height=24,
+            corner_radius=6, fg_color=C["amber"],
+            text_color="#111827",
             font=ctk.CTkFont(size=11, weight="bold"))
         self.status_output_pill.pack(side="left")
-
         ctk.CTkLabel(
             info_card, text="Control Mode",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1936,8 +2751,9 @@ class DashboardApp:
         return label
 
     # -- Session logging and readback collection -----------------------------
-    # The visible log mirrors into logs/*.log, while data collection writes live
-    # polling samples to CSV only when the operator enables it.
+    # All diagnostics are retained in logs/*.log.  The bottom event panel is
+    # deliberately quieter: controller polling traffic stays file-only while
+    # hardware events and errors remain visible to the operator.
     def _init_log_file(self):
         try:
             log_dir = os.path.join(os.getcwd(), "logs")
@@ -1954,11 +2770,23 @@ class DashboardApp:
             self.log_file_handle = None
             self.log_file_path = ""
 
+    @staticmethod
+    def _log_level(tag):
+        levels = {
+            "ok": "INFO",
+            "info": "INFO",
+            "warn": "WARNING",
+            "err": "ERROR",
+            "critical": "CRITICAL ERROR",
+        }
+        return levels.get(str(tag).lower(), "INFO")
+
     def _write_log_file_line(self, ts, tag, msg):
         if not self.log_file_handle:
             return
         try:
-            self.log_file_handle.write(f"[{ts}] [{tag.upper()}] {msg}\n")
+            self.log_file_handle.write(
+                f"[{ts}] [{self._log_level(tag)}] {msg}\n")
             self.log_file_handle.flush()
         except Exception:
             self.log_file_handle = None
@@ -2214,11 +3042,17 @@ class DashboardApp:
         self._ui_queue.put(callback)
         return True
 
-    def log(self, msg, tag="info"):
+    def log(self, msg, tag="info", visible=None):
+        """Persist every entry; render only operator-relevant event entries."""
         ts = time.strftime("%H:%M:%S")
-        sym = {"info": "[i]", "ok": "[ok]", "warn": "[!]", "err": "[x]"}.get(tag, "[.]")
-        self.log_text.insert("end", f"[{ts}] {sym} {msg}\n")
-        self.log_text.see("end")
+        level = self._log_level(tag)
+        if visible is None:
+            # Plain INFO is diagnostic/application chatter.  Successful
+            # actions, warnings, and errors are operator-facing events.
+            visible = str(tag).lower() in ("ok", "warn", "err", "critical")
+        if visible:
+            self.log_text.insert("end", f"[{ts}] [{level}] {msg}\n")
+            self.log_text.see("end")
         self._write_log_file_line(ts, tag, msg)
 
     def _controller_debug_log(self, level, msg):
@@ -2230,10 +3064,17 @@ class DashboardApp:
         elif level == "err":
             tag = "err"
 
+        # TX/RX/polling traffic is still written to the session file, but it
+        # must not displace operator events in the visible event panel.
+        visible = (
+            tag in ("err", "critical")
+            or "advisory BIT error" in msg
+            or "despite advisory device error" in msg)
         if threading.current_thread() is threading.main_thread():
-            self.log(f"[COMM] {msg}", tag)
+            self.log(f"[COMM] {msg}", tag, visible=visible)
         else:
-            self._call_on_ui(lambda: self.log(f"[COMM] {msg}", tag))
+            self._call_on_ui(
+                lambda: self.log(f"[COMM] {msg}", tag, visible=visible))
 
     def _log_safe(self, msg, tag="info"):
         self._call_on_ui(lambda: self.log(msg, tag))
@@ -2241,21 +3082,39 @@ class DashboardApp:
     # -- Connection, reset, and status mirroring -----------------------------
     # These helpers keep the app's local flags, status panel, and output button
     # synchronized whenever the device connects, drops, resets, or polls.
-    def _set_connected_state(self, connected, idn=""):
-        if connected:
+    def _set_connected_state(self, idn=""):
+        """Render the controller's current transport trust state."""
+        state = self.kepco.comm_state
+        if self.kepco.is_verified:
             self.conn_btn.configure(
                 text="Disconnect", fg_color=C["red"], hover_color="#dc2626")
             self.status_lbl.configure(text="Connected", text_color=C["green"])
             self.idn_lbl.configure(text=idn)
         else:
+            reconnectable = state is CommState.DEGRADED and self.kepco.is_transport_connected
             self.conn_btn.configure(
-                text="Connect", fg_color=C["primary"], hover_color=C["primary_h"])
-            self.status_lbl.configure(text="Disconnected", text_color=C["red"])
-            self.idn_lbl.configure(text="")
+                text="Recover" if reconnectable else "Connect",
+                fg_color=C["primary"], hover_color=C["primary_h"])
+            state_text = {
+                CommState.CONNECTING: "Connecting",
+                CommState.VERIFYING: "Connected — Verifying Device State",
+                CommState.DEGRADED: "Communication degraded",
+                CommState.FAULTED: "Communication faulted",
+            }.get(state, "Disconnected")
+            state_color = C["amber"] if state in (
+                CommState.CONNECTING, CommState.VERIFYING,
+                CommState.DEGRADED) else C["red"]
+            self.status_lbl.configure(text=state_text, text_color=state_color)
+            self.idn_lbl.configure(text=idn if self.kepco.is_transport_connected else "")
+        self.scan_btn.configure(
+            state=(
+                "disabled"
+                if self.kepco.is_transport_connected or self._connect_in_flight
+                else "normal"))
         self._update_output_controls()
 
     def _handle_comm_failure(self, context):
-        if self.kepco.connected:
+        if self.kepco.is_verified:
             return
         self._stop_status_polling()
         self._connect_in_flight = False
@@ -2264,24 +3123,33 @@ class DashboardApp:
         self.stop_event.set()
         self.sequence_active = False
         self.is_running = False
-        self._set_connected_state(False)
-        self._reset_live_status()
+        self._set_connected_state()
+        self._reset_live_status(output_state=None)
         self._reset_uploaded_state()
-        self.log(f"Connection lost during {context}: {self.kepco.last_error}", "err")
+        self.log(
+            f"Connection lost during {context}: {self.kepco.last_error}",
+            "critical")
 
-    def _reset_live_status(self):
+    def _resume_or_handle_transaction_failure(self, context, delay_ms=100):
+        """Resume polling after a command rejection; lock only on comm loss."""
+        if self.kepco.is_verified:
+            self._resume_status_polling(delay_ms)
+        else:
+            self._handle_comm_failure(context)
+
+    def _reset_live_status(self, output_state: bool | None = None,
+                           control_mode=None):
+        """Clear live readbacks without claiming an unverified output is OFF."""
         self._measurement_guard = None
-        self.current_output_on = False
-        self.current_control_mode = "VOLT"
+        self.current_control_mode = control_mode or "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
         self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
         self._set_dc_current_monitors_inactive()
-        self._set_status_output_display(False)
         self._set_status_mode_display(None)
-        self.control_mode_var.set("VOLT")
+        self.control_mode_var.set(self.current_control_mode)
         if hasattr(self, "mode_buttons"):
-            self._update_mode_buttons("VOLT")
-        self._set_output_ui_state(False)
+            self._update_mode_buttons(self.current_control_mode)
+        self._set_output_ui_state(output_state)
         self._refresh_ac_operation_notice()
 
     def _reset_uploaded_state(self):
@@ -2293,7 +3161,6 @@ class DashboardApp:
         self.status_cfg_labels["device_state"].configure(text="No waveform uploaded")
         self.prog_lbl.configure(text="No upload yet")
         self.progress.set(0)
-        self._set_output_ui_state(False)
         self._set_dc_current_monitors_inactive()
         self._refresh_ac_operation_notice()
         self._update_output_controls()
@@ -2335,8 +3202,8 @@ class DashboardApp:
             self.status_cfg_labels[key].configure(text=value)
         self._update_status_plot(req["plot_points"])
 
-    def _set_output_ui_state(self, is_on):
-        self.current_output_on = bool(is_on)
+    def _set_output_ui_state(self, is_on: bool | None):
+        self.current_output_on = is_on
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
         if not is_on:
@@ -2344,10 +3211,19 @@ class DashboardApp:
         self._refresh_ac_operation_notice(is_on)
 
     def _set_status_output_display(self, is_on):
+        if is_on is None:
+            self.status_output_pill.configure(
+                text="Output: UNKNOWN", fg_color=C["amber"], text_color="#111827")
+            self._set_live_console_line(
+                "output",
+                "Output: UNKNOWN — Verify the KEPCO before interacting with the load.",
+                C["amber"])
+            return
         self.status_output_pill.configure(
-            text="ON" if is_on else "OFF",
+            text="Output: ON" if is_on else "Output: OFF",
             fg_color=C["green"] if is_on else C["red"],
             text_color="#ffffff")
+        self._set_live_console_line("output", "", C["amber"], visible=False)
 
     # -- Output button rendering --------------------------------------------
     # The output button has several logical locks: disconnected, no waveform,
@@ -2371,7 +3247,7 @@ class DashboardApp:
 
     def _can_toggle_output(self):
         return self._output_toggle_allowed(
-            self.kepco.connected,
+            self.kepco.is_verified,
             self.uploaded_waveform_ready,
             self.current_output_on,
             self.sequence_active,
@@ -2390,7 +3266,7 @@ class DashboardApp:
         button_hover = "#4b5563"
         button_text_color = "#e5e7eb"
 
-        if self.kepco.connected:
+        if self.kepco.is_verified:
             if self._output_toggle_in_flight:
                 badge_text = "APPLYING"
                 badge_color = C["amber"]
@@ -2434,14 +3310,21 @@ class DashboardApp:
             state="normal" if can_toggle else "disabled")
 
     def _update_output_controls(self):
-        upload_state = "disabled" if (self._upload_in_flight or self.sequence_active) else "normal"
+        upload_state = "normal" if (
+            self.kepco.is_verified
+            and not self._upload_in_flight
+            and not self.sequence_active) else "disabled"
         self.upload_btn.configure(state=upload_state)
 
         can_toggle = self._can_toggle_output()
         self._refresh_output_toggle_button(can_toggle)
 
-        if not self.kepco.connected:
-            hint = "Connect to a Kepco to control output."
+        if not self.kepco.is_verified:
+            hint = (
+                "Device state is unverified; output state is unknown."
+                if self.kepco.comm_state in (CommState.DEGRADED, CommState.FAULTED)
+                else "Verify communication with a Kepco before controlling output."
+            )
         elif self._output_toggle_in_flight:
             hint = "Applying output change..."
         elif self.sequence_active:
@@ -2472,7 +3355,7 @@ class DashboardApp:
         req = self.uploaded_request or {}
         output_on = self.current_output_on if is_on is None else bool(is_on)
         return bool(
-            self.kepco.connected
+            self.kepco.is_verified
             and output_on
             and req.get("kind") == "LIST"
             and req.get("wave") not in ("", None, "DC")
@@ -2505,7 +3388,9 @@ class DashboardApp:
             except Exception:
                 packed = False
             if not packed:
-                label.pack(fill="x", padx=6, pady=(0, 3))
+                label.pack(
+                    fill="x", padx=6,
+                    pady=(3 if key in ("output", "voltage") else 0, 3))
             label.configure(text=text, text_color=color)
         else:
             label.pack_forget()
@@ -2554,7 +3439,7 @@ class DashboardApp:
     def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
         req = self.uploaded_request or {}
         active = (
-            self.kepco.connected
+            self.kepco.is_verified
             and is_on
             and mode_text == "CURR"
             and req.get("kind") == "DC"
@@ -2848,17 +3733,63 @@ class DashboardApp:
     def _log_scpi_sequence(self, label, cmds):
         self._log_safe(f"{label}: {'; '.join(cmds)}", "info")
 
-    def _apply_device_limits(self, mode, voltage_compliance, current_limit):
-        mode = (mode or "VOLT").upper()
+    def _drain_and_log_existing_device_errors(self, context):
+        """Preserve queued BIT errors before beginning a DC transaction."""
         try:
-            cmds = self.kepco._limit_setup_cmds(
-                mode, voltage_compliance, current_limit)
-        except ValueError as exc:
-            return False, str(exc)
-        self._log_scpi_sequence(
-            f"Applying {mode} complementary limit setup", cmds)
-        return self.kepco.send_sequence(
-            cmds, label=f"{mode} complementary limit setup")
+            errors = self.kepco.drain_errors(fail_on_timeout=True)
+        except ConnectionLostError as exc:
+            reason = str(exc)
+            self._log_safe(
+                f"{context}: could not read BIT system error queue: {reason}",
+                "err")
+            return False, reason
+
+        if errors is None:
+            reason = self.kepco.last_error or "SYST:ERR? timed out"
+            self._log_safe(
+                f"{context}: could not read BIT system error queue: {reason}",
+                "err")
+            return False, reason
+
+        for error in errors:
+            self._log_safe(
+                f"{context}: existing BIT system error: {error}", "warn")
+        return True, ""
+
+    def _run_dc_transaction(self, operation, context, expected_mode=None,
+                            expected_output=None):
+        """Run one paused DC operation plus mandatory postflight checks."""
+        def transaction():
+            ok, msg = self._drain_and_log_existing_device_errors(
+                f"{context} preflight")
+            if not ok:
+                return False, msg, None
+
+            ok, msg = operation()
+            if not ok:
+                return False, msg or f"{context} command transaction failed", None
+
+            verified, verify_msg, snapshot = self.kepco.verify_dc_postflight(
+                expected_mode=expected_mode,
+                expected_output=expected_output,
+                label=context)
+            if not verified:
+                return False, verify_msg, None
+            return True, msg, snapshot
+
+        return self.kepco.run_transaction(transaction)
+
+    def _resume_after_dc_postflight(self, snapshot):
+        """Apply a verified snapshot before allowing periodic polling again."""
+        if snapshot is None:
+            return False
+        self._apply_live_status(
+            snapshot.voltage,
+            snapshot.current,
+            "ON" if snapshot.output_on else "OFF",
+            snapshot.mode)
+        self._resume_status_polling(STATUS_POLL_INTERVAL_MS)
+        return True
 
     def _safe_prepare_output(self, mode, initial_setpoint=0.0,
                              voltage_compliance=None, current_limit=None,
@@ -2871,23 +3802,45 @@ class DashboardApp:
         if mode not in ("VOLT", "CURR"):
             return False, f"Unsupported FUNC:MODE '{mode}'"
 
-        cmds = [
-            "VOLT:MODE FIX",
-            "CURR:MODE FIX",
-            f"FUNC:MODE {mode}",
-            f"{mode}:RANG 1",
-        ]
-        initial = KepcoController.format_scpi_value(initial_setpoint)
-        if mode == "CURR":
-            cmds.extend(KepcoController.signed_limit_cmds(
-                "VOLT", voltage_compliance))
-            cmds.append(f"CURR {initial}")
-        else:
-            cmds.extend(KepcoController.signed_limit_cmds(
-                "CURR", current_limit))
-            cmds.append(f"VOLT {initial}")
-        self._log_scpi_sequence(label, cmds)
-        return self.kepco.send_sequence(cmds, label=label)
+        # A previous LIST program can leave the active source armed. Query and
+        # disarm only that source; sending MODE FIX to both sources can itself
+        # enqueue -221.  Do not send *CLS here: the DC transaction preflight
+        # already drained and logged errors, and *CLS is not part of the
+        # manual's optimized fixed-output programming sequence.
+        ok, msg = self.kepco.disarm_active_list_mode()
+        if not ok:
+            return False, f"{label} list disarm failed: {msg}"
+
+        return self.kepco.configure_fixed_mode(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            initial_setpoint=initial_setpoint,
+            label=label)
+
+    def _ensure_dc_configuration(self, mode, voltage_compliance,
+                                 current_limit, label):
+        """Reuse a correct zero-staged setup; otherwise program it once."""
+        ok, reason = self.kepco.verify_programmed_configuration(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            expected_setpoint=0.0,
+            label=f"{label} existing-state check")
+        if ok:
+            return True, "Existing fixed-mode setup already verified"
+        if not self.kepco.is_verified:
+            return False, reason
+        self._log_safe(
+            f"{label}: existing setup is not reusable ({reason}); "
+            "programming the manual-recommended zero/limit sequence",
+            "info")
+        return self._safe_prepare_output(
+            mode,
+            initial_setpoint=0.0,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            label=label)
 
     def _get_software_limits(self, show_error=False):
         limits = self._get_device_limits_from_ui(show_error=show_error)
@@ -2910,14 +3863,53 @@ class DashboardApp:
                 "warn")
             return
 
-        mode_resp = self.kepco.send("FUNC:MODE?", query=True)
-        active_mode = KepcoController._normalize_func_mode(mode_resp)
+        transaction_state = {
+            "active_mode": None,
+            "sent": False,
+            "commands": [],
+        }
+
+        def limit_transaction():
+            mode_resp = self.kepco.send("FUNC:MODE?", query=True)
+            active = KepcoController._normalize_func_mode(mode_resp)
+            transaction_state["active_mode"] = active
+            if not active:
+                return False, "Could not confirm device control mode"
+            fixed_ok, fixed_msg = self.kepco.select_fixed_mode(
+                active, label=f"{mode} device limit fixed-mode setup")
+            if not fixed_ok:
+                return False, fixed_msg
+            complementary = (
+                (active == "CURR" and mode == "VOLT")
+                or (active == "VOLT" and mode == "CURR")
+            )
+            if not complementary:
+                return True, "Limit is software-only for active channel"
+            command = KepcoController.complementary_limit_cmd(
+                active,
+                voltage_compliance=limits["VOLT"],
+                current_limit=limits["CURR"])
+            transaction_state["commands"] = [command]
+            sent, send_msg = self.kepco.send_sequence(
+                [command, "*WAI"], label=f"{mode} device limit command")
+            transaction_state["sent"] = sent
+            return sent, send_msg
+
+        self._pause_status_polling()
+        expected_output = (
+            self.current_output_on
+            if isinstance(self.current_output_on, bool) else None)
+        ok, msg, snapshot = self._run_dc_transaction(
+            limit_transaction,
+            f"{mode} device limit change",
+            expected_output=expected_output)
+        active_mode = transaction_state["active_mode"]
         if not active_mode:
             self.log(
                 "Limit command not sent; could not confirm device control mode.",
                 "err")
-            if not self.kepco.connected:
-                self._handle_comm_failure("query control mode for limit set")
+            self._resume_or_handle_transaction_failure(
+                "query control mode for limit set")
             return
 
         if active_mode != self.control_mode_var.get().upper():
@@ -2925,29 +3917,25 @@ class DashboardApp:
             self.control_mode_var.set(active_mode)
             self._update_mode_buttons(active_mode)
 
-        is_complementary = (
-            (active_mode == "CURR" and mode == "VOLT")
-            or (active_mode == "VOLT" and mode == "CURR")
-        )
-        if not is_complementary:
+        if ok and not transaction_state["sent"]:
             self.log(
                 f"{mode} is the active output channel in {active_mode} mode; "
                 "this field is staged as a UI/software limit only.",
                 "warn")
+            self._resume_after_dc_postflight(snapshot)
             return
 
-        cmds = KepcoController.signed_limit_cmds(mode, limits[mode])
-        self.log(f"Sending device limit command(s): {'; '.join(cmds)}", "info")
-        ok, msg = self.kepco.send_sequence(
-            cmds, label=f"{mode} device limit command(s)")
+        cmds = transaction_state["commands"]
+        self.log(f"Sending device limit command: {'; '.join(cmds)}", "info")
         self.log(
-            f"{mode} device limit set to {neg_limit:.4f} to {pos_limit:.4f} {unit}"
-            if ok else f"Failed to send {mode} limit command(s): {msg}",
+            f"{mode} software limits are {neg_limit:.4f} to {pos_limit:.4f} "
+            f"{unit}; device limit programmed as absolute magnitude"
+            if ok else f"Failed to send {mode} limit command: {msg}",
             "ok" if ok else "err")
         if ok:
-            self._schedule_status_poll(100)
+            self._resume_after_dc_postflight(snapshot)
         else:
-            self._handle_comm_failure(f"set {mode} limit")
+            self._resume_or_handle_transaction_failure(f"set {mode} limit")
 
     def _check_interlock(self, mode, points, context):
         limits = self._get_software_limits(show_error=True)
@@ -3104,39 +4092,62 @@ class DashboardApp:
     # Manual actions use the same safety/state helpers as the main workflow so
     # the status panel and connection-loss behavior remain coherent.
     def _man_require_conn(self):
-        if not self.kepco.connected:
-            self.log("Not connected - connect first.", "warn")
+        if not self.kepco.is_verified:
+            self.log("Device state is not verified; controls are locked.", "warn")
             return False
         return True
 
     def _select_control_mode(self, mode):
         mode = mode.upper()
-        self.current_control_mode = mode
-        self.control_mode_var.set(mode)
-        self._update_mode_buttons(mode)
-        if not self.kepco.connected:
+        previous_mode = self.current_control_mode
+        if self.kepco.is_verified and self.current_output_on:
+            self.control_mode_var.set(previous_mode)
+            self._update_mode_buttons(previous_mode)
+            messagebox.showwarning(
+                "Output Enabled",
+                "Disable output before changing the control mode. This avoids "
+                "a live voltage/current crossover transient.")
+            return
+        if not self.kepco.is_verified:
+            self.current_control_mode = mode
+            self.control_mode_var.set(mode)
+            self._update_mode_buttons(mode)
             self.log(f"Control mode preset to {mode}", "info")
             return
         limits = self._get_software_limits(show_error=True)
         if not limits:
+            self.control_mode_var.set(previous_mode)
+            self._update_mode_buttons(previous_mode)
             return
-        if self.current_output_on:
-            ok, msg = self._safe_prepare_output(
+        self._pause_status_polling()
+
+        def mode_transaction():
+            return self._ensure_dc_configuration(
                 mode,
-                initial_setpoint=0.0,
-                voltage_compliance=limits["VOLT"],
-                current_limit=limits["CURR"],
-                label=f"Manual {mode} mode safe prepare")
-        else:
-            ok, msg = self._apply_device_limits(
-                mode, limits["VOLT"], limits["CURR"])
+                limits["VOLT"],
+                limits["CURR"],
+                label=f"Manual {mode} fixed-mode selection")
+
+        expected_output = (
+            self.current_output_on
+            if isinstance(self.current_output_on, bool) else None)
+        ok, msg, snapshot = self._run_dc_transaction(
+            mode_transaction,
+            f"Manual {mode} mode change",
+            expected_mode=mode,
+            expected_output=expected_output)
         self.log(
             f"Control mode -> {mode}" if ok else f"Failed to set control mode: {msg}",
             "ok" if ok else "err")
         if ok:
-            self._schedule_status_poll(100)
+            self.current_control_mode = mode
+            self.control_mode_var.set(mode)
+            self._update_mode_buttons(mode)
+            self._resume_after_dc_postflight(snapshot)
         else:
-            self._handle_comm_failure("set control mode")
+            self.control_mode_var.set(previous_mode)
+            self._update_mode_buttons(previous_mode)
+            self._resume_or_handle_transaction_failure("set control mode")
 
     def _man_set_range(self):
         if not self._man_require_conn():
@@ -3152,20 +4163,33 @@ class DashboardApp:
             cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 1"]
             label = "Full Scale"
         else:
-            cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 0"]
+            cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 4"]
             label = "Quarter Scale"
-        ok = True
-        for cmd in cmds:
-            ok = bool(self.kepco.send(cmd))
-            if not ok:
-                break
+        self._pause_status_polling()
+        expected_output = (
+            self.current_output_on
+            if isinstance(self.current_output_on, bool) else None)
+
+        def range_transaction():
+            fixed_ok, fixed_msg = self.kepco.select_fixed_mode(
+                mode, label=f"Manual {mode} range fixed-mode setup")
+            if not fixed_ok:
+                return False, fixed_msg
+            return self.kepco.send_sequence(
+                cmds + ["*WAI"], label=f"Manual {mode} range -> {label}")
+
+        ok, msg, snapshot = self._run_dc_transaction(
+            range_transaction,
+            f"Manual {mode} range change",
+            expected_mode=mode,
+            expected_output=expected_output)
         self.log(
-            f"{mode} range -> {label}" if ok else "Failed to set range",
+            f"{mode} range -> {label}" if ok else f"Failed to set range: {msg}",
             "ok" if ok else "err")
         if ok:
-            self._schedule_status_poll(100)
+            self._resume_after_dc_postflight(snapshot)
         else:
-            self._handle_comm_failure("set range")
+            self._resume_or_handle_transaction_failure("set range")
 
     def _man_reset(self):
         if not self._man_require_conn():
@@ -3175,7 +4199,13 @@ class DashboardApp:
                 "Busy",
                 "Stop the active upload/stream before resetting the device.")
             return
-        ok = self.kepco.send("*RST")
+        self._pause_status_polling()
+        ok, msg, snapshot = self._run_dc_transaction(
+            lambda: self.kepco.send_sequence(
+                ["*RST", "*WAI"], label="Device reset"),
+            "Device reset",
+            expected_mode="VOLT",
+            expected_output=False)
         if ok:
             self.stop_event.set()
             self.sequence_active = False
@@ -3183,13 +4213,14 @@ class DashboardApp:
             self.current_control_mode = "VOLT"
             self.control_mode_var.set("VOLT")
             self._update_mode_buttons("VOLT")
-            self._reset_live_status()
+            # *RST is a verified command whose documented state is output OFF.
+            self._reset_live_status(output_state=False)
             self._reset_uploaded_state()
             self.log("Device reset (*RST)", "ok")
-            self._schedule_status_poll(150)
+            self._resume_after_dc_postflight(snapshot)
         else:
-            self.log("Reset failed", "err")
-            self._handle_comm_failure("reset")
+            self.log(f"Reset failed: {msg}", "err")
+            self._resume_or_handle_transaction_failure("reset")
 
     def _man_send_scpi(self):
         if not self._man_require_conn():
@@ -3210,13 +4241,24 @@ class DashboardApp:
             if resp is None:
                 self._handle_comm_failure(f"SCPI query '{cmd}'")
         else:
-            ok = self.kepco.send(cmd)
+            self._pause_status_polling()
+
+            def manual_command():
+                return self.kepco.send_sequence(
+                    [cmd, "*WAI"], label=f"Manual SCPI command '{cmd}'")
+
+            ok, msg, snapshot = self._run_dc_transaction(
+                manual_command, f"Manual SCPI command '{cmd}'")
             self.scpi_resp.insert("end", f"[{ts}] {'OK' if ok else 'FAILED'}\n")
-            if not ok:
-                self._handle_comm_failure(f"SCPI command '{cmd}'")
+            if ok:
+                self._resume_after_dc_postflight(snapshot)
+            else:
+                self._resume_or_handle_transaction_failure(
+                    f"SCPI command '{cmd}'")
         self.scpi_resp.see("end")
         self.log(f"SCPI: {cmd}", "info")
-        self._schedule_status_poll(150)
+        if is_query:
+            self._schedule_status_poll(150)
 
     def _man_send_preset(self, cmd):
         if not self._man_require_conn():
@@ -3236,22 +4278,26 @@ class DashboardApp:
 
     def _man_health_check_worker(self):
         ts = time.strftime("%H:%M:%S")
-        results = []
+        def health_check_transaction():
+            results = []
 
-        def run_query(cmd):
-            resp = self.kepco.send(cmd, query=True)
-            results.append((cmd, resp))
-            return resp
+            def run_query(cmd):
+                resp = self.kepco.send(cmd, query=True)
+                results.append((cmd, resp))
+                return resp
 
-        run_query("*IDN?")
-        mode_resp = run_query("FUNC:MODE?")
-        run_query("OUTP?")
+            run_query("*IDN?")
+            mode_resp = run_query("FUNC:MODE?")
+            run_query("OUTP?")
 
-        mode_text = str(mode_resp or "").strip().upper()
-        active_mode = "CURR" if mode_text in ("1", "CURR") else "VOLT"
-        run_query(f"LIST:{active_mode}:POIN?")
-        run_query("SYST:ERR?")
-        run_query("*ESR?")
+            mode_text = str(mode_resp or "").strip().upper()
+            active_mode = "CURR" if mode_text in ("1", "CURR") else "VOLT"
+            run_query(f"LIST:{active_mode}:POIN?")
+            run_query("SYST:ERR?")
+            run_query("*ESR?")
+            return results
+
+        results = self.kepco.run_transaction(health_check_transaction)
 
         self._call_on_ui(lambda: self._man_health_check_done(ts, results))
 
@@ -3272,10 +4318,10 @@ class DashboardApp:
             self._schedule_status_poll(150)
 
     # -- Live status polling -------------------------------------------------
-    # Polling runs continuously while connected, but pauses during uploads,
-    # streaming transitions, output toggles, and disconnect safety checks so
-    # command sequences do not interleave unexpectedly on the SCPI connection.
-    def _schedule_status_poll(self, delay_ms=1000):
+    # Polling runs continuously while connected. Its complete four-query
+    # snapshot is submitted as one socket-owner transaction; UI pauses avoid
+    # unnecessary queued polls during long operator transactions.
+    def _schedule_status_poll(self, delay_ms=STATUS_POLL_INTERVAL_MS):
         if self._status_poll_timer:
             try:
                 self.root.after_cancel(self._status_poll_timer)
@@ -3285,15 +4331,18 @@ class DashboardApp:
         if self._status_poll_enabled:
             self._status_poll_timer = self.root.after(delay_ms, self._status_poll_tick)
 
-    def _start_status_polling(self):
+    def _start_status_polling(self, delay_ms=100):
+        self._status_poll_generation += 1
         self._status_poll_enabled = True
         self._status_poll_paused = False
-        self._schedule_status_poll(100)
+        self._schedule_status_poll(delay_ms)
 
     def _stop_status_polling(self):
+        self._status_poll_generation += 1
         self._status_poll_enabled = False
         self._status_poll_paused = False
         self._status_poll_in_flight = False
+        self._status_poll_in_flight_generation = None
         if self._status_poll_timer:
             try:
                 self.root.after_cancel(self._status_poll_timer)
@@ -3302,6 +4351,7 @@ class DashboardApp:
             self._status_poll_timer = None
 
     def _pause_status_polling(self):
+        self._status_poll_generation += 1
         self._status_poll_paused = True
         if self._status_poll_timer:
             try:
@@ -3310,43 +4360,83 @@ class DashboardApp:
                 pass
             self._status_poll_timer = None
 
-    def _resume_status_polling(self):
+    def _resume_status_polling(self, delay_ms=100):
+        self._status_poll_generation += 1
         self._status_poll_paused = False
         if self._status_poll_enabled:
-            self._schedule_status_poll(100)
-
-    def _wait_for_status_poll_idle(self, timeout=2.0):
-        """Block worker threads until an in-flight poll cycle fully unwinds."""
-        deadline = time.time() + timeout
-        while self._status_poll_in_flight and time.time() < deadline:
-            time.sleep(0.05)
-        return not self._status_poll_in_flight
+            self._schedule_status_poll(delay_ms)
 
     def _status_poll_tick(self):
         self._status_poll_timer = None
-        if not self._status_poll_enabled or self._status_poll_paused or not self.kepco.connected:
+        if (not self._status_poll_enabled or self._status_poll_paused
+                or not self.kepco.is_verified):
             return
         if self._status_poll_in_flight:
             self._schedule_status_poll(250)
             return
         self._status_poll_in_flight = True
-        threading.Thread(target=self._status_poll_worker, daemon=True).start()
+        generation = self._status_poll_generation
+        self._status_poll_in_flight_generation = generation
+        threading.Thread(
+            target=self._status_poll_worker,
+            args=(generation,),
+            daemon=True).start()
 
-    def _status_poll_worker(self):
-        """Collect one readback snapshot on a worker thread."""
-        v = self.kepco.send("MEAS:VOLT?", query=True)
-        c = self.kepco.send("MEAS:CURR?", query=True)
-        outp = self.kepco.send("OUTP?", query=True)
-        mode = self.kepco.send("FUNC:MODE?", query=True)
-        self._call_on_ui(lambda: self._status_poll_done(v, c, outp, mode))
+    def _status_poll_worker(self, generation):
+        """Collect one atomic snapshot; never query past the first failure."""
+        def poll_transaction():
+            # Recheck on the owner thread. A Disconnect/Recover request may
+            # have paused polling after this background thread was created but
+            # before its queue entry reached the socket owner.
+            if (generation != self._status_poll_generation
+                    or not self._status_poll_enabled
+                    or self._status_poll_paused):
+                return None, "", True
+            snapshot, reason = self.kepco.read_status_snapshot()
+            return snapshot, reason, False
 
-    def _status_poll_done(self, v, c, outp, mode):
-        """Apply one poll result and schedule the next cycle."""
-        self._status_poll_in_flight = False
-        if any(item is None for item in (v, c, outp, mode)):
-            self._handle_comm_failure("status polling")
+        snapshot, reason, cancelled = self.kepco.run_transaction(
+            poll_transaction)
+        if cancelled:
+            self._call_on_ui(
+                lambda: self._status_poll_cancelled(generation))
+            return
+        if snapshot is None:
+            self._call_on_ui(
+                lambda: self._status_poll_failed(reason, generation))
+            return
+        self._call_on_ui(
+            lambda: self._status_poll_done(snapshot, generation))
+
+    def _release_status_poll(self, generation):
+        """Clear the in-flight marker only for the poll that owns it."""
+        if self._status_poll_in_flight_generation == generation:
+            self._status_poll_in_flight = False
+            self._status_poll_in_flight_generation = None
+
+    def _status_poll_cancelled(self, generation):
+        """Release the in-flight marker for a poll cancelled before I/O."""
+        self._release_status_poll(generation)
+
+    def _status_poll_failed(self, reason, generation):
+        """Discard a partial poll because SCPI response alignment is uncertain."""
+        self._release_status_poll(generation)
+        self._handle_comm_failure("status polling")
+
+    def _status_poll_done(self, snapshot, generation):
+        """Apply one previously validated, complete status snapshot."""
+        self._release_status_poll(generation)
+        if (generation != self._status_poll_generation
+                or not self._status_poll_enabled
+                or self._status_poll_paused
+                or not self.kepco.is_verified):
             return
 
+        self.kepco.last_verified_state = snapshot
+        v = snapshot.voltage
+        c = snapshot.current
+        outp = "ON" if snapshot.output_on else "OFF"
+        mode = snapshot.mode
         self._record_data_collection_sample(v, c, outp, mode)
 
         poll_mode = str(mode).strip().upper()
@@ -3375,7 +4465,7 @@ class DashboardApp:
 
         self._apply_live_status(v, c, outp, mode)
         if self._status_poll_enabled and not self._status_poll_paused:
-            self._schedule_status_poll(1000)
+            self._schedule_status_poll(STATUS_POLL_INTERVAL_MS)
 
     def _apply_live_status(self, v, c, outp, mode):
         """Normalize raw SCPI status replies and update local/UI state."""
@@ -3425,8 +4515,8 @@ class DashboardApp:
                 "Waveform Running",
                 "Turn output off before uploading a new multi-chunk streamed waveform.")
             return
-        if not self.kepco.connected:
-            messagebox.showerror("Error", "Connect to a device first.")
+        if not self.kepco.is_verified:
+            messagebox.showerror("Error", "Verify communication with a device first.")
             return
         req = self._read_waveform_request()
         if not req:
@@ -3445,18 +4535,33 @@ class DashboardApp:
     def _upload_request_worker(self, req):
         """Run the upload path off the UI thread, then report completion."""
         start_sequence = False
+        postflight_snapshot = None
         try:
-            self._wait_for_status_poll_idle()
-            if req["kind"] == "DC":
-                ok, msg = self._apply_dc_request(req)
-            elif req["point_count"] <= MAX_LIST_POINTS:
-                ok, msg = self._upload_single_chunk_request(req)
-            else:
-                ok, msg, start_sequence = self._prime_multi_chunk_request(req)
+            def upload_transaction():
+                if req["kind"] == "DC":
+                    expected_output = (
+                        self.current_output_on
+                        if isinstance(self.current_output_on, bool) else None)
+                    dc_ok, dc_msg, snapshot = self._run_dc_transaction(
+                        lambda: self._apply_dc_request(req),
+                        "DC setpoint staging",
+                        expected_mode=req["mode"],
+                        expected_output=expected_output)
+                    return dc_ok, dc_msg, False, snapshot
+                if req["point_count"] <= MAX_LIST_POINTS:
+                    list_ok, list_msg = self._upload_single_chunk_request(req)
+                    return list_ok, list_msg, False, None
+                prime_ok, prime_msg, start = self._prime_multi_chunk_request(req)
+                return prime_ok, prime_msg, start, None
+
+            ok, msg, start_sequence, postflight_snapshot = (
+                self.kepco.run_transaction(upload_transaction))
         except Exception as exc:
             ok = False
             msg = str(exc)
-        self._call_on_ui(lambda: self._upload_request_done(req, ok, msg, start_sequence))
+        self._call_on_ui(
+            lambda: self._upload_request_done(
+                req, ok, msg, start_sequence, postflight_snapshot))
 
     def _apply_dc_request(self, req):
         """Stage or live-update a fixed DC setpoint with safe limit setup."""
@@ -3471,42 +4576,54 @@ class DashboardApp:
             and prev_req.get("mode") == mode
         )
 
+        if self.current_output_on and not live_dc_update:
+            return False, (
+                "Disable output before staging a DC request in a different "
+                "mode; live FUNC:MODE changes are intentionally blocked")
+
         setpoint_cmd = (
             f"{mode} {KepcoController.format_scpi_value(value)}")
 
         if live_dc_update:
-            ok, msg = self._apply_device_limits(
-                mode, voltage_compliance, current_limit)
-            if not ok:
-                return False, f"DC limit setup failed: {msg}"
+            previous_voltage_compliance, previous_current_limit = (
+                self._get_request_limits(prev_req))
+            limits_changed = (
+                voltage_compliance != previous_voltage_compliance
+                or current_limit != previous_current_limit)
+            if limits_changed:
+                ok, msg = self.kepco.apply_complementary_limit(
+                    mode,
+                    voltage_compliance=voltage_compliance,
+                    current_limit=current_limit,
+                    label=f"DC live {mode} complementary limit update")
+                if not ok:
+                    return False, f"DC limit update failed: {msg}"
+            else:
+                ok, msg = self.kepco.verify_programmed_configuration(
+                    mode,
+                    voltage_compliance=voltage_compliance,
+                    current_limit=current_limit,
+                    label="DC live setpoint preflight")
+                if not ok:
+                    return False, msg
             self._log_scpi_sequence("DC live setpoint update", [setpoint_cmd])
             ok, msg = self.kepco.send_sequence(
-                [setpoint_cmd], label="DC live setpoint update")
+                [setpoint_cmd, "*WAI"], label="DC live setpoint update")
             if not ok:
                 return False, msg
         else:
-            ok, msg = self._safe_prepare_output(
+            ok, msg = self._ensure_dc_configuration(
                 mode,
-                initial_setpoint=0.0,
-                voltage_compliance=voltage_compliance,
-                current_limit=current_limit,
+                voltage_compliance,
+                current_limit,
                 label="DC fixed-output safe prepare")
             if not ok:
                 return False, msg
-            if self.current_output_on:
-                self._log_scpi_sequence(
-                    "DC live handoff setpoint update", [setpoint_cmd])
-                ok, msg = self.kepco.send_sequence(
-                    [setpoint_cmd], label="DC live handoff setpoint update")
-                if not ok:
-                    return False, msg
 
         self._call_on_ui(lambda: self.progress.set(1.0))
         unit = "V" if mode == "VOLT" else "A"
         if live_dc_update:
             return True, f"DC setpoint updated live to {value:.4f} {unit}"
-        if self.current_output_on:
-            return True, f"DC setpoint applied live at {value:.4f} {unit}"
         return True, f"DC setpoint staged at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
@@ -3568,7 +4685,8 @@ class DashboardApp:
             return True, f"{msg}; continuing streamed execution without toggling output", True
         return True, f"{msg}; remaining {len(chunks) - 1} chunk(s) staged for output-on streaming", False
 
-    def _upload_request_done(self, req, ok, msg, start_sequence):
+    def _upload_request_done(self, req, ok, msg, start_sequence,
+                             postflight_snapshot=None):
         self._upload_in_flight = False
         prev_req = self.uploaded_request or {}
         self.uploaded_request = req if ok else self.uploaded_request
@@ -3607,18 +4725,22 @@ class DashboardApp:
             self.log(f"Upload failed: {msg}", "err")
             self.progress.set(0)
             self.prog_lbl.configure(text="Upload failed")
-            if not self.kepco.connected:
+            if not self.kepco.is_verified:
                 self._handle_comm_failure("upload")
 
         self.is_running = False
-        self._resume_status_polling()
+        if req["kind"] != "DC":
+            self._resume_status_polling()
+        elif ok:
+            self._resume_after_dc_postflight(postflight_snapshot)
+        else:
+            self._resume_or_handle_transaction_failure("upload")
         self._update_output_controls()
-        self._schedule_status_poll(100)
 
     def _begin_uploaded_sequence(self, req, output_already_on=False, skip_first_upload=False):
         """Begin background streaming for a staged multi-chunk LIST waveform."""
-        if not self.kepco.connected:
-            return False, "Connect to a device first."
+        if not self.kepco.is_verified:
+            return False, "Device state is not verified."
         if self.sequence_active:
             return False, "A streamed waveform is already active."
 
@@ -3647,7 +4769,6 @@ class DashboardApp:
         forever = req["loop"] == 0
         iteration = 0
         try:
-            self._wait_for_status_poll_idle()
             chunks = [
                 req["points"][i:i + MAX_LIST_POINTS]
                 for i in range(0, len(req["points"]), MAX_LIST_POINTS)
@@ -3698,7 +4819,7 @@ class DashboardApp:
                         enable_output=enable_output,
                         voltage_compliance=voltage_compliance,
                         current_limit=current_limit,
-                        apply_limit_setup=enable_output)
+                        apply_limit_setup=False)
                     if not ok:
                         final_msg = f"Chunk {chunk_idx + 1} run failed: {msg}"
                         break
@@ -3763,12 +4884,11 @@ class DashboardApp:
             self.log("Waveform stream stopped." if stopped else msg, "ok")
         else:
             self.log(msg, "err")
-            if not self.kepco.connected:
+            if not self.kepco.is_verified:
                 self._handle_comm_failure("waveform streaming")
 
         self._resume_status_polling()
         self._update_output_controls()
-        self._schedule_status_poll(100)
 
     # -- Output control ------------------------------------------------------
     # The Output button is a router: DC uses fixed setpoint commands, single
@@ -3781,9 +4901,9 @@ class DashboardApp:
         target_on = not self.current_output_on
         req = self.uploaded_request
 
-        if not self.kepco.connected:
-            self._set_output_ui_state(False)
-            self.log("Not connected - connect first.", "warn")
+        if not self.kepco.is_verified:
+            self._set_output_ui_state(None)
+            self.log("Device state is not verified; output control is locked.", "warn")
             return
         if target_on and not self.uploaded_waveform_ready:
             self._set_output_ui_state(False)
@@ -3822,25 +4942,42 @@ class DashboardApp:
             daemon=True).start()
 
     def _enable_dc_output(self, req):
-        """Enable output for a DC request after zeroed safe preparation."""
+        """Enable a previously staged DC request without reconfiguring it."""
         mode = req["mode"]
         value = req["amplitude"]
         voltage_compliance, current_limit = self._get_request_limits(req)
-        ok, msg = self._safe_prepare_output(
+        ok, msg = self.kepco.verify_programmed_configuration(
             mode,
-            initial_setpoint=0.0,
             voltage_compliance=voltage_compliance,
             current_limit=current_limit,
-            label="DC safe setup before OUTP ON")
+            expected_setpoint=0.0,
+            label="DC output enable staged-state check")
         if not ok:
             return False, msg
 
-        setpoint_cmd = (
-            f"{mode} {KepcoController.format_scpi_value(value)}")
-        cmds = ["OUTP ON", setpoint_cmd]
-        self._log_scpi_sequence("DC enable and apply setpoint", cmds)
+        # The manual initializes the active parameter at zero with its
+        # complementary limit, then changes only the active parameter. Program
+        # and verify the requested value while output is still OFF before the
+        # one OUTP ON transition.
+        setpoint_cmd = f"{mode} {KepcoController.format_scpi_value(value)}"
+        cmds = [setpoint_cmd, "*WAI"]
+        self._log_scpi_sequence("DC apply staged setpoint", cmds)
         ok, msg = self.kepco.send_sequence(
-            cmds, label="DC enable and apply setpoint")
+            cmds, label="DC apply staged setpoint")
+        if not ok:
+            return False, msg
+        ok, msg = self.kepco.verify_programmed_configuration(
+            mode,
+            voltage_compliance=voltage_compliance,
+            current_limit=current_limit,
+            expected_setpoint=value,
+            label="DC programmed setpoint check")
+        if not ok:
+            return False, msg
+
+        self._log_scpi_sequence("DC output enable", ["OUTP ON", "*WAI"])
+        ok, msg = self.kepco.send_sequence(
+            ["OUTP ON", "*WAI"], label="DC output enable")
         if not ok:
             return False, msg
         unit = "V" if mode == "VOLT" else "A"
@@ -3848,33 +4985,61 @@ class DashboardApp:
 
     def _output_toggle_worker(self, target_on, req):
         """Apply one output transition on a worker thread."""
+        postflight_snapshot = None
+        dc_transaction = bool(
+            (target_on and req and req.get("kind") == "DC")
+            or (not target_on and (not req or req.get("kind") == "DC")))
         try:
-            self._wait_for_status_poll_idle()
-            mode = (req or {}).get("mode") or self.current_control_mode
-            if target_on:
-                if req["kind"] == "DC":
-                    ok, msg = self._enable_dc_output(req)
-                else:
+            def output_transaction():
+                mode = (req or {}).get("mode") or self.current_control_mode
+                if dc_transaction:
+                    def dc_output_operation():
+                        if target_on:
+                            return self._enable_dc_output(req)
+                        return self.kepco.send_sequence(
+                            [
+                                "OUTP OFF",
+                                f"{mode} 0",
+                                "*WAI",
+                            ],
+                            label="DC output disable")
+
+                    return self._run_dc_transaction(
+                        dc_output_operation,
+                        "DC output enable" if target_on else "DC output disable",
+                        expected_mode=mode,
+                        expected_output=target_on)
+                if target_on:
                     count = 0 if req["loop"] == 0 else max(req["loop"], 1)
                     voltage_compliance, current_limit = self._get_request_limits(req)
-                    ok, msg = self.kepco.run_list(
+                    list_ok, list_msg = self.kepco.run_list(
                         mode,
                         count=count,
                         enable_output=True,
                         voltage_compliance=voltage_compliance,
-                        current_limit=current_limit)
-            else:
+                        current_limit=current_limit,
+                        apply_limit_setup=False)
+                    return list_ok, list_msg, None
                 if req and req["kind"] == "LIST":
-                    ok, msg = self.kepco.stop(base_mode=mode)
-                else:
-                    ok = bool(self.kepco.send("OUTP OFF"))
-                    msg = "Output OFF" if ok else "Failed to turn output OFF"
+                    list_ok, list_msg = self.kepco.stop(base_mode=mode)
+                    return list_ok, list_msg, None
+                sent = bool(self.kepco.send("OUTP OFF"))
+                return (
+                    sent,
+                    "Output OFF" if sent else "Failed to turn output OFF",
+                    None)
+
+            ok, msg, postflight_snapshot = self.kepco.run_transaction(
+                output_transaction)
         except Exception as exc:
             ok = False
             msg = str(exc)
-        self._call_on_ui(lambda: self._output_toggle_done(target_on, ok, msg))
+        self._call_on_ui(
+            lambda: self._output_toggle_done(
+                target_on, ok, msg, dc_transaction, postflight_snapshot))
 
-    def _output_toggle_done(self, target_on, ok, msg):
+    def _output_toggle_done(self, target_on, ok, msg, dc_transaction=False,
+                            postflight_snapshot=None):
         self._output_toggle_in_flight = False
         if ok:
             self._set_output_ui_state(target_on)
@@ -3884,25 +5049,38 @@ class DashboardApp:
             else:
                 self.prog_lbl.configure(text="Idle")
                 self.progress.set(0)
-            self._resume_status_polling()
+            if dc_transaction:
+                self._resume_after_dc_postflight(postflight_snapshot)
+            else:
+                self._resume_status_polling()
             self._update_output_controls()
-            self._schedule_status_poll(100)
             return
-        self._set_output_ui_state(not target_on)
+        # A command may have reached the device even when its postflight
+        # verification failed. Never infer the physical state from the
+        # requested transition; the immediate resumed snapshot will reconcile it.
+        self._set_output_ui_state(None)
         self.log(msg, "err")
-        self._resume_status_polling()
         self._update_output_controls()
-        if not self.kepco.connected:
-            self._handle_comm_failure("output toggle")
+        self._resume_or_handle_transaction_failure("output toggle")
 
     # -- Discovery and connection lifecycle ----------------------------------
     # Network scan, connect, disconnect, and application close all end by
     # reconciling local UI state with the controller's connection state.
     def _start_scan(self):
+        if self._scan_in_flight:
+            return
+        if self.kepco.is_transport_connected or self._connect_in_flight:
+            messagebox.showwarning(
+                "Connection Active",
+                "Disconnect before scanning. A scan can open another socket "
+                "to the Kepco and disrupt the active control session.")
+            return
+        self._scan_in_flight = True
         self.scan_btn.configure(state="disabled", text="Scanning...")
+        self.conn_btn.configure(state="disabled")
         self.log(
             "Scanning local subnet for Kepco devices "
-            "(Telnet 5024 first, fallback 5025)...",
+            "(raw SCPI 5025 first, Telnet 5024 fallback)...",
             "info")
         ip = self.ip_var.get().strip()
         base = ".".join(ip.split(".")[:3]) + ".0" if ip else "192.168.50.0"
@@ -3919,7 +5097,9 @@ class DashboardApp:
             daemon=True).start()
 
     def _scan_done(self, results):
+        self._scan_in_flight = False
         self.scan_btn.configure(state="normal", text="Scan Network")
+        self.conn_btn.configure(state="normal")
         self.progress.set(0)
         if results:
             ips = [ip for ip, _idn in results]
@@ -3932,38 +5112,97 @@ class DashboardApp:
             self.log("Network scan complete: 0 devices found", "warn")
 
     def _toggle_connect(self):
-        if self._connect_in_flight:
+        if self._connect_in_flight or self._scan_in_flight:
             return
 
-        if not self.kepco.connected:
+        if (self.kepco.comm_state is CommState.DEGRADED
+                and self.kepco.is_transport_connected):
+            self.log("Controlled communication recovery requested", "warn")
+            self._connect_in_flight = True
+            self._pause_status_polling()
+            self.scan_btn.configure(state="disabled")
+            self.conn_btn.configure(state="disabled", text="Recovering...")
+            threading.Thread(target=self._recover_worker, daemon=True).start()
+            return
+
+        if not self.kepco.is_transport_connected:
             ip = self.ip_var.get().strip()
             self.log(f"Connect requested for {ip}", "info")
             self._connect_in_flight = True
+            self.scan_btn.configure(state="disabled")
             self.conn_btn.configure(state="disabled", text="Connecting...")
             threading.Thread(target=self._connect_worker, args=(ip,), daemon=True).start()
         else:
-            if self.sequence_active or self._upload_in_flight:
+            if (self.sequence_active or self._upload_in_flight
+                    or self._output_toggle_in_flight):
                 messagebox.showwarning(
                     "Waveform Busy",
-                    "Wait for the active upload/stream to finish before disconnecting.")
+                    "Wait for the active output transaction, upload, or stream "
+                    "to finish before disconnecting.")
                 return
             self.log("Disconnect requested", "info")
             self._connect_in_flight = True
+            self._pause_status_polling()
             self.conn_btn.configure(state="disabled", text="Disconnecting...")
             threading.Thread(target=self._disconnect_worker, daemon=True).start()
 
     def _connect_worker(self, ip):
-        """Connect and validate identity away from the Tk event loop."""
-        ok, msg = self.kepco.connect(ip, validate_identity=True)
-        idn = self.kepco.last_identity or None
+        """Connect, then verify a complete device state off the Tk event loop."""
+        def connect_transaction():
+            ok, msg = self.kepco.connect(ip, validate_identity=True)
+            if ok:
+                self._call_on_ui(self._show_verifying_device_state)
+                self._log_safe(
+                    "Socket and identity available; verifying device state...",
+                    "info")
+                ok, verify_msg = self.kepco.verify_device_state()
+                msg = (
+                    "Verified device state" if ok else
+                    f"Device verification failed: {verify_msg}")
+                if not ok:
+                    self.kepco.fault(msg)
+            return ok, msg, self.kepco.last_identity or None
+
+        ok, msg, idn = self.kepco.run_transaction(connect_transaction)
         self._call_on_ui(lambda: self._connect_done(ok, msg, ip, idn))
+
+    def _recover_worker(self):
+        """Attempt a fresh socket plus full verification after degradation."""
+        ip = self.kepco.ip
+
+        def recovery_transaction():
+            ok, _ = self.kepco.connect(ip, validate_identity=True)
+            if ok:
+                self._call_on_ui(self._show_verifying_device_state)
+                ok, reason = self.kepco.verify_device_state()
+            else:
+                reason = self.kepco.last_error or "transport reconnect failed"
+            if not ok:
+                self.kepco.fault(f"Automatic recovery failed: {reason}")
+            msg = (
+                "Recovery verified device state" if ok else
+                self.kepco.last_error)
+            return ok, msg, self.kepco.ip, self.kepco.last_identity or None
+
+        ok, msg, connected_ip, idn = self.kepco.run_transaction(
+            recovery_transaction)
+        self._call_on_ui(
+            lambda: self._connect_done(ok, msg, connected_ip, idn))
+
+    def _show_verifying_device_state(self):
+        """Keep controls locked while the background health gate is running."""
+        if self.kepco.comm_state is CommState.VERIFYING:
+            self._set_connected_state(self.kepco.last_identity)
 
     def _connect_done(self, ok, msg, ip, idn):
         self._connect_in_flight = False
         self.conn_btn.configure(state="normal")
         if ok:
-            self._set_connected_state(True, idn or "Unknown device")
-            self._reset_live_status()
+            self._set_connected_state(idn or "Unknown device")
+            snapshot = self.kepco.last_verified_state
+            self._reset_live_status(
+                output_state=snapshot.output_on if snapshot else None,
+                control_mode=snapshot.mode if snapshot else None)
             self._reset_uploaded_state()
             self.log(
                 f"Connected to {ip} via {self.kepco.transport} "
@@ -3971,24 +5210,36 @@ class DashboardApp:
                 "ok")
             self._start_status_polling()
         else:
-            self.kepco.disconnect()
-            self._set_connected_state(False)
-            self._reset_live_status()
+            if self.kepco.is_transport_connected:
+                self.kepco.disconnect()
+            self._set_connected_state()
+            self._reset_live_status(output_state=None)
             self._reset_uploaded_state()
             self.log(f"Connection failed: {msg}", "err")
 
     def _disconnect_worker(self):
         """Verify output is safe before closing the socket."""
-        self._wait_for_status_poll_idle()
-        ok, err_msg = self._safe_output_off_before_disconnect()
-        if ok:
-            self.kepco.disconnect()
-        self._call_on_ui(lambda: self._disconnect_done(ok, err_msg))
+        def disconnect_transaction():
+            if not self.kepco.is_verified:
+                # Do not issue output commands against an untrusted response
+                # stream. Closing the socket leaves physical output unknown.
+                self.kepco.disconnect()
+                return True, "", True
+            ok, err_msg = self._safe_output_off_before_disconnect()
+            if ok:
+                self.kepco.disconnect()
+            return ok, err_msg, False
+
+        ok, err_msg, output_unknown = self.kepco.run_transaction(
+            disconnect_transaction)
+        self._call_on_ui(
+            lambda: self._disconnect_done(
+                ok, err_msg, output_unknown=output_unknown))
 
     def _safe_output_off_before_disconnect(self):
         """Return True only after output OFF and near-zero V/I are verified."""
-        if not self.kepco.connected:
-            return True, ""
+        if not self.kepco.is_verified:
+            return False, "Device state is not verified; output state is unknown"
 
         def _parse_num(raw):
             try:
@@ -3996,7 +5247,9 @@ class DashboardApp:
             except Exception:
                 return None
 
+        snapshot = self.kepco.last_verified_state
         base_mode = (
+            snapshot.mode if snapshot is not None else
             self.uploaded_request["mode"]
             if self.uploaded_request else self.current_control_mode
         )
@@ -4005,22 +5258,29 @@ class DashboardApp:
         # twice, and keep the app connected if readback cannot verify safety.
         for attempt in range(2):
             errors = []
-            ok_stop, stop_msg = self.kepco.stop(base_mode=base_mode)
+            try:
+                ok_stop, stop_msg = self.kepco.stop(base_mode=base_mode)
+            except ConnectionLostError as exc:
+                return False, str(exc)
             if not ok_stop:
                 errors.append(f"stop failed ({stop_msg})")
 
-            for cmd, desc in [
-                ("VOLT 0", "set voltage to 0V"),
-                ("CURR 0", "set current to 0A"),
-                ("OUTP OFF", "turn output OFF"),
-            ]:
-                if not self.kepco.send(cmd):
-                    err = self.kepco.last_error or "send failed"
-                    errors.append(f"could not {desc} ({err})")
+            try:
+                safe_ok, safe_msg = self.kepco.send_sequence(
+                    [f"{base_mode} 0", "*WAI", "OUTP OFF", "*WAI"],
+                    label=f"Disconnect safe-zero ({base_mode})")
+            except ConnectionLostError as exc:
+                return False, str(exc)
+            if not safe_ok:
+                errors.append(safe_msg)
+                return False, "; ".join(errors)
 
-            outp = (self.kepco.send("OUTP?", query=True) or "").strip().upper()
-            v = _parse_num(self.kepco.send("VOLT?", query=True))
-            c = _parse_num(self.kepco.send("CURR?", query=True))
+            try:
+                outp = (self.kepco.send("OUTP?", query=True) or "").strip().upper()
+                v = _parse_num(self.kepco.send("MEAS:VOLT?", query=True))
+                c = _parse_num(self.kepco.send("MEAS:CURR?", query=True))
+            except ConnectionLostError as exc:
+                return False, str(exc)
             outp_ok = outp in ("0", "OFF")
             zero_ok = (
                 v is not None and c is not None
@@ -4031,7 +5291,8 @@ class DashboardApp:
                 return True, ""
 
             errors.append(
-                f"verification failed (OUTP?='{outp}', VOLT?='{v}', CURR?='{c}')")
+                f"verification failed (OUTP?='{outp}', "
+                f"MEAS:VOLT?='{v}', MEAS:CURR?='{c}')")
             if attempt == 0:
                 time.sleep(0.1)
             else:
@@ -4039,25 +5300,29 @@ class DashboardApp:
 
         return False, "safety verification failed"
 
-    def _disconnect_done(self, ok, err_msg):
+    def _disconnect_done(self, ok, err_msg, output_unknown=False):
         self._connect_in_flight = False
         self.conn_btn.configure(state="normal")
         if not ok:
-            self._set_connected_state(True, self.idn_lbl.cget("text"))
-            self.log(f"Disconnect blocked by safety interlock: {err_msg}", "err")
+            self._set_connected_state(self.idn_lbl.cget("text"))
+            self._reset_live_status(output_state=None)
+            self.log(
+                f"Disconnect blocked by safety interlock: {err_msg}",
+                "critical")
             messagebox.showerror(
                 "Safety Interlock",
                 "Disconnect blocked.\n"
                 "Output could not be verified OFF at 0V/0A.\n"
                 f"Details: {err_msg}")
+            self._resume_or_handle_transaction_failure("disconnect safety check")
             return
 
         self._stop_status_polling()
         self.stop_event.set()
         self.sequence_active = False
         self.is_running = False
-        self._set_connected_state(False)
-        self._reset_live_status()
+        self._set_connected_state()
+        self._reset_live_status(output_state=None if output_unknown else False)
         self._reset_uploaded_state()
         self.log("Disconnected.", "info")
 
@@ -4066,23 +5331,40 @@ class DashboardApp:
     # down polling, data collection, session logging, and queued UI callbacks.
     def _on_close(self):
         self.stop_event.set()
-        if self.kepco.connected:
+        self._pause_status_polling()
+
+        def close_transaction():
+            # Check transport state only after all earlier queue entries have
+            # completed. This also covers a Connect worker that was launched
+            # just before the operator closed the application.
+            if not self.kepco.is_transport_connected:
+                return True, ""
             ok, err_msg = self._safe_output_off_before_disconnect()
-            if not ok:
-                self.log(f"Close blocked by safety interlock: {err_msg}", "err")
-                messagebox.showerror(
-                    "Safety Interlock",
-                    "Close blocked.\n"
-                    "Output could not be verified OFF at 0V/0A.\n"
-                    f"Details: {err_msg}")
-                return
-            self.kepco.disconnect()
+            if ok:
+                self.kepco.disconnect()
+            return ok, err_msg
+
+        ok, err_msg = self.kepco.run_transaction(close_transaction)
+        if not ok:
+            self._set_connected_state(self.kepco.last_identity)
+            self._reset_live_status(output_state=None)
+            self.log(
+                f"Close blocked by safety interlock: {err_msg}",
+                "critical")
+            messagebox.showerror(
+                "Safety Interlock",
+                "Close blocked.\n"
+                "Output could not be verified OFF at 0V/0A.\n"
+                f"Details: {err_msg}")
+            self._resume_or_handle_transaction_failure("close safety check")
+            return
         self._stop_status_polling()
         self._stop_solenoid_temperature_polling()
         self._stop_data_collection()
         self.log("Application closed.", "info")
         self._close_log_file()
         self._stop_ui_dispatcher()
+        self.kepco.shutdown_socket_worker()
         self.root.destroy()
 
     def run(self):
