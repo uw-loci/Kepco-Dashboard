@@ -187,6 +187,14 @@ def validate_operation_complete(raw):
     return True
 
 
+def validate_remote_mode(raw):
+    """Validate the BIT Telnet remote-mode query defined as `0` or `1`."""
+    value = str(raw).strip()
+    if value not in {"0", "1"}:
+        raise ProtocolError(f"Invalid SYST:REM? response: {raw!r}")
+    return value == "1"
+
+
 # -- Material colour palette -------------------------------------------------
 C = dict(
     bg="#121212", surface="#1e1e2e", card="#2a2a3c",
@@ -601,7 +609,7 @@ class KepcoController:
                     raise ConnectionError("Connection closed by peer")
                 self._append_received(data)
                 return True
-            except (socket.timeout, OSError):
+            except (socket.timeout, BlockingIOError):
                 return False
         finally:
             try:
@@ -686,7 +694,7 @@ class KepcoController:
         self._dbg("warn", self.last_error)
         raise ConnectionLostError(self.last_error)
 
-    def send_cmd(self, cmd):
+    def send_cmd(self, cmd, allow_unverified=False):
         """Send a non-query SCPI command with mandatory pacing.
 
         The SCPI_CMD_GAP sleep runs on the socket-owner thread so another
@@ -696,8 +704,9 @@ class KepcoController:
         deadlock the card).  Returns True / None.
         """
         if not self._is_socket_worker():
-            return self.run_transaction(self.send_cmd, cmd)
-        self._ensure_verified_for_io()
+            return self.run_transaction(
+                self.send_cmd, cmd, allow_unverified=allow_unverified)
+        self._ensure_verified_for_io(allow_unverified=allow_unverified)
         with self._lock:
             try:
                 self._dbg("info", f"TX CMD: {cmd}")
@@ -1224,6 +1233,35 @@ class KepcoController:
     def identity(self):
         return self.send_query("*IDN?", allow_unverified=True)
 
+    def _ensure_telnet_remote_control(self):
+        """Enter and verify remote mode before trusting a Telnet session."""
+        if self.port != TELNET_PORT:
+            return True
+
+        remote_resp = self.send_query("SYST:REM?", allow_unverified=True)
+        if remote_resp is None:
+            raise ConnectionLostError(
+                self.last_error or "No response to 'SYST:REM?'")
+        if validate_remote_mode(remote_resp):
+            self._dbg("ok", "Telnet remote mode already enabled")
+            return True
+
+        self._dbg("info", "Enabling Telnet remote mode")
+        if self.send_cmd("SYST:REM 1", allow_unverified=True) is None:
+            raise ConnectionLostError(
+                self.last_error or "Failed to send 'SYST:REM 1'")
+
+        remote_resp = self.send_query("SYST:REM?", allow_unverified=True)
+        if remote_resp is None:
+            raise ConnectionLostError(
+                self.last_error or "No response verifying Telnet remote mode")
+        if not validate_remote_mode(remote_resp):
+            raise ProtocolError(
+                "Telnet remote-mode verification failed: "
+                f"SYST:REM? returned {remote_resp!r}")
+        self._dbg("ok", "Telnet remote mode enabled and verified")
+        return True
+
     def read_status_snapshot(self, allow_unverified=False):
         """Read one status snapshot, aborting before any later query on failure."""
         if not self._is_socket_worker():
@@ -1269,6 +1307,7 @@ class KepcoController:
         try:
             identity = validate_identity(self.identity())
             self.last_identity = identity
+            self._ensure_telnet_remote_control()
             opc = self.send_query("*OPC?", allow_unverified=True)
             validate_operation_complete(opc)
         except (ProtocolError, ConnectionLostError) as exc:
@@ -1302,9 +1341,12 @@ class KepcoController:
         snapshot = snapshots[-1]
         self.last_verified_state = snapshot
         self.last_error = ""
+        gate_summary = "*IDN?, *OPC?"
+        if self.port == TELNET_PORT:
+            gate_summary = "*IDN?, Telnet remote mode, *OPC?"
         self._set_comm_state(
             CommState.HEALTHY,
-            f"*IDN?, *OPC?, and {VERIFY_SNAPSHOT_COUNT} stable snapshots verified")
+            f"{gate_summary}, and {VERIFY_SNAPSHOT_COUNT} stable snapshots verified")
         self._dbg(
             "ok",
             "Device health verified: "
