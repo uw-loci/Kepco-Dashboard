@@ -225,8 +225,8 @@ class KepcoController:
         query, command, recovery, and disconnect operation enters its queue.
       - Multi-command operations re-enter directly from the owner thread, so
         status snapshots and other transactions remain indivisible.
-      - Every non-query command sleeps SCPI_CMD_GAP (35 ms) on the owner
-        thread so no other operation can violate the pacing constraint.
+      - Every command and query uses one owner-thread transmit throttle so
+        consecutive SCPI messages are separated by SCPI_CMD_GAP (35 ms).
       - *OPC? sync is used only at key checkpoints (after LIST:CLE, after
         all values sent, after DWEL) - NOT after every single LIST:VOLT.
       - Post-upload, LIST:{mode}:POIN? verifies the card accepted all
@@ -245,6 +245,7 @@ class KepcoController:
         self._recv_buffer = b""
         self._telnet_iac_pending = b""
         self._last_receive_issue = ""
+        self._last_tx_time = None
         # The lock remains as a defensive invariant for nested controller
         # methods. Actual cross-thread serialization happens through the sole
         # socket-owner queue below.
@@ -359,6 +360,7 @@ class KepcoController:
         self._recv_buffer = b""
         self._telnet_iac_pending = b""
         self._last_receive_issue = ""
+        self._last_tx_time = None
 
     def mark_degraded(self, reason):
         """Revoke permission to control an untrusted SCPI session."""
@@ -694,14 +696,28 @@ class KepcoController:
         self._dbg("warn", self.last_error)
         raise ConnectionLostError(self.last_error)
 
+    def _wait_for_tx_slot(self):
+        """Wait until the shared command/query transmit interval has elapsed."""
+        last_tx_time = getattr(self, "_last_tx_time", None)
+        if last_tx_time is None:
+            return
+        remaining = SCPI_CMD_GAP - (time.monotonic() - last_tx_time)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _send_scpi_message(self, cmd):
+        """Pace and transmit one SCPI message on the socket-owner thread."""
+        self._wait_for_tx_slot()
+        self.sock.sendall((cmd + "\n").encode("ascii"))
+        self._last_tx_time = time.monotonic()
+
     def send_cmd(self, cmd, allow_unverified=False):
         """Send a non-query SCPI command with mandatory pacing.
 
-        The SCPI_CMD_GAP sleep runs on the socket-owner thread so another
-        transaction cannot send a second command faster than the 25 ms
-        throughput limit. After the gap, we drain the Telnet echo to
-        prevent the card's TCP send-buffer from filling up (which would
-        deadlock the card).  Returns True / None.
+        The shared transmit throttle runs on the socket-owner thread and also
+        covers queries. For Telnet, wait through the same pacing interval
+        before draining the command echo so it has time to arrive. Returns
+        True / None.
         """
         if not self._is_socket_worker():
             return self.run_transaction(
@@ -710,9 +726,9 @@ class KepcoController:
         with self._lock:
             try:
                 self._dbg("info", f"TX CMD: {cmd}")
-                self.sock.sendall((cmd + "\n").encode("ascii"))
-                time.sleep(SCPI_CMD_GAP)
+                self._send_scpi_message(cmd)
                 if self.port == TELNET_PORT:
+                    self._wait_for_tx_slot()
                     self._drain_echo()  # consume Telnet echo
                 return True
             except Exception as e:
@@ -736,7 +752,7 @@ class KepcoController:
         with self._lock:
             try:
                 self._dbg("info", f"TX QRY: {cmd}")
-                self.sock.sendall((cmd + "\n").encode("ascii"))
+                self._send_scpi_message(cmd)
                 resp = self._recv_response(sent_cmd=cmd, timeout=timeout)
                 if resp is None:
                     receive_issue = self._last_receive_issue or "no complete response"
