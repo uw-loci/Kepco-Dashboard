@@ -707,6 +707,27 @@ class KepcoController:
         self.sock.sendall((cmd + "\n").encode("ascii"))
         self._last_tx_time = time.monotonic()
 
+    @staticmethod
+    def _hardware_write_log_message(cmd):
+        """Describe a state-changing SCPI write for the operator audit log."""
+        text = str(cmd or "").strip()
+        upper = text.upper()
+        if not text or upper in ("*WAI", "*OPC"):
+            # Synchronization barriers do not change programmed hardware state
+            # and would obscure the writes that do.
+            return None
+
+        for prefix in ("LIST:VOLT ", "LIST:CURR "):
+            if upper.startswith(prefix):
+                payload = text[len(prefix):]
+                point_count = len(payload.split(",")) if payload else 0
+                channel = prefix.split(":")[1].strip()
+                return (
+                    "KEPCO HW WRITE sent: "
+                    f"{channel} LIST data ({point_count} point(s))")
+
+        return f"KEPCO HW WRITE sent: {text}"
+
     def send_cmd(self, cmd, allow_unverified=False):
         """Send a non-query SCPI command with mandatory pacing.
 
@@ -726,6 +747,9 @@ class KepcoController:
                 if self.port == TELNET_PORT:
                     self._wait_for_tx_slot()
                     self._drain_echo()  # consume Telnet echo
+                hardware_log = self._hardware_write_log_message(cmd)
+                if hardware_log:
+                    self._dbg("ok", hardware_log)
                 return True
             except Exception as e:
                 self.connection_lost(str(e))
@@ -3232,6 +3256,7 @@ class DashboardApp:
         # must not displace operator events in the visible event panel.
         visible = (
             tag in ("err", "critical")
+            or "KEPCO HW WRITE sent:" in msg
             or "advisory BIT error" in msg
             or "despite advisory device error" in msg)
         if threading.current_thread() is threading.main_thread():
@@ -4125,8 +4150,7 @@ class DashboardApp:
         if not self.kepco.is_verified:
             self._commit_dashboard_limit(mode, limit)
             self.log(
-                f"{mode} absolute limit staged locally at {limit:.4f} {unit}; "
-                "connect to send it to the device.",
+                f"{mode} absolute limit staged locally at {limit:.4f} {unit}.",
                 "warn")
             return
 
