@@ -1928,6 +1928,8 @@ class DashboardApp:
         self._ui_shutdown = False
         self._responsive_layout = None
         self._resize_job = None
+        self._log_expanded = False
+        self._expanded_log_height = None
 
         self.vmon_threshold_pct = DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT
         self.imon_threshold_pct = DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT
@@ -1944,6 +1946,8 @@ class DashboardApp:
         if self.log_file_path:
             self.log(f"Session log file: {self.log_file_path}", "info")
         self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.bind(
+            "<Alt-l>", lambda _event: self._toggle_log_expansion(), add="+")
         self._apply_responsive_layout(self.root.winfo_width())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1958,9 +1962,11 @@ class DashboardApp:
             return
         if self._resize_job is not None:
             self.root.after_cancel(self._resize_job)
-        def apply_resize(width=event.width):
+        def apply_resize(width=event.width, height=event.height):
             self._resize_job = None
             self._apply_responsive_layout(width)
+            if self._log_expanded:
+                self._resize_expanded_log(height)
         self._resize_job = self.root.after(
             80, apply_resize)
 
@@ -2095,7 +2101,6 @@ class DashboardApp:
         self.idn_lbl.grid(row=0, column=5, sticky="e", padx=(6, 10), pady=6)
 
         self.main = ctk.CTkFrame(self.root, corner_radius=12)
-        self.main.pack(fill="both", expand=True, padx=6, pady=3)
         self.main.grid_columnconfigure(0, weight=11, uniform="main_columns")
         self.main.grid_columnconfigure(1, weight=9, uniform="main_columns")
         self.main.grid_rowconfigure(0, weight=1)
@@ -2119,13 +2124,79 @@ class DashboardApp:
         right.grid_columnconfigure(0, weight=1)
         self._build_status_panel(right)
 
-        log_wrap = ctk.CTkFrame(self.root, corner_radius=10)
-        log_wrap.pack(fill="both", padx=6, pady=(0, 6))
+        self.log_wrap = ctk.CTkFrame(self.root, corner_radius=10)
+        # Reserve the log's requested height before the expanding main panel.
+        # This lets an expanded log crop/condense graph content instead of
+        # being constrained by the graphs' requested canvas heights.
+        self.log_wrap.pack(
+            side="bottom", fill="x", padx=6, pady=(0, 6))
+        log_header = ctk.CTkFrame(self.log_wrap, fg_color="transparent")
+        log_header.pack(fill="x", padx=6, pady=(4, 0))
+        ctk.CTkLabel(
+            log_header,
+            text="Event Log",
+            font=ctk.CTkFont(size=12, weight="bold")).pack(
+            side="left", padx=(2, 0))
+        self.log_toggle_btn = ctk.CTkButton(
+            log_header,
+            text="Expand Log",
+            width=96,
+            height=24,
+            command=self._toggle_log_expansion,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            font=ctk.CTkFont(size=11))
+        self.log_toggle_btn.pack(side="right")
         self.log_text = ctk.CTkTextbox(
-            log_wrap, height=66,
+            self.log_wrap, height=66,
             font=ctk.CTkFont(family="Consolas", size=10),
             activate_scrollbars=True)
         self.log_text.pack(fill="both", padx=5, pady=5, expand=True)
+        self.main.pack(
+            side="top", fill="both", expand=True, padx=6, pady=3)
+
+    @staticmethod
+    def _expanded_log_target_height(window_height):
+        """Use about 18% of the window while retaining the main dashboard."""
+        return max(150, min(300, int(float(window_height) * 0.18)))
+
+    def _resize_expanded_log(self, window_height=None):
+        if not self._log_expanded or not hasattr(self, "log_text"):
+            return
+        if window_height is None:
+            window_height = self.root.winfo_height()
+        target = self._expanded_log_target_height(window_height)
+        if target == self._expanded_log_height:
+            return
+        self._expanded_log_height = target
+        self.log_text.configure(height=target)
+
+    def _set_plots_condensed_for_log(self, condensed):
+        """Reduce graph height requests so the expanded log gets its space."""
+        heights = {
+            "preview_canvas": 80 if condensed else 205,
+            "status_canvas": 70 if condensed else 145,
+        }
+        for canvas_name, height in heights.items():
+            canvas = getattr(self, canvas_name, None)
+            if canvas is not None:
+                canvas.get_tk_widget().configure(height=height)
+
+    def _set_log_expanded(self, expanded):
+        self._log_expanded = bool(expanded)
+        if self._log_expanded:
+            self._set_plots_condensed_for_log(True)
+            self._expanded_log_height = None
+            self._resize_expanded_log()
+            self.log_toggle_btn.configure(text="Collapse Log")
+        else:
+            self._expanded_log_height = None
+            self.log_text.configure(height=66)
+            self._set_plots_condensed_for_log(False)
+            self.log_toggle_btn.configure(text="Expand Log")
+
+    def _toggle_log_expansion(self):
+        self._set_log_expanded(not self._log_expanded)
 
     def _build_waveform_tab(self, parent):
         outer = ctk.CTkFrame(parent, fg_color="transparent")

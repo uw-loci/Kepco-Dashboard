@@ -115,6 +115,13 @@ The status panel also shows the latest solenoid 1 and solenoid 2 temperatures re
 
 The newest valid JSONL status entry is used. If the file cannot be found, cannot be parsed, or no longer updates, the live console shows a WebMonitor warning. WebMonitor values are polled every `3 s`; values older than `10 s` are marked stale.
 
+The on-screen **Event Log** starts at a compact height. Use **Expand Log**
+or press `Alt+L` to enlarge it vertically; the expanded height follows the
+window size. While expanded, the preview and active/uploaded waveform graphs
+are condensed so the log receives its requested space on low-resolution
+displays. Use **Collapse Log** or `Alt+L` again to restore the compact log and
+normal graph sizes.
+
 ## DC Current Monitoring
 
 The **DC Monitor Thresholds** controls set percentage tolerances for the DC current monitor. Their dark read-only boxes show the committed symmetric tolerances as `+/-value`; each vertically stacked threshold has its own pending entry and **Set** button. The default voltage and current tolerances are both `5%`.
