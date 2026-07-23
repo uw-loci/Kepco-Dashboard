@@ -222,8 +222,9 @@ class KepcoController:
         status snapshots and other transactions remain indivisible.
       - Every command and query uses one owner-thread transmit throttle so
         consecutive SCPI messages are separated by SCPI_CMD_GAP (35 ms).
-      - *OPC? sync is used only at key checkpoints (after LIST:CLE, after
-        all values sent, after DWEL) - NOT after every single LIST:VOLT.
+      - LIST programming uses *WAI barriers at the manual-derived checkpoints
+        (after LIST:CLE, after all values are sent, and after DWEL). *OPC? is
+        reserved for the connection health gate.
       - Post-upload, LIST:{mode}:POIN? verifies the card accepted all
         points, and SYST:ERR? drains any queued errors.
     """
@@ -1683,7 +1684,7 @@ class KepcoController:
                 return False, str(e)
 
     def stop(self, base_mode="VOLT"):
-        """Stop LIST, return to safe fixed-output state."""
+        """Stop LIST and return only after output OFF is authoritative."""
         if not self._is_socket_worker():
             return self.run_transaction(self.stop, base_mode=base_mode)
         base_mode = (base_mode or "VOLT").upper()
@@ -1697,13 +1698,36 @@ class KepcoController:
                 ok, msg = self.disarm_active_list_mode()
                 if not ok:
                     return False, msg
-                if self.send_cmd("OUTP OFF") is None:
-                    return False, f"Stop 'OUTP OFF' failed: {self.last_error}"
+                ok, msg = self.send_sequence(
+                    ["OUTP OFF", "*WAI"], label="LIST output disable")
+                if not ok:
+                    return False, msg
+
+                # Socket delivery is not proof that the BIT accepted OUTP OFF.
+                # Query immediately after the manual-required wait barrier,
+                # before any later mode normalization can obscure which step
+                # failed. A missing or malformed reply revokes communication
+                # trust; a valid ON reply leaves the session usable but makes
+                # the requested stop fail.
+                outp_resp = self.send_query("OUTP?")
+                if outp_resp is None:
+                    return False, (
+                        "Stop verification failed: OUTP? unavailable; "
+                        "physical output state is unknown")
+                try:
+                    output_on = validate_output(outp_resp)
+                except ProtocolError as exc:
+                    return self._reject_invalid_response(
+                        f"Stop verification failed: {exc}")
+                if output_on:
+                    return False, (
+                        "Stop verification failed: OUTP? reports output ON")
+
                 ok, msg = self.select_fixed_mode(
                     base_mode, label=f"Stop fixed-mode setup ({base_mode})")
                 if not ok:
                     return False, msg
-                return True, "Stopped"
+                return True, "Output OFF verified; LIST stopped"
             except Exception as e:
                 return False, str(e)
 
@@ -1882,6 +1906,9 @@ class DashboardApp:
         self._connect_in_flight = False
         self._upload_in_flight = False
         self._output_toggle_in_flight = False
+        self._manual_operation_in_flight = False
+        self._manual_operation_label = ""
+        self._manual_device_controls = []
         self._status_poll_enabled = False
         self._status_poll_paused = False
         self._status_poll_in_flight = False
@@ -2390,10 +2417,11 @@ class DashboardApp:
             height=24, font=ctk.CTkFont(family="Consolas", size=10))
         self.scpi_entry.pack(side="left", fill="x", expand=True, padx=4)
         self.scpi_entry.bind("<Return>", lambda _e: self._man_send_scpi())
-        ctk.CTkButton(
+        self.man_scpi_send_btn = ctk.CTkButton(
             scpi_row, text="Send", width=54, height=24, command=self._man_send_scpi,
-            fg_color=C["primary"], hover_color=C["primary_h"]).pack(
-            side="left", padx=4)
+            fg_color=C["primary"], hover_color=C["primary_h"])
+        self.man_scpi_send_btn.pack(side="left", padx=4)
+        self._manual_device_controls.append(self.man_scpi_send_btn)
 
         quick_row = ctk.CTkFrame(console, fg_color="transparent")
         quick_row.pack(fill="x", padx=8, pady=(0, 2))
@@ -2404,11 +2432,12 @@ class DashboardApp:
             ("MEAS:VOLT?", "MEAS:VOLT?"),
             ("MEAS:CURR?", "MEAS:CURR?"),
         ]:
-            ctk.CTkButton(
+            btn = ctk.CTkButton(
                 quick_row, text=label, width=76, height=22,
                 command=lambda c=cmd: self._man_send_preset(c),
-                fg_color="#374151", hover_color="#4b5563").pack(
-                side="left", padx=(0, 4))
+                fg_color="#374151", hover_color="#4b5563")
+            btn.pack(side="left", padx=(0, 4))
+            self._manual_device_controls.append(btn)
 
         quick_row2 = ctk.CTkFrame(console, fg_color="transparent")
         quick_row2.pack(fill="x", padx=8, pady=(0, 2))
@@ -2418,19 +2447,21 @@ class DashboardApp:
             ("LIST:VOLT:POIN?", "LIST:VOLT:POIN?"),
             ("LIST:CURR:POIN?", "LIST:CURR:POIN?"),
         ]:
-            ctk.CTkButton(
+            btn = ctk.CTkButton(
                 quick_row2, text=label, width=94, height=22,
                 command=lambda c=cmd: self._man_send_preset(c),
-                fg_color="#374151", hover_color="#4b5563").pack(
-                side="left", padx=(0, 4))
+                fg_color="#374151", hover_color="#4b5563")
+            btn.pack(side="left", padx=(0, 4))
+            self._manual_device_controls.append(btn)
 
         scpi_ctrl = ctk.CTkFrame(console, fg_color="transparent")
         scpi_ctrl.pack(fill="x", padx=8, pady=(0, 2))
-        ctk.CTkButton(
+        self.man_health_btn = ctk.CTkButton(
             scpi_ctrl, text="Health Check", width=90, height=22,
             command=self._man_health_check,
-            fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(0, 5))
+            fg_color="#374151", hover_color="#4b5563")
+        self.man_health_btn.pack(side="left", padx=(0, 5))
+        self._manual_device_controls.append(self.man_health_btn)
         ctk.CTkButton(
             scpi_ctrl, text="Clear Console", width=90, height=22,
             command=self._man_clear_scpi,
@@ -2471,6 +2502,7 @@ class DashboardApp:
                 command=lambda m=mode: self._select_control_mode(m))
             btn.pack(side="left", padx=(0, 6))
             self.mode_buttons[mode] = btn
+            self._manual_device_controls.append(btn)
         ctk.CTkLabel(
             mode_card, text="Waveform uploads use the selected mode.",
             text_color=C["text2"], font=ctk.CTkFont(size=12),
@@ -2506,10 +2538,12 @@ class DashboardApp:
             v_ctrl, width=62, height=24, font=ctk.CTkFont(size=12))
         self.soft_volt_limit_entry.insert(0, str(DEFAULT_VOLTAGE_LIMIT))
         self.soft_volt_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(
+        self.soft_volt_limit_set_btn = ctk.CTkButton(
             v_ctrl, text="Set", width=34, height=24,
             command=lambda: self._set_software_limit("VOLT"),
-            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+            fg_color="#374151", hover_color="#4b5563")
+        self.soft_volt_limit_set_btn.pack(side="left")
+        self._manual_device_controls.append(self.soft_volt_limit_set_btn)
 
         c_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         c_row.pack(fill="x", padx=10, pady=(0, 8))
@@ -2533,10 +2567,12 @@ class DashboardApp:
             c_ctrl, width=62, height=24, font=ctk.CTkFont(size=12))
         self.soft_curr_limit_entry.insert(0, str(DEFAULT_CURRENT_LIMIT))
         self.soft_curr_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(
+        self.soft_curr_limit_set_btn = ctk.CTkButton(
             c_ctrl, text="Set", width=34, height=24,
             command=lambda: self._set_software_limit("CURR"),
-            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+            fg_color="#374151", hover_color="#4b5563")
+        self.soft_curr_limit_set_btn.pack(side="left")
+        self._manual_device_controls.append(self.soft_curr_limit_set_btn)
 
         range_card = ctk.CTkFrame(right_controls, corner_radius=12)
         range_card.pack(fill="x")
@@ -2557,18 +2593,21 @@ class DashboardApp:
             values=["Auto", "Full Scale", "Quarter Scale"],
             width=116, height=24, font=ctk.CTkFont(size=12))
         self.man_range_combo.pack(side="left", padx=(0, 6))
-        ctk.CTkButton(
+        self.man_range_set_btn = ctk.CTkButton(
             range_row, text="Set", width=40, height=24,
             command=self._man_set_range,
-            fg_color="#374151", hover_color="#4b5563").pack(side="left")
+            fg_color="#374151", hover_color="#4b5563")
+        self.man_range_set_btn.pack(side="left")
+        self._manual_device_controls.append(self.man_range_set_btn)
         ctk.CTkFrame(range_card, height=2, fg_color=C["border"]).pack(
             fill="x", padx=10, pady=(2, 6))
-        ctk.CTkButton(
+        self.man_reset_btn = ctk.CTkButton(
             range_card, text="Reset Device (*RST)",
             command=self._man_reset,
             fg_color=C["red"], hover_color="#dc2626",
-            height=26, font=ctk.CTkFont(size=12, weight="bold")).pack(
-            fill="x", padx=10, pady=(0, 8))
+            height=26, font=ctk.CTkFont(size=12, weight="bold"))
+        self.man_reset_btn.pack(fill="x", padx=10, pady=(0, 8))
+        self._manual_device_controls.append(self.man_reset_btn)
 
         monitor_card = ctk.CTkFrame(left_controls, corner_radius=12)
         monitor_card.pack(fill="x")
@@ -3245,6 +3284,8 @@ class DashboardApp:
         self._connect_in_flight = False
         self._upload_in_flight = False
         self._output_toggle_in_flight = False
+        self._manual_operation_in_flight = False
+        self._manual_operation_label = ""
         self._set_connected_state()
         self._reset_live_status(output_state=None)
         self._reset_uploaded_state()
@@ -3384,12 +3425,15 @@ class DashboardApp:
             == self.control_mode_var.get().upper())
 
     def _can_toggle_output(self):
-        return self._output_toggle_allowed(
-            self.kepco.is_verified,
-            self._uploaded_waveform_matches_selected_mode(),
-            self.current_output_on,
-            self._upload_in_flight,
-            self._output_toggle_in_flight)
+        return (
+            not getattr(self, "_manual_operation_in_flight", False)
+            and self._output_toggle_allowed(
+                self.kepco.is_verified,
+                self._uploaded_waveform_matches_selected_mode(),
+                self.current_output_on,
+                self._upload_in_flight,
+                self._output_toggle_in_flight)
+        )
 
     def _refresh_output_toggle_button(self, can_toggle=None):
         if can_toggle is None:
@@ -3461,7 +3505,9 @@ class DashboardApp:
         upload_state = "normal" if (
             self.kepco.is_verified
             and isinstance(self.current_output_on, bool)
-            and not self._upload_in_flight) else "disabled"
+            and not self._upload_in_flight
+            and not getattr(
+                self, "_manual_operation_in_flight", False)) else "disabled"
         self.upload_btn.configure(state=upload_state)
 
         can_toggle = self._can_toggle_output()
@@ -3473,6 +3519,8 @@ class DashboardApp:
                 if self.kepco.comm_state in (CommState.DEGRADED, CommState.FAULTED)
                 else "Verify communication with a Kepco before controlling output."
             )
+        elif getattr(self, "_manual_operation_in_flight", False):
+            hint = "Manual device operation in progress..."
         elif self._output_toggle_in_flight:
             hint = "Applying output change..."
         elif self.current_output_on is None:
@@ -3486,6 +3534,28 @@ class DashboardApp:
         else:
             hint = "Output follows the last uploaded waveform."
         self.output_hint_lbl.configure(text=hint)
+        self._update_manual_device_controls()
+
+    def _primary_control_operation_active(self):
+        """Return True while a non-manual workflow owns device semantics."""
+        return any((
+            getattr(self, "_scan_in_flight", False),
+            getattr(self, "_connect_in_flight", False),
+            getattr(self, "_upload_in_flight", False),
+            getattr(self, "_output_toggle_in_flight", False),
+        ))
+
+    def _update_manual_device_controls(self):
+        """Disable manual device actions while any control workflow is active."""
+        busy = (
+            self._primary_control_operation_active()
+            or getattr(self, "_manual_operation_in_flight", False))
+        state = "disabled" if busy else "normal"
+        for widget in getattr(self, "_manual_device_controls", ()):
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
 
     def _update_mode_buttons(self, active_mode):
         for mode, btn in self.mode_buttons.items():
@@ -4052,7 +4122,7 @@ class DashboardApp:
         limits = self._get_software_limits()
         limits[mode] = limit
         unit = "V" if mode == "VOLT" else "A"
-        if not self._man_require_conn():
+        if not self.kepco.is_verified:
             self._commit_dashboard_limit(mode, limit)
             self.log(
                 f"{mode} absolute limit staged locally at {limit:.4f} {unit}; "
@@ -4060,45 +4130,65 @@ class DashboardApp:
                 "warn")
             return
 
-        transaction_state = {
-            "active_mode": None,
-            "sent": False,
-            "commands": [],
-        }
-
-        def limit_transaction():
-            mode_resp = self.kepco.send("FUNC:MODE?", query=True)
-            active = KepcoController._normalize_func_mode(mode_resp)
-            transaction_state["active_mode"] = active
-            if not active:
-                return False, "Could not confirm device control mode"
-            complementary = (
-                (active == "CURR" and mode == "VOLT")
-                or (active == "VOLT" and mode == "CURR")
-            )
-            if not complementary:
-                return True, "Limit is software-only for active channel"
-            command = KepcoController.complementary_limit_cmd(
-                active,
-                voltage_compliance=limits["VOLT"],
-                current_limit=limits["CURR"])
-            transaction_state["commands"] = [command]
-            sent, send_msg = self.kepco.apply_complementary_limit(
-                active,
-                voltage_compliance=limits["VOLT"],
-                current_limit=limits["CURR"],
-                label=f"{mode} device limit command")
-            transaction_state["sent"] = sent
-            return sent, send_msg
-
-        self._pause_status_polling()
         expected_output = (
             self.current_output_on
             if isinstance(self.current_output_on, bool) else None)
-        ok, msg, snapshot = self._run_dc_transaction(
-            limit_transaction,
-            f"{mode} device limit change",
-            expected_output=expected_output)
+
+        def operation():
+            transaction_state = {
+                "active_mode": None,
+                "sent": False,
+                "commands": [],
+            }
+
+            def limit_transaction():
+                mode_resp = self.kepco.send("FUNC:MODE?", query=True)
+                active = KepcoController._normalize_func_mode(mode_resp)
+                transaction_state["active_mode"] = active
+                if not active:
+                    return False, "Could not confirm device control mode"
+                complementary = (
+                    (active == "CURR" and mode == "VOLT")
+                    or (active == "VOLT" and mode == "CURR")
+                )
+                if not complementary:
+                    return True, "Limit is software-only for active channel"
+                command = KepcoController.complementary_limit_cmd(
+                    active,
+                    voltage_compliance=limits["VOLT"],
+                    current_limit=limits["CURR"])
+                transaction_state["commands"] = [command]
+                sent, send_msg = self.kepco.apply_complementary_limit(
+                    active,
+                    voltage_compliance=limits["VOLT"],
+                    current_limit=limits["CURR"],
+                    label=f"{mode} device limit command")
+                transaction_state["sent"] = sent
+                return sent, send_msg
+
+            ok, msg, snapshot = self._run_dc_transaction(
+                limit_transaction,
+                f"{mode} device limit change",
+                expected_output=expected_output)
+            return ok, msg, snapshot, transaction_state
+
+        def completed(result, error):
+            if error:
+                result = (
+                    False,
+                    error,
+                    None,
+                    {"active_mode": None, "sent": False, "commands": []})
+            ok, msg, snapshot, transaction_state = result
+            self._set_software_limit_done(
+                mode, limit, unit, ok, msg, snapshot, transaction_state)
+
+        self._start_manual_operation(
+            f"{mode} limit update", operation, completed)
+
+    def _set_software_limit_done(
+            self, mode, limit, unit, ok, msg, snapshot, transaction_state):
+        """Commit a manual limit only after its worker verification completes."""
         active_mode = transaction_state["active_mode"]
         if not active_mode:
             self.log(
@@ -4298,6 +4388,72 @@ class DashboardApp:
         if not self.kepco.is_verified:
             self.log("Device state is not verified; controls are locked.", "warn")
             return False
+        if self._primary_control_operation_active():
+            self.log(
+                "Manual device controls are locked while another control "
+                "operation is active.",
+                "warn")
+            return False
+        if getattr(self, "_manual_operation_in_flight", False):
+            label = getattr(self, "_manual_operation_label", "") or "manual operation"
+            self.log(f"Wait for the active {label} to finish.", "warn")
+            return False
+        return True
+
+    def _begin_manual_operation(self, label):
+        """Atomically reserve application-level control for one manual action."""
+        if not self._man_require_conn():
+            return False
+        self._manual_operation_in_flight = True
+        self._manual_operation_label = label
+        self._pause_status_polling()
+        if hasattr(self, "conn_btn"):
+            self.conn_btn.configure(state="disabled")
+        if hasattr(self, "upload_btn"):
+            self._update_output_controls()
+        else:
+            self._update_manual_device_controls()
+        return True
+
+    def _finish_manual_operation(self):
+        """Release the manual-operation gate on the Tk thread."""
+        self._manual_operation_in_flight = False
+        self._manual_operation_label = ""
+        if hasattr(self, "conn_btn") and not (
+                self._connect_in_flight or self._scan_in_flight):
+            self.conn_btn.configure(state="normal")
+        if hasattr(self, "upload_btn"):
+            self._update_output_controls()
+        else:
+            self._update_manual_device_controls()
+
+    def _start_manual_operation(self, label, operation, completion):
+        """Run device-facing manual work off Tk and deliver one UI result."""
+        if not self._begin_manual_operation(label):
+            return False
+
+        def worker():
+            try:
+                result = operation()
+                error = None
+            except Exception as exc:
+                result = None
+                error = str(exc)
+
+            def deliver():
+                try:
+                    completion(result, error)
+                finally:
+                    # Keep all primary/manual controls gated until the result
+                    # has reconciled readiness, output, mode, and comm state.
+                    self._finish_manual_operation()
+
+            self._call_on_ui(deliver)
+
+        threading.Thread(
+            target=worker,
+            name=f"kepco-manual-{label.replace(' ', '-').lower()}",
+            daemon=True).start()
         return True
 
     def _select_control_mode(self, mode):
@@ -4328,7 +4484,9 @@ class DashboardApp:
             self.control_mode_var.set(previous_mode)
             self._update_mode_buttons(previous_mode)
             return
-        self._pause_status_polling()
+        expected_output = (
+            self.current_output_on
+            if isinstance(self.current_output_on, bool) else None)
 
         def mode_transaction():
             return self._ensure_dc_configuration(
@@ -4337,14 +4495,27 @@ class DashboardApp:
                 limits["CURR"],
                 label=f"Manual {mode} fixed-mode selection")
 
-        expected_output = (
-            self.current_output_on
-            if isinstance(self.current_output_on, bool) else None)
-        ok, msg, snapshot = self._run_dc_transaction(
-            mode_transaction,
-            f"Manual {mode} mode change",
-            expected_mode=mode,
-            expected_output=expected_output)
+        def operation():
+            return self._run_dc_transaction(
+                mode_transaction,
+                f"Manual {mode} mode change",
+                expected_mode=mode,
+                expected_output=expected_output)
+
+        def completed(result, error):
+            if error:
+                result = (False, error, None)
+            self._select_control_mode_done(
+                previous_mode, mode, *result)
+
+        if not self._start_manual_operation(
+                f"{mode} mode change", operation, completed):
+            self.control_mode_var.set(previous_mode)
+            self._update_mode_buttons(previous_mode)
+
+    def _select_control_mode_done(
+            self, previous_mode, mode, ok, msg, snapshot):
+        """Apply a verified manual mode result on the Tk thread."""
         self.log(
             f"Control mode -> {mode}" if ok else f"Failed to set control mode: {msg}",
             "ok" if ok else "err")
@@ -4363,6 +4534,12 @@ class DashboardApp:
     def _man_set_range(self):
         if not self._man_require_conn():
             return
+        if self.current_output_on:
+            messagebox.showwarning(
+                "Output Enabled",
+                "Disable output before changing range. A range transition can "
+                "disarm LIST operation or create a scale crossover transient.")
+            return
         choice = self.man_range_var.get()
         mode = self.control_mode_var.get()
         cmds = []
@@ -4376,7 +4553,6 @@ class DashboardApp:
         else:
             cmds = [f"{mode}:RANG:AUTO OFF", f"{mode}:RANG 4"]
             label = "Quarter Scale"
-        self._pause_status_polling()
         expected_output = (
             self.current_output_on
             if isinstance(self.current_output_on, bool) else None)
@@ -4389,34 +4565,51 @@ class DashboardApp:
             return self.kepco.send_sequence(
                 cmds + ["*WAI"], label=f"Manual {mode} range -> {label}")
 
-        ok, msg, snapshot = self._run_dc_transaction(
-            range_transaction,
-            f"Manual {mode} range change",
-            expected_mode=mode,
-            expected_output=expected_output)
+        def operation():
+            return self._run_dc_transaction(
+                range_transaction,
+                f"Manual {mode} range change",
+                expected_mode=mode,
+                expected_output=expected_output)
+
+        def completed(result, error):
+            if error:
+                result = (False, error, None)
+            self._man_set_range_done(mode, label, *result)
+
+        self._start_manual_operation(
+            f"{mode} range change", operation, completed)
+
+    def _man_set_range_done(self, mode, label, ok, msg, snapshot):
         self.log(
             f"{mode} range -> {label}" if ok else f"Failed to set range: {msg}",
             "ok" if ok else "err")
         if ok:
+            self._set_unverified_upload_state(
+                device_state="Range changed - re-upload required",
+                progress_text="Range changed - re-upload required",
+                plot_title="Range changed - device waveform state unverified")
             self._resume_after_dc_postflight(snapshot)
         else:
             self._resume_or_handle_transaction_failure("set range")
 
     def _man_reset(self):
-        if not self._man_require_conn():
-            return
-        if self._upload_in_flight:
-            messagebox.showwarning(
-                "Busy",
-                "Wait for the active upload before resetting the device.")
-            return
-        self._pause_status_polling()
-        ok, msg, snapshot = self._run_dc_transaction(
-            lambda: self.kepco.send_sequence(
-                ["*RST", "*WAI"], label="Device reset"),
-            "Device reset",
-            expected_mode="VOLT",
-            expected_output=False)
+        def operation():
+            return self._run_dc_transaction(
+                lambda: self.kepco.send_sequence(
+                    ["*RST", "*WAI"], label="Device reset"),
+                "Device reset",
+                expected_mode="VOLT",
+                expected_output=False)
+
+        def completed(result, error):
+            if error:
+                result = (False, error, None)
+            self._man_reset_done(*result)
+
+        self._start_manual_operation("device reset", operation, completed)
+
+    def _man_reset_done(self, ok, msg, snapshot):
         if ok:
             self.current_control_mode = "VOLT"
             self.control_mode_var.set("VOLT")
@@ -4431,61 +4624,86 @@ class DashboardApp:
             self._resume_or_handle_transaction_failure("reset")
 
     def _man_send_scpi(self):
-        if not self._man_require_conn():
-            return
         cmd = self.scpi_entry.get().strip()
         if not cmd:
             return
-        self._man_exec_scpi_command(cmd)
-        self.scpi_entry.delete(0, "end")
+        if self._man_exec_scpi_command(cmd):
+            self.scpi_entry.delete(0, "end")
 
     def _man_exec_scpi_command(self, cmd):
         is_query = cmd.rstrip().endswith("?")
         ts = time.strftime("%H:%M:%S")
-        self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
-        if is_query:
-            resp = self.kepco.send(cmd, query=True)
-            self.scpi_resp.insert("end", f"[{ts}] < {resp or '(no response)'}\n")
-            if resp is None:
-                self._handle_comm_failure(f"SCPI query '{cmd}'")
-        else:
-            self._pause_status_polling()
+
+        def operation():
+            if is_query:
+                return self.kepco.send(cmd, query=True)
 
             def manual_command():
                 return self.kepco.send_sequence(
                     [cmd, "*WAI"], label=f"Manual SCPI command '{cmd}'")
 
-            ok, msg, snapshot = self._run_dc_transaction(
+            return self._run_dc_transaction(
                 manual_command, f"Manual SCPI command '{cmd}'")
-            self.scpi_resp.insert("end", f"[{ts}] {'OK' if ok else 'FAILED'}\n")
+
+        def completed(result, error):
+            self._man_exec_scpi_done(
+                cmd, is_query, ts, result, error)
+
+        started = self._start_manual_operation(
+            f"SCPI {'query' if is_query else 'command'}", operation, completed)
+        if started:
+            self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
+            self.scpi_resp.see("end")
+            self.log(f"SCPI: {cmd}", "info")
+        return started
+
+    def _man_exec_scpi_done(self, cmd, is_query, ts, result, error):
+        if is_query:
+            resp = None if error else result
+            self.scpi_resp.insert(
+                "end", f"[{ts}] < {resp or '(no response)'}\n")
+            if resp is None:
+                if error:
+                    self.log(f"SCPI query failed: {error}", "err")
+                self._resume_or_handle_transaction_failure(
+                    f"SCPI query '{cmd}'")
+            else:
+                self._resume_status_polling(150)
+        else:
+            if error:
+                ok, msg, snapshot = False, error, None
+            else:
+                ok, msg, snapshot = result
+            self.scpi_resp.insert(
+                "end", f"[{ts}] {'OK' if ok else 'FAILED'}\n")
             if ok:
+                # Arbitrary writes cannot be classified reliably. Even if the
+                # live output/mode snapshot is valid, it cannot prove that LIST
+                # values, dwell, range, or the staged DC setpoint still match.
+                self._set_unverified_upload_state(
+                    device_state="Manual command applied - re-upload required",
+                    progress_text="Manual command applied - re-upload required",
+                    plot_title=(
+                        "Manual command applied - device waveform state "
+                        "unverified"))
                 self._resume_after_dc_postflight(snapshot)
             else:
                 self._resume_or_handle_transaction_failure(
                     f"SCPI command '{cmd}'")
         self.scpi_resp.see("end")
-        self.log(f"SCPI: {cmd}", "info")
-        if is_query:
-            self._schedule_status_poll(150)
 
     def _man_send_preset(self, cmd):
-        if not self._man_require_conn():
-            return
-        self.scpi_entry.delete(0, "end")
-        self.scpi_entry.insert(0, cmd)
-        self._man_exec_scpi_command(cmd)
+        if self._man_exec_scpi_command(cmd):
+            self.scpi_entry.delete(0, "end")
+            self.scpi_entry.insert(0, cmd)
 
     def _man_clear_scpi(self):
         self.scpi_resp.delete("1.0", "end")
         self.log("SCPI console cleared", "info")
 
     def _man_health_check(self):
-        if not self._man_require_conn():
-            return
-        threading.Thread(target=self._man_health_check_worker, daemon=True).start()
-
-    def _man_health_check_worker(self):
         ts = time.strftime("%H:%M:%S")
+
         def health_check_transaction():
             results = []
 
@@ -4505,25 +4723,36 @@ class DashboardApp:
             run_query("*ESR?")
             return results
 
-        results = self.kepco.run_transaction(health_check_transaction)
+        def operation():
+            return self.kepco.run_transaction(health_check_transaction)
 
-        self._call_on_ui(lambda: self._man_health_check_done(ts, results))
+        def completed(result, error):
+            results = [] if result is None else result
+            self._man_health_check_done(ts, results, error=error)
 
-    def _man_health_check_done(self, ts, results):
+        self._start_manual_operation(
+            "health check", operation, completed)
+
+    def _man_health_check_done(self, ts, results, error=None):
         self.scpi_resp.insert("end", f"[{ts}] ==== Health Check ====\n")
-        missing = False
+        missing = bool(error)
         for cmd, resp in results:
             self.scpi_resp.insert("end", f"[{ts}] > {cmd}\n")
             self.scpi_resp.insert("end", f"[{ts}] < {resp or '(no response)'}\n")
             if resp is None:
                 missing = True
+        if error:
+            self.scpi_resp.insert("end", f"[{ts}] ERROR: {error}\n")
         self.scpi_resp.insert("end", f"[{ts}] =====================\n")
         self.scpi_resp.see("end")
-        self.log("Manual health check complete", "ok")
+        self.log(
+            "Manual health check failed" if missing
+            else "Manual health check complete",
+            "err" if missing else "ok")
         if missing:
-            self._handle_comm_failure("health check")
+            self._resume_or_handle_transaction_failure("health check")
         else:
-            self._schedule_status_poll(150)
+            self._resume_status_polling(150)
 
     # -- Live status polling -------------------------------------------------
     # Polling runs continuously while connected. Its complete four-query
@@ -4717,6 +4946,11 @@ class DashboardApp:
     def _upload_waveform(self):
         """Start upload/preparation for the current waveform request."""
         if self._upload_in_flight:
+            return
+        if getattr(self, "_manual_operation_in_flight", False):
+            self.log(
+                "Wait for the active manual device operation before uploading.",
+                "warn")
             return
         if not self.kepco.is_verified:
             messagebox.showerror("Error", "Verify communication with a device first.")
@@ -4935,6 +5169,11 @@ class DashboardApp:
         """Turn output on/off while preserving interlocks and staged limits."""
         if self._output_toggle_in_flight:
             return
+        if getattr(self, "_manual_operation_in_flight", False):
+            self.log(
+                "Output control is locked during a manual device operation.",
+                "warn")
+            return
         if self._upload_in_flight:
             self.log(
                 "Output control is locked until the waveform upload completes.",
@@ -4977,8 +5216,8 @@ class DashboardApp:
                 return
 
         self._output_toggle_in_flight = True
-        self.output_toggle_btn.configure(state="disabled")
         self._pause_status_polling()
+        self._update_output_controls()
         threading.Thread(
             target=self._output_toggle_worker,
             args=(target_on, req),
@@ -5120,6 +5359,11 @@ class DashboardApp:
     def _start_scan(self):
         if self._scan_in_flight:
             return
+        if getattr(self, "_manual_operation_in_flight", False):
+            self.log(
+                "Wait for the active manual device operation before scanning.",
+                "warn")
+            return
         if self.kepco.is_transport_connected or self._connect_in_flight:
             messagebox.showwarning(
                 "Connection Active",
@@ -5129,6 +5373,7 @@ class DashboardApp:
         self._scan_in_flight = True
         self.scan_btn.configure(state="disabled", text="Scanning...")
         self.conn_btn.configure(state="disabled")
+        self._update_output_controls()
         self.log(
             "Scanning local subnet for Kepco devices "
             "(raw SCPI 5025 first, Telnet 5024 fallback)...",
@@ -5151,6 +5396,7 @@ class DashboardApp:
         self._scan_in_flight = False
         self.scan_btn.configure(state="normal", text="Scan Network")
         self.conn_btn.configure(state="normal")
+        self._update_output_controls()
         self.progress.set(0)
         if results:
             ips = [ip for ip, _idn in results]
@@ -5165,6 +5411,12 @@ class DashboardApp:
     def _toggle_connect(self):
         if self._connect_in_flight or self._scan_in_flight:
             return
+        if getattr(self, "_manual_operation_in_flight", False):
+            self.log(
+                "Wait for the active manual device operation before changing "
+                "the connection.",
+                "warn")
+            return
 
         if (self.kepco.comm_state is CommState.DEGRADED
                 and self.kepco.is_transport_connected):
@@ -5173,6 +5425,7 @@ class DashboardApp:
             self._pause_status_polling()
             self.scan_btn.configure(state="disabled")
             self.conn_btn.configure(state="disabled", text="Recovering...")
+            self._update_output_controls()
             threading.Thread(target=self._recover_worker, daemon=True).start()
             return
 
@@ -5182,6 +5435,7 @@ class DashboardApp:
             self._connect_in_flight = True
             self.scan_btn.configure(state="disabled")
             self.conn_btn.configure(state="disabled", text="Connecting...")
+            self._update_output_controls()
             threading.Thread(target=self._connect_worker, args=(ip,), daemon=True).start()
         else:
             if self._upload_in_flight or self._output_toggle_in_flight:
@@ -5194,6 +5448,7 @@ class DashboardApp:
             self._connect_in_flight = True
             self._pause_status_polling()
             self.conn_btn.configure(state="disabled", text="Disconnecting...")
+            self._update_output_controls()
             threading.Thread(target=self._disconnect_worker, daemon=True).start()
 
     def _connect_worker(self, ip):
