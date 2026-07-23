@@ -71,6 +71,17 @@ Generated AC waveforms and CSV waveforms use LIST mode. The dashboard supports o
 
 CSV mode reads numeric cells from the selected file, flattens them into one point list, requires between `2` and `1000` points, and uses the selected frequency to calculate dwell. Files containing more than `1000` numeric values are rejected.
 
+LIST upload and replacement require a verified output-OFF state. The dashboard
+rejects LIST upload while output is ON or unknown because staging disarms the
+existing LIST and clears the device buffer. After local validation succeeds,
+starting any device upload immediately invalidates the prior actionable request.
+Only complete upload and postflight verification commits the new request as
+READY. A failed upload displays **Upload failed - device waveform state
+unverified** and requires another successful upload before output can be
+enabled. Same-mode DC setpoint updates may remain live, but the previous DC
+request is passed only as transaction context and is not retained as readiness
+during the update.
+
 ## Limits And Safety
 
 Implemented hardware and software limits:

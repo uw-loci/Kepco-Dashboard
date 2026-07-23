@@ -2861,10 +2861,11 @@ class DashboardApp:
             self.preview_fig, self.preview_ax, self.preview_canvas,
             points=points, empty_title="No waveform - configure and preview")
 
-    def _update_status_plot(self, points=None):
+    def _update_status_plot(
+            self, points=None, empty_title="No waveform uploaded"):
         self._draw_waveform_plot(
             self.status_fig, self.status_ax, self.status_canvas,
-            points=points, empty_title="No waveform uploaded")
+            points=points, empty_title=empty_title)
 
     @staticmethod
     def _lbl(parent, text):
@@ -3273,18 +3274,29 @@ class DashboardApp:
         self._set_output_ui_state(output_state)
         self._refresh_ac_operation_notice()
 
-    def _reset_uploaded_state(self):
+    def _set_unverified_upload_state(
+            self,
+            device_state,
+            progress_text,
+            plot_title):
+        """Clear actionable upload state and explain why output is locked."""
         self.uploaded_request = None
         self.uploaded_waveform_ready = False
-        self._update_status_plot(None)
+        self._update_status_plot(None, empty_title=plot_title)
         for label in self.status_cfg_labels.values():
             label.configure(text="--")
-        self.status_cfg_labels["device_state"].configure(text="No waveform uploaded")
-        self.prog_lbl.configure(text="No upload yet")
+        self.status_cfg_labels["device_state"].configure(text=device_state)
+        self.prog_lbl.configure(text=progress_text)
         self.progress.set(0)
         self._set_dc_current_monitors_inactive()
         self._refresh_ac_operation_notice()
         self._update_output_controls()
+
+    def _reset_uploaded_state(self):
+        self._set_unverified_upload_state(
+            device_state="No waveform uploaded",
+            progress_text="No upload yet",
+            plot_title="No waveform uploaded")
 
     def _refresh_uploaded_status_panel(self):
         """Mirror the staged waveform request into the right-side status card."""
@@ -3303,8 +3315,8 @@ class DashboardApp:
             wave_name = f"CSV ({req['csv_name']})"
 
         device_state = (
-            "Fixed setpoint staged"
-            if req["wave"] == "DC" else "LIST uploaded")
+            "Fixed setpoint staged and verified"
+            if req["wave"] == "DC" else "LIST uploaded and verified")
 
         values = {
             "wave": wave_name,
@@ -3448,6 +3460,7 @@ class DashboardApp:
     def _update_output_controls(self):
         upload_state = "normal" if (
             self.kepco.is_verified
+            and isinstance(self.current_output_on, bool)
             and not self._upload_in_flight) else "disabled"
         self.upload_btn.configure(state=upload_state)
 
@@ -4711,31 +4724,56 @@ class DashboardApp:
         req = self._read_waveform_request()
         if not req:
             return
+        if not isinstance(self.current_output_on, bool):
+            messagebox.showwarning(
+                "Output State Unknown",
+                "Wait for verified output status before uploading a waveform.")
+            return
+        if req["kind"] == "LIST" and self.current_output_on:
+            messagebox.showwarning(
+                "Output Enabled",
+                "Disable output before uploading or replacing a LIST waveform.")
+            return
 
+        previous_request = (
+            self.uploaded_request
+            if self.uploaded_waveform_ready else None)
         self.preview_points = req["plot_points"]
         self._update_preview_plot(req["plot_points"])
         self._upload_in_flight = True
-        self.prog_lbl.configure(text="Uploading...")
-        self.progress.set(0)
         self._pause_status_polling()
-        self._update_output_controls()
-        threading.Thread(target=self._upload_request_worker, args=(req,), daemon=True).start()
+        self._set_unverified_upload_state(
+            device_state="Upload in progress - not verified",
+            progress_text="Uploading...",
+            plot_title="Upload in progress")
+        threading.Thread(
+            target=self._upload_request_worker,
+            args=(req, previous_request),
+            daemon=True).start()
 
-    def _upload_request_worker(self, req):
+    def _upload_request_worker(self, req, previous_request=None):
         """Run the upload path off the UI thread, then report completion."""
         postflight_snapshot = None
         try:
             def upload_transaction():
+                if not isinstance(self.current_output_on, bool):
+                    return False, "Output state is unknown", None
                 if req["kind"] == "DC":
                     expected_output = (
                         self.current_output_on
                         if isinstance(self.current_output_on, bool) else None)
                     dc_ok, dc_msg, snapshot = self._run_dc_transaction(
-                        lambda: self._apply_dc_request(req),
+                        lambda: self._apply_dc_request(
+                            req, previous_request=previous_request),
                         "DC setpoint staging",
                         expected_mode=req["mode"],
                         expected_output=expected_output)
                     return dc_ok, dc_msg, snapshot
+                if self.current_output_on:
+                    return (
+                        False,
+                        "Disable output before uploading a LIST waveform",
+                        None)
                 if req["point_count"] > MAX_LIST_POINTS:
                     return (
                         False,
@@ -4754,13 +4792,16 @@ class DashboardApp:
             lambda: self._upload_request_done(
                 req, ok, msg, postflight_snapshot))
 
-    def _apply_dc_request(self, req):
+    def _apply_dc_request(self, req, previous_request=None):
         """Stage or live-update a fixed DC setpoint with safe limit setup."""
         self._call_on_ui(lambda: self.progress.set(0.5))
         mode = req["mode"]
         value = req["amplitude"]
         voltage_compliance, current_limit = self._get_request_limits(req)
-        prev_req = self.uploaded_request or {}
+        prev_req = (
+            previous_request
+            if previous_request is not None else
+            self.uploaded_request or {})
         live_dc_update = (
             self.current_output_on
             and prev_req.get("kind") == "DC"
@@ -4827,7 +4868,9 @@ class DashboardApp:
         return True, f"DC setpoint staged at {value:.4f} {unit}"
 
     def _upload_single_chunk_request(self, req):
-        """Upload one LIST buffer and optionally re-arm it while output is live."""
+        """Upload one LIST buffer while verified output remains OFF."""
+        if self.current_output_on is not False:
+            return False, "LIST upload requires verified output OFF"
         voltage_compliance, current_limit = self._get_request_limits(req)
 
         def progress_cb(sent, total):
@@ -4844,57 +4887,44 @@ class DashboardApp:
             current_limit=current_limit)
         if not ok:
             return False, msg
-        if self.current_output_on:
-            count = 0 if req["loop"] == 0 else max(req["loop"], 1)
-            ok, run_msg = self.kepco.run_list(
-                req["mode"],
-                count=count,
-                enable_output=False,
-                voltage_compliance=voltage_compliance,
-                current_limit=current_limit,
-                apply_limit_setup=False)
-            if not ok:
-                return False, f"Upload succeeded but live re-arm failed: {run_msg}"
-            return True, f"{msg}; applied without toggling output"
         return True, msg
 
     def _upload_request_done(self, req, ok, msg, postflight_snapshot=None):
         self._upload_in_flight = False
-        prev_req = self.uploaded_request or {}
-        self.uploaded_request = req if ok else self.uploaded_request
+        communication_failed = not self.kepco.is_verified
+        if ok and communication_failed:
+            ok = False
+            msg = (
+                f"{msg}; communication became unverified before the upload "
+                "could be committed")
         if ok:
+            self.uploaded_request = req
             self.uploaded_waveform_ready = True
             self._refresh_ac_operation_notice()
             self._refresh_uploaded_status_panel()
-            if (
-                self.current_output_on
-                and prev_req.get("kind") == "DC"
-                and prev_req.get("mode") == req["mode"]
-                and req["kind"] == "LIST"
-                and req.get("offset") is not None
-            ):
-                self._measurement_guard = {
-                    "mode": req["mode"],
-                    "previous_value": float(prev_req.get("amplitude", 0.0)),
-                    "expected_value": float(req["offset"]),
-                }
-                self._set_live_measurement_axis(req["mode"], req["offset"])
             self.log(msg, "ok")
             self.prog_lbl.configure(
-                text="Setpoint staged" if req["kind"] == "DC" else "Uploaded")
+                text=(
+                    "Setpoint staged and verified"
+                    if req["kind"] == "DC"
+                    else "Uploaded and verified"))
             self.progress.set(1.0)
         else:
             self.log(f"Upload failed: {msg}", "err")
-            self.progress.set(0)
-            self.prog_lbl.configure(text="Upload failed")
-            if not self.kepco.is_verified:
+            if communication_failed:
                 self._handle_comm_failure("upload")
+            self._set_unverified_upload_state(
+                device_state=(
+                    "Upload failed - device waveform state unverified"),
+                progress_text="Upload failed - re-upload required",
+                plot_title=(
+                    "Upload failed - device waveform state unverified"))
 
-        if req["kind"] != "DC":
+        if req["kind"] != "DC" and self.kepco.is_verified:
             self._resume_status_polling()
         elif ok:
             self._resume_after_dc_postflight(postflight_snapshot)
-        else:
+        elif not communication_failed:
             self._resume_or_handle_transaction_failure("upload")
         self._update_output_controls()
 
