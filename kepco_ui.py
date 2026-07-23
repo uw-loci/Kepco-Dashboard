@@ -3419,10 +3419,17 @@ class DashboardApp:
             )
         )
 
+    def _uploaded_waveform_matches_selected_mode(self):
+        return bool(
+            self.uploaded_waveform_ready
+            and self.uploaded_request
+            and self.uploaded_request.get("mode")
+            == self.control_mode_var.get().upper())
+
     def _can_toggle_output(self):
         return self._output_toggle_allowed(
             self.kepco.is_verified,
-            self.uploaded_waveform_ready,
+            self._uploaded_waveform_matches_selected_mode(),
             self.current_output_on,
             self.sequence_active,
             self._upload_in_flight,
@@ -3431,6 +3438,8 @@ class DashboardApp:
     def _refresh_output_toggle_button(self, can_toggle=None):
         if can_toggle is None:
             can_toggle = self._can_toggle_output()
+        uploaded_for_selected_mode = (
+            self._uploaded_waveform_matches_selected_mode())
 
         badge_text = "OFFLINE"
         badge_color = C["red"]
@@ -3465,13 +3474,13 @@ class DashboardApp:
                 button_text = "Disable Output"
                 button_color = C["red"]
                 button_hover = "#dc2626"
-            elif not self.uploaded_waveform_ready:
+            elif not uploaded_for_selected_mode:
                 badge_text = "LOCKED"
                 badge_color = C["amber"]
                 badge_text_color = "#111827"
                 summary = "Awaiting waveform upload"
                 button_text = "Upload Waveform First"
-            elif self.uploaded_waveform_ready:
+            elif uploaded_for_selected_mode:
                 badge_text = "READY"
                 badge_color = C["primary"]
                 summary = "Waveform uploaded and armed"
@@ -3514,9 +3523,11 @@ class DashboardApp:
             hint = "Output state is unknown; waiting for verified device status."
         elif self.sequence_active:
             hint = "Streaming multi-chunk waveform."
-        elif self.current_output_on and not self.uploaded_waveform_ready:
+        elif (
+                self.current_output_on
+                and not self._uploaded_waveform_matches_selected_mode()):
             hint = "Output is ON; disable output before uploading a waveform."
-        elif not self.uploaded_waveform_ready:
+        elif not self._uploaded_waveform_matches_selected_mode():
             hint = "Upload a waveform to enable output."
         else:
             hint = "Output follows the last uploaded waveform."
@@ -3528,6 +3539,28 @@ class DashboardApp:
             btn.configure(
                 fg_color=C["green"] if active else "#4b5563",
                 hover_color="#059669" if active else "#6b7280")
+
+    def _invalidate_upload_after_control_mode_change(
+            self, previous_mode, selected_mode):
+        """Clear a staged request that belongs to the opposite control mode."""
+        previous_mode = str(previous_mode).strip().upper()
+        selected_mode = str(selected_mode).strip().upper()
+        if previous_mode == selected_mode:
+            return False
+
+        had_staged_request = bool(
+            self.uploaded_waveform_ready or self.uploaded_request)
+        # Set the safety state explicitly before refreshing dependent widgets.
+        self.uploaded_waveform_ready = False
+        self.uploaded_request = None
+        self._reset_uploaded_state()
+        if had_staged_request:
+            self.log(
+                f"Control mode changed {previous_mode} -> {selected_mode}; "
+                f"the previous waveform was cleared. Upload a new "
+                f"{selected_mode} waveform before enabling output.",
+                "warn")
+        return had_staged_request
 
     def _set_status_mode_display(self, mode):
         for key, label in self.status_mode_labels.items():
@@ -4312,6 +4345,10 @@ class DashboardApp:
     def _select_control_mode(self, mode):
         mode = mode.upper()
         previous_mode = self.current_control_mode
+        if mode == previous_mode:
+            self.control_mode_var.set(mode)
+            self._update_mode_buttons(mode)
+            return
         if self.kepco.is_verified and self.current_output_on:
             self.control_mode_var.set(previous_mode)
             self._update_mode_buttons(previous_mode)
@@ -4324,6 +4361,8 @@ class DashboardApp:
             self.current_control_mode = mode
             self.control_mode_var.set(mode)
             self._update_mode_buttons(mode)
+            self._invalidate_upload_after_control_mode_change(
+                previous_mode, mode)
             self.log(f"Control mode preset to {mode}", "info")
             return
         limits = self._get_software_limits(show_error=True)
@@ -4355,6 +4394,8 @@ class DashboardApp:
             self.current_control_mode = mode
             self.control_mode_var.set(mode)
             self._update_mode_buttons(mode)
+            self._invalidate_upload_after_control_mode_change(
+                previous_mode, mode)
             self._resume_after_dc_postflight(snapshot)
         else:
             self.control_mode_var.set(previous_mode)
@@ -5149,6 +5190,17 @@ class DashboardApp:
             self._set_output_ui_state(False)
             self.log("Upload a waveform before enabling output.", "warn")
             return
+        selected_mode = self.control_mode_var.get().upper()
+        if target_on and (
+                not req or req.get("mode") != selected_mode):
+            self.uploaded_waveform_ready = False
+            self._update_output_controls()
+            self.log(
+                f"The staged waveform does not match {selected_mode} control "
+                f"mode. Upload a new {selected_mode} waveform before enabling "
+                "output.",
+                "warn")
+            return
         if target_on:
             # Re-check limits at the moment output is enabled because the
             # operator can edit software-limit fields after upload.
@@ -5283,7 +5335,15 @@ class DashboardApp:
         self._output_toggle_in_flight = False
         if ok:
             self._set_output_ui_state(target_on)
-            self.log(msg, "ok")
+            transition = "Output ON" if target_on else "Output OFF"
+            detail = str(msg or "").strip()
+            if not detail or detail.upper() == "OK":
+                success_message = transition
+            elif transition.lower() in detail.lower():
+                success_message = detail
+            else:
+                success_message = f"{transition}; {detail}"
+            self.log(success_message, "ok")
             if target_on:
                 self.prog_lbl.configure(text="Output enabled")
             else:
