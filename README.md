@@ -8,7 +8,7 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 - Scans the selected `/24` subnet and validates candidate devices with `*IDN?`
 - Generates `DC`, `Sine`, `Square`, `Triangle`, `Sawtooth`, and CSV-based waveforms
 - Previews waveform shape locally before sending anything to hardware
-- Uploads LIST data in verified chunks that fit the BIT 802E command and point limits
+- Uploads and verifies one LIST waveform of up to `1000` points
 - Supports voltage (`VOLT`) and current (`CURR`) control modes with one absolute limit value for each channel
 - Provides manual SCPI controls, quick diagnostic queries, range control, health check, and reset
 - Shows the uploaded waveform, live output state, control mode, and voltage/current readback only while device communication is verified
@@ -67,9 +67,9 @@ Enabling output remains locked until a waveform or DC setpoint has been uploaded
 
 `DC` uses fixed `VOLT` or `CURR` commands and does not use LIST mode.
 
-Generated AC waveforms and CSV waveforms use LIST mode. A single LIST upload is limited to `1000` points, so larger waveforms are staged as multiple chunks. The app supports up to `4000` total points and streams multi-chunk waveforms chunk-by-chunk while output is enabled.
+Generated AC waveforms and CSV waveforms use LIST mode. The dashboard supports one device-resident LIST of `2` through `1000` points. Requests above `1000` points are rejected before device communication; they are not truncated or streamed through multiple LIST buffers.
 
-CSV mode reads numeric cells from the selected file, flattens them into one point list, requires at least two points, and uses the selected frequency to calculate dwell. If the file contains more than `4000` values, only the first `4000` are used.
+CSV mode reads numeric cells from the selected file, flattens them into one point list, requires between `2` and `1000` points, and uses the selected frequency to calculate dwell. Files containing more than `1000` numeric values are rejected.
 
 ## Limits And Safety
 
@@ -77,8 +77,7 @@ Implemented hardware and software limits:
 
 - Minimum dwell: `0.0005 s`
 - Maximum dwell: `10.0 s`
-- Maximum LIST points per upload chunk: `1000`
-- Maximum staged waveform points: `4000`
+- Maximum LIST/staged waveform points: `1000`
 - BOP voltage rating used by the UI limit check: `+/-100 V`
 - BOP current rating used by the UI limit check: `+/-2 A`
 - Default absolute voltage limit: `40 V`
@@ -136,7 +135,7 @@ The monitor is active only during this stage:
 - The selected uploaded control mode is `CURR`
 - The device status poll reports `CURR` mode
 
-In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload, LIST waveform output, AC waveform streaming, and output transitions, the voltage and current monitor lines are set to inactive.
+In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload or output, and output transitions, the voltage and current monitor lines are set to inactive.
 
 When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two WebMonitor solenoid temperatures:
 
@@ -168,7 +167,7 @@ One dedicated worker thread owns the SCPI socket. Polling, DC and LIST transacti
 
 Network discovery and active control are mutually exclusive. The dashboard disables scanning while connecting or connected so it cannot open a second competing socket to the same Kepco.
 
-Dependent DC state changes do not rely on the `35 ms` pacing delay. If a mode transition is actually needed, the controller sends `FUNC:MODE`, waits with `*WAI`, and verifies `FUNC:MODE?`; it changes the selected source to `MODE FIX` only when necessary, waits again, and verifies the source `MODE?`. Initial DC/LIST staging then follows the manual's optimized sequence: lock the active source to full scale with `RANG 1`, stage the operating parameter at zero, and program the one complementary limit to its desired absolute maximum. For DC output enable, the requested operating setpoint is programmed and verified while output remains off, then `OUTP ON` is sent. Later same-mode DC updates change only the operating parameter; the complementary limit is rewritten only when the operator changes it. Multi-chunk LIST streaming similarly establishes the complementary limit with the first staged chunk and preserves it across subsequent chunk uploads. Live DC mode changes are rejected until output is disabled. Polling is paused for DC staging, mode/range/limit changes, output transitions, reset/manual writes, recovery, and disconnect. It resumes after a verified postflight snapshot or, when the socket remains healthy, after logging a command rejection. BIT `-221,"Settings conflict"` entries are retained as contextual advisory warnings and do not block an otherwise verified transaction. Other cleanly received SCPI rejections fail the requested action and are logged without being misclassified as communication degradation. Transport framing failures, timeouts, invalid responses, and socket failures enter `DEGRADED` and require fresh-socket recovery.
+Dependent DC state changes do not rely on the `35 ms` pacing delay. If a mode transition is actually needed, the controller sends `FUNC:MODE`, waits with `*WAI`, and verifies `FUNC:MODE?`; it changes the selected source to `MODE FIX` only when necessary, waits again, and verifies the source `MODE?`. Initial DC/LIST staging then follows the manual's optimized sequence: lock the active source to full scale with `RANG 1`, stage the operating parameter at zero, and program the one complementary limit to its desired absolute maximum. For DC output enable, the requested operating setpoint is programmed and verified while output remains off, then `OUTP ON` is sent. Later same-mode DC updates change only the operating parameter; the complementary limit is rewritten only when the operator changes it. Live DC mode changes are rejected until output is disabled. Polling is paused for DC staging, mode/range/limit changes, output transitions, reset/manual writes, recovery, and disconnect. It resumes after a verified postflight snapshot or, when the socket remains healthy, after logging a command rejection. BIT `-221,"Settings conflict"` entries are retained as contextual advisory warnings and do not block an otherwise verified transaction. Other cleanly received SCPI rejections fail the requested action and are logged without being misclassified as communication degradation. Transport framing failures, timeouts, invalid responses, and socket failures enter `DEGRADED` and require fresh-socket recovery.
 
 Changing between voltage and current control clears any staged waveform and
 locks output enable until a new waveform is uploaded in the selected mode.
@@ -183,10 +182,10 @@ Preview is local-only. Upload, output toggle, manual SCPI commands, status polli
 
 - Route device communication through `KepcoController.send_cmd`, `send_query`, `send_sequence`, or `run_transaction`; those helpers enforce socket-owner serialization, command pacing, Telnet echo handling, and verified-state/recovery behavior.
 - Worker threads must update the GUI through `DashboardApp._call_on_ui`. Direct Tkinter updates from background threads can destabilize the UI.
-- DC transactions invalidate any in-flight poll generation and remain paused until their queued postflight verification succeeds. LIST upload/streaming also pauses periodic polling; disconnect and recovery keep it paused until the session is either safely closed or fully reverified.
-- Waveforms over `1000` points are not resident on the device all at once. The first chunk is primed, then `_sequence_worker` uploads and runs subsequent chunks while streaming.
+- DC transactions invalidate any in-flight poll generation and remain paused until their queued postflight verification succeeds. LIST upload also pauses periodic polling; disconnect and recovery keep it paused until the session is either safely closed or fully reverified.
+- Generated and CSV LIST requests above `1000` points are rejected before upload. Do not bypass this validation or divide one requested waveform into multiple live LIST operations.
 - The voltage and current limit entries are absolute magnitudes. The active output channel is checked symmetrically against its magnitude in software, and only the complementary channel is programmed on the BIT when appropriate.
-- Data collection is driven by status polling, so samples pause whenever polling is paused for uploads, output transitions, streaming, or disconnect safety checks.
+- Data collection is driven by status polling, so samples pause whenever polling is paused for uploads, output transitions, or disconnect safety checks.
 
 ## Troubleshooting
 

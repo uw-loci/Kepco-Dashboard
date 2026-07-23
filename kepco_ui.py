@@ -2,13 +2,13 @@
 """
 Kepco BIT 802E Waveform Generator - High Performance Edition
 
-Material-design UI with real-time waveform preview, chunk-send
-indication, auto-discovery, and optimized multi-list upload.
+Material-design UI with real-time waveform preview, upload progress,
+auto-discovery, and verified single-LIST upload.
 
 Hardware Constraints (BIT 802E manual):
   - Max 1000 list points per upload (1002 technically)
   - Dwell time: 0.0005 s (500 us) to 10 s
-  - For >1000 points: sequential multi-list upload required
+  - Waveforms over 1000 points are rejected before device communication
   - Use the active mode's RANG 1 to avoid quarter-scale transients
 
 Maintenance Map:
@@ -39,7 +39,6 @@ import customtkinter as ctk
 
 import matplotlib
 matplotlib.use("TkAgg")
-import matplotlib.lines as mlines
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -47,12 +46,11 @@ from solenoid_temperature_reader import WebMonitorSolenoidTemperatureReader
 
 # -- Constants ---------------------------------------------------------------
 # These values encode hardware limits and transport timing assumptions. Keep
-# them centralized so UI validation, upload chunking, and safety interlocks stay
+# them centralized so UI validation, upload handling, and safety interlocks stay
 # aligned with the BIT/BOP behavior documented in the manual.
 MIN_DWELL        = 0.0005    # 500 us - hardware minimum
 MAX_DWELL        = 10.0      # hardware maximum
-MAX_LIST_POINTS  = 1000      # per single LIST upload
-MAX_TOTAL_POINTS = 4000      # 4 x 1000 chunks
+MAX_LIST_POINTS  = 1000      # maximum supported LIST waveform size
 TELNET_PORT      = 5024      # Telnet fallback endpoint
 SCPI_SOCKET_PORT = 5025      # preferred raw SCPI socket endpoint
 DISCOVERY_TIMEOUT = 0.25
@@ -200,8 +198,7 @@ C = dict(
     green="#10b981", red="#ef4444", amber="#f59e0b",
     text="#e2e8f0", text2="#94a3b8", border="#3f3f5c",
     input_bg="#363650", graph_bg="#161625",
-    chunk_colors=["#818cf8", "#34d399", "#fb923c", "#f472b6"],
-    sent="#f472b6",
+    waveform="#818cf8",
 )
 
 
@@ -1451,11 +1448,11 @@ class KepcoController:
         except Exception as e:
             return False, str(e)
 
-    # -- List upload (single chunk <= 1000 pts) -----------------------------
+    # -- Single LIST upload (<= 1000 pts) -----------------------------------
     def upload_list_chunk(self, points, dwell, mode="VOLT",
                           progress_cb=None, voltage_compliance=None,
                           current_limit=None, apply_limit_setup=True):
-        """Upload one chunk (<= 1000 points) with paced writes + verification.
+        """Upload one device-resident LIST with pacing and verification.
 
         Strategy:
           1. Disarm: switch the active LIST program back to FIX, then zero it
@@ -1488,7 +1485,7 @@ class KepcoController:
             if not points:
                 return False, "Empty point list"
             if len(points) > MAX_LIST_POINTS:
-                return False, f"Chunk exceeds {MAX_LIST_POINTS} points"
+                return False, f"LIST exceeds {MAX_LIST_POINTS} points"
             mode = (mode or "VOLT").upper()
             if mode not in ("VOLT", "CURR"):
                 return False, f"Unsupported list mode '{mode}'"
@@ -1849,7 +1846,7 @@ class DashboardApp:
     The app keeps hardware I/O on background threads, mirrors device state into
     UI widgets on the main thread, and stores the latest waveform as a request
     dictionary. That request object is the handoff contract between preview,
-    upload, output toggling, and multi-chunk streaming.
+    upload, and output toggling.
     """
 
     def __init__(self):
@@ -1862,8 +1859,6 @@ class DashboardApp:
         self.root.minsize(900, 600)
 
         self.kepco = KepcoController()
-        self.stop_event = threading.Event()
-
         # Current waveform/session state. uploaded_request is the canonical
         # staged payload used by output toggling and status-panel rendering.
         self.csv_points = None
@@ -1881,9 +1876,6 @@ class DashboardApp:
         # None means the physical output has not been verified.  Never coerce
         # this to False: a lost dashboard session does not turn off a BOP.
         self.current_output_on: bool | None = None
-        self.sequence_active = False
-        self.is_running = False
-
         # Background work flags. They prevent duplicate button actions and help
         # status polling yield while command sequences own the hardware.
         self._scan_in_flight = False
@@ -2279,7 +2271,7 @@ class DashboardApp:
         self.off_entry.insert(0, "0.0")
         self.off_entry.pack(fill="x", padx=7, pady=(0, 2))
 
-        self.pts_label = self._lbl(self.wave_cfg, "Total Points (max 4000)")
+        self.pts_label = self._lbl(self.wave_cfg, "Total Points (max 1000)")
         self.pts_entry = ctk.CTkEntry(
             self.wave_cfg, placeholder_text="1000",
             height=24, font=ctk.CTkFont(size=11))
@@ -2819,8 +2811,8 @@ class DashboardApp:
             self.status_mode_labels[mode] = pill
 
     # -- Plot rendering ------------------------------------------------------
-    # Both preview and status plots share the same renderer so chunk boundaries,
-    # active upload highlighting, and empty-state behavior stay consistent.
+    # Both preview and status plots share the same renderer so waveform and
+    # empty-state behavior stay consistent.
     def _build_plot(self, parent, figsize):
         fig = Figure(figsize=figsize, dpi=100, facecolor=C["graph_bg"])
         ax = fig.add_subplot(111)
@@ -2842,7 +2834,7 @@ class DashboardApp:
         ax.yaxis.label.set_color(C["text2"])
         ax.grid(True, color="#2a2a40", linewidth=0.5, alpha=0.6)
 
-    def _draw_waveform_plot(self, fig, ax, canvas, points=None, chunk_idx=-1,
+    def _draw_waveform_plot(self, fig, ax, canvas, points=None,
                             empty_title="No waveform uploaded"):
         ax.clear()
         self._style_ax(ax)
@@ -2855,49 +2847,12 @@ class DashboardApp:
             canvas.draw_idle()
             return
 
-        chunk_sz = MAX_LIST_POINTS
-        chunks = [points[i:i + chunk_sz] for i in range(0, len(points), chunk_sz)]
-        colors = C["chunk_colors"]
-
-        for ci, chunk in enumerate(chunks):
-            start = ci * chunk_sz
-            xs = list(range(start, start + len(chunk)))
-            color = colors[ci % len(colors)]
-            lw = 1.3
-            alpha = 1.0
-
-            if chunk_idx >= 0:
-                if ci < chunk_idx:
-                    alpha = 0.30
-                elif ci == chunk_idx:
-                    color = C["sent"]
-                    lw = 2.8
-                else:
-                    alpha = 0.45
-
-            ax.plot(xs, chunk, color=color, linewidth=lw, alpha=alpha)
-
-        if len(chunks) > 1:
-            for ci in range(1, len(chunks)):
-                ax.axvline(ci * chunk_sz, color=C["border"],
-                           linestyle="--", linewidth=0.7, alpha=0.6)
-            if chunk_idx < 0:
-                handles = [
-                    mlines.Line2D(
-                        [], [], color=colors[i % len(colors)], linewidth=2,
-                        label=f"Chunk {i + 1} ({len(chunks[i])} pts)")
-                    for i in range(len(chunks))
-                ]
-                ax.legend(handles=handles, fontsize=7, loc="upper right",
-                          facecolor=C["card"], edgecolor=C["border"],
-                          labelcolor=C["text2"])
-
-        title = (
-            f"Waveform - {len(points)} points, {len(chunks)} chunk(s)"
-            if chunk_idx < 0
-            else f"Uploading chunk {chunk_idx + 1}/{len(chunks)}"
-        )
-        ax.set_title(title, color=C["text"], fontsize=9, pad=4)
+        ax.plot(
+            range(len(points)), points,
+            color=C["waveform"], linewidth=1.3)
+        ax.set_title(
+            f"Waveform - {len(points)} points",
+            color=C["text"], fontsize=9, pad=4)
         fig.tight_layout(pad=0.7)
         canvas.draw_idle()
 
@@ -2906,11 +2861,10 @@ class DashboardApp:
             self.preview_fig, self.preview_ax, self.preview_canvas,
             points=points, empty_title="No waveform - configure and preview")
 
-    def _update_status_plot(self, points=None, chunk_idx=-1):
+    def _update_status_plot(self, points=None):
         self._draw_waveform_plot(
             self.status_fig, self.status_ax, self.status_canvas,
-            points=points, chunk_idx=chunk_idx,
-            empty_title="No waveform uploaded")
+            points=points, empty_title="No waveform uploaded")
 
     @staticmethod
     def _lbl(parent, text):
@@ -3290,9 +3244,6 @@ class DashboardApp:
         self._connect_in_flight = False
         self._upload_in_flight = False
         self._output_toggle_in_flight = False
-        self.stop_event.set()
-        self.sequence_active = False
-        self.is_running = False
         self._set_connected_state()
         self._reset_live_status(output_state=None)
         self._reset_uploaded_state()
@@ -3351,12 +3302,9 @@ class DashboardApp:
         if req["wave"] == "CSV Custom (untested)" and req["csv_name"]:
             wave_name = f"CSV ({req['csv_name']})"
 
-        if req["wave"] == "DC":
-            device_state = "Fixed setpoint staged"
-        elif req["point_count"] <= MAX_LIST_POINTS:
-            device_state = "LIST uploaded"
-        else:
-            device_state = "First chunk uploaded; full sequence staged"
+        device_state = (
+            "Fixed setpoint staged"
+            if req["wave"] == "DC" else "LIST uploaded")
 
         values = {
             "wave": wave_name,
@@ -3397,14 +3345,12 @@ class DashboardApp:
 
     # -- Output button rendering --------------------------------------------
     # The output button has several logical locks: disconnected, unknown output
-    # state, no waveform, waveform upload, in-flight command sequence, streamed
-    # waveform active, and ready/armed.
+    # state, no waveform, waveform upload, in-flight transition, and ready/armed.
     @staticmethod
     def _output_toggle_allowed(
             connected,
             uploaded_waveform_ready,
             current_output_on,
-            sequence_active,
             upload_in_flight,
             output_toggle_in_flight):
         return (
@@ -3415,7 +3361,6 @@ class DashboardApp:
             and (
                 uploaded_waveform_ready
                 or current_output_on
-                or sequence_active
             )
         )
 
@@ -3431,7 +3376,6 @@ class DashboardApp:
             self.kepco.is_verified,
             self._uploaded_waveform_matches_selected_mode(),
             self.current_output_on,
-            self.sequence_active,
             self._upload_in_flight,
             self._output_toggle_in_flight)
 
@@ -3467,10 +3411,10 @@ class DashboardApp:
                 button_text = "Output State Unknown"
                 button_color = "#475569"
                 button_hover = "#475569"
-            elif self.current_output_on or self.sequence_active:
+            elif self.current_output_on:
                 badge_text = "LIVE"
                 badge_color = C["green"]
-                summary = "Streaming waveform" if self.sequence_active else "Output enabled"
+                summary = "Output enabled"
                 button_text = "Disable Output"
                 button_color = C["red"]
                 button_hover = "#dc2626"
@@ -3504,8 +3448,7 @@ class DashboardApp:
     def _update_output_controls(self):
         upload_state = "normal" if (
             self.kepco.is_verified
-            and not self._upload_in_flight
-            and not self.sequence_active) else "disabled"
+            and not self._upload_in_flight) else "disabled"
         self.upload_btn.configure(state=upload_state)
 
         can_toggle = self._can_toggle_output()
@@ -3521,8 +3464,6 @@ class DashboardApp:
             hint = "Applying output change..."
         elif self.current_output_on is None:
             hint = "Output state is unknown; waiting for verified device status."
-        elif self.sequence_active:
-            hint = "Streaming multi-chunk waveform."
         elif (
                 self.current_output_on
                 and not self._uploaded_waveform_matches_selected_mode()):
@@ -3832,7 +3773,7 @@ class DashboardApp:
             if self.csv_points:
                 self.pts_entry.configure(state="normal")
                 self.pts_entry.delete(0, "end")
-                self.pts_entry.insert(0, str(min(len(self.csv_points), MAX_TOTAL_POINTS)))
+                self.pts_entry.insert(0, str(len(self.csv_points)))
                 self._set_entry_enabled(self.pts_entry, False)
             self.timing_lbl.configure(
                 text="CSV uses the loaded file values and the selected frequency.")
@@ -3857,23 +3798,22 @@ class DashboardApp:
                     for row in csv.reader(handle)
                     for value in row
                     if value.strip()
-                ]
+            ]
             if len(points) < 2:
                 raise ValueError("CSV must contain at least 2 numeric points.")
+            if len(points) > MAX_LIST_POINTS:
+                raise ValueError(
+                    f"CSV contains {len(points)} points; the dashboard supports "
+                    f"a maximum of {MAX_LIST_POINTS} points in one LIST. "
+                    "Shorten the CSV before loading it.")
             self.csv_points = points
             self.csv_name = os.path.basename(path)
-            shown_points = min(len(points), MAX_TOTAL_POINTS)
-            self.csv_lbl.configure(text=f"{self.csv_name} ({shown_points} pts)")
+            self.csv_lbl.configure(text=f"{self.csv_name} ({len(points)} pts)")
             self.pts_entry.configure(state="normal")
             self.pts_entry.delete(0, "end")
-            self.pts_entry.insert(0, str(shown_points))
+            self.pts_entry.insert(0, str(len(points)))
             self._set_entry_enabled(self.pts_entry, False)
-            if len(points) > MAX_TOTAL_POINTS:
-                self.log(
-                    f"Loaded CSV {self.csv_name}; using first {MAX_TOTAL_POINTS} points.",
-                    "warn")
-            else:
-                self.log(f"Loaded CSV: {self.csv_name} -> {len(points)} points", "ok")
+            self.log(f"Loaded CSV: {self.csv_name} -> {len(points)} points", "ok")
         except Exception as exc:
             messagebox.showerror("CSV Error", str(exc))
 
@@ -4221,12 +4161,18 @@ class DashboardApp:
             "point_count": 1, "loop": 0, "dwell": None,
             "actual_frequency": 0.0,
             "points": [value], "plot_points": [value, value],
-            "csv_name": None, "first_chunk_primed": False,
+            "csv_name": None,
         }
 
     def _build_csv_request(self, mode):
         if not self.csv_points:
             messagebox.showerror("Input Error", "Load a CSV file first.")
+            return None
+        if len(self.csv_points) > MAX_LIST_POINTS:
+            messagebox.showerror(
+                "Input Error",
+                f"CSV waveforms are limited to {MAX_LIST_POINTS} points. "
+                f"The loaded file contains {len(self.csv_points)} points.")
             return None
         freq = self._read_float(self.freq_entry, "frequency")
         loop = self._read_int(self.loop_entry, "loop count")
@@ -4234,7 +4180,7 @@ class DashboardApp:
             if loop is not None and loop < 0:
                 messagebox.showerror("Input Error", "Loop count must be 0 or greater.")
             return None
-        point_count = min(len(self.csv_points), MAX_TOTAL_POINTS)
+        point_count = len(self.csv_points)
         actual, dwell, actual_freq, warns = WaveformGen.calculate_timing(freq, point_count)
         if actual == 0:
             messagebox.showerror("Input Error", "\n".join(warns))
@@ -4244,15 +4190,11 @@ class DashboardApp:
             if len(points) < 2:
                 messagebox.showerror("Input Error", "CSV must contain at least 2 points.")
             return None
-        if len(self.csv_points) > MAX_TOTAL_POINTS:
-            warns.append(f"CSV truncated to {MAX_TOTAL_POINTS} points.")
         lines = [
-            f"Points: {len(points)} ({math.ceil(len(points) / MAX_LIST_POINTS)} chunk(s))",
+            f"Points: {len(points)} (single LIST)",
             f"Dwell: {dwell * 1000:.4f} ms",
             f"Actual frequency: {actual_freq:.4f} Hz",
         ]
-        if len(points) > MAX_LIST_POINTS:
-            lines.append("Waveforms over 1000 points stream in chunks when output is ON.")
         lines.extend([f"Warning: {warning}" for warning in warns])
         self._set_timing_lines(lines)
         return {
@@ -4261,7 +4203,7 @@ class DashboardApp:
             "point_count": len(points), "loop": loop, "dwell": dwell,
             "actual_frequency": actual_freq,
             "points": points, "plot_points": points,
-            "csv_name": self.csv_name, "first_chunk_primed": False,
+            "csv_name": self.csv_name,
         }
 
     def _build_standard_request(self, mode):
@@ -4277,7 +4219,12 @@ class DashboardApp:
                 "Input Error",
                 "Need at least 2 points and a loop count of 0 or greater.")
             return None
-        pts = min(pts, MAX_TOTAL_POINTS)
+        if pts > MAX_LIST_POINTS:
+            messagebox.showerror(
+                "Input Error",
+                f"LIST waveforms are limited to {MAX_LIST_POINTS} points. "
+                f"Requested: {pts}.")
+            return None
         actual, dwell, actual_freq, warns = WaveformGen.calculate_timing(freq, pts)
         if actual == 0:
             messagebox.showerror("Input Error", "\n".join(warns))
@@ -4286,12 +4233,10 @@ class DashboardApp:
         if not self._check_interlock(mode, points, f"{self.wave_var.get()} waveform"):
             return None
         lines = [
-            f"Points: {len(points)} ({math.ceil(len(points) / MAX_LIST_POINTS)} chunk(s))",
+            f"Points: {len(points)} (single LIST)",
             f"Dwell: {dwell * 1000:.4f} ms",
             f"Actual frequency: {actual_freq:.4f} Hz",
         ]
-        if len(points) > MAX_LIST_POINTS:
-            lines.append("Waveforms over 1000 points stream in chunks when output is ON.")
         lines.extend([f"Warning: {warning}" for warning in warns])
         self._set_timing_lines(lines)
         return {
@@ -4300,7 +4245,7 @@ class DashboardApp:
             "point_count": len(points), "loop": loop, "dwell": dwell,
             "actual_frequency": actual_freq,
             "points": points, "plot_points": points,
-            "csv_name": None, "first_chunk_primed": False,
+            "csv_name": None,
         }
 
     def _read_waveform_request(self):
@@ -4447,10 +4392,10 @@ class DashboardApp:
     def _man_reset(self):
         if not self._man_require_conn():
             return
-        if self.sequence_active or self._upload_in_flight:
+        if self._upload_in_flight:
             messagebox.showwarning(
                 "Busy",
-                "Stop the active upload/stream before resetting the device.")
+                "Wait for the active upload before resetting the device.")
             return
         self._pause_status_polling()
         ok, msg, snapshot = self._run_dc_transaction(
@@ -4460,9 +4405,6 @@ class DashboardApp:
             expected_mode="VOLT",
             expected_output=False)
         if ok:
-            self.stop_event.set()
-            self.sequence_active = False
-            self.is_running = False
             self.current_control_mode = "VOLT"
             self.control_mode_var.set("VOLT")
             self._update_mode_buttons("VOLT")
@@ -4745,7 +4687,7 @@ class DashboardApp:
             self.control_mode_var.set(mode_text)
             self._update_mode_buttons(mode_text)
 
-        if not self.sequence_active and not self._output_toggle_in_flight:
+        if not self._output_toggle_in_flight:
             self._set_output_ui_state(is_on)
         else:
             self.current_output_on = is_on
@@ -4755,18 +4697,13 @@ class DashboardApp:
         self._update_dc_current_monitors(v, c, is_on, mode_text)
         self._update_output_controls()
 
-    # -- Upload and multi-chunk streaming ------------------------------------
-    # Upload prepares or primes the selected waveform. DC and <=1000-point LISTs
-    # fit in a single device state; larger LISTs stream chunk-by-chunk because
-    # the BIT card exposes only one active LIST buffer at a time.
+    # -- Upload ---------------------------------------------------------------
+    # Every supported LIST waveform fits in the BIT card's single LIST buffer.
+    # Oversized requests are rejected during request construction and checked
+    # again in the worker before any device command is sent.
     def _upload_waveform(self):
         """Start upload/preparation for the current waveform request."""
         if self._upload_in_flight:
-            return
-        if self.sequence_active:
-            messagebox.showwarning(
-                "Waveform Running",
-                "Turn output off before uploading a new multi-chunk streamed waveform.")
             return
         if not self.kepco.is_verified:
             messagebox.showerror("Error", "Verify communication with a device first.")
@@ -4778,7 +4715,6 @@ class DashboardApp:
         self.preview_points = req["plot_points"]
         self._update_preview_plot(req["plot_points"])
         self._upload_in_flight = True
-        self.is_running = True
         self.prog_lbl.configure(text="Uploading...")
         self.progress.set(0)
         self._pause_status_polling()
@@ -4787,7 +4723,6 @@ class DashboardApp:
 
     def _upload_request_worker(self, req):
         """Run the upload path off the UI thread, then report completion."""
-        start_sequence = False
         postflight_snapshot = None
         try:
             def upload_transaction():
@@ -4800,21 +4735,24 @@ class DashboardApp:
                         "DC setpoint staging",
                         expected_mode=req["mode"],
                         expected_output=expected_output)
-                    return dc_ok, dc_msg, False, snapshot
-                if req["point_count"] <= MAX_LIST_POINTS:
-                    list_ok, list_msg = self._upload_single_chunk_request(req)
-                    return list_ok, list_msg, False, None
-                prime_ok, prime_msg, start = self._prime_multi_chunk_request(req)
-                return prime_ok, prime_msg, start, None
+                    return dc_ok, dc_msg, snapshot
+                if req["point_count"] > MAX_LIST_POINTS:
+                    return (
+                        False,
+                        f"LIST request has {req['point_count']} points; "
+                        f"maximum is {MAX_LIST_POINTS}",
+                        None)
+                list_ok, list_msg = self._upload_single_chunk_request(req)
+                return list_ok, list_msg, None
 
-            ok, msg, start_sequence, postflight_snapshot = (
+            ok, msg, postflight_snapshot = (
                 self.kepco.run_transaction(upload_transaction))
         except Exception as exc:
             ok = False
             msg = str(exc)
         self._call_on_ui(
             lambda: self._upload_request_done(
-                req, ok, msg, start_sequence, postflight_snapshot))
+                req, ok, msg, postflight_snapshot))
 
     def _apply_dc_request(self, req):
         """Stage or live-update a fixed DC setpoint with safe limit setup."""
@@ -4920,35 +4858,7 @@ class DashboardApp:
             return True, f"{msg}; applied without toggling output"
         return True, msg
 
-    def _prime_multi_chunk_request(self, req):
-        """Upload the first LIST chunk; remaining chunks stream on output ON."""
-        voltage_compliance, current_limit = self._get_request_limits(req)
-        chunks = [
-            req["points"][i:i + MAX_LIST_POINTS]
-            for i in range(0, len(req["points"]), MAX_LIST_POINTS)
-        ]
-
-        def progress_cb(sent, total):
-            pct = sent / max(total, 1)
-            self._call_on_ui(lambda p=pct: self.progress.set(p))
-            self._call_on_ui(
-                lambda s=sent, t=total: self.prog_lbl.configure(
-                    text=f"Priming chunk 1/{len(chunks)}... {s}/{t} pts"))
-
-        ok, msg = self.kepco.upload_list_chunk(
-            chunks[0], req["dwell"], req["mode"],
-            progress_cb=progress_cb,
-            voltage_compliance=voltage_compliance,
-            current_limit=current_limit)
-        if not ok:
-            return False, msg, False
-        req["first_chunk_primed"] = True
-        if self.current_output_on:
-            return True, f"{msg}; continuing streamed execution without toggling output", True
-        return True, f"{msg}; remaining {len(chunks) - 1} chunk(s) staged for output-on streaming", False
-
-    def _upload_request_done(self, req, ok, msg, start_sequence,
-                             postflight_snapshot=None):
+    def _upload_request_done(self, req, ok, msg, postflight_snapshot=None):
         self._upload_in_flight = False
         prev_req = self.uploaded_request or {}
         self.uploaded_request = req if ok else self.uploaded_request
@@ -4970,16 +4880,6 @@ class DashboardApp:
                 }
                 self._set_live_measurement_axis(req["mode"], req["offset"])
             self.log(msg, "ok")
-            if start_sequence:
-                started, start_msg = self._begin_uploaded_sequence(
-                    req,
-                    output_already_on=self.current_output_on,
-                    skip_first_upload=req.get("first_chunk_primed", False),
-                )
-                if started:
-                    self.log(start_msg, "info")
-                    return
-                self.log(start_msg, "err")
             self.prog_lbl.configure(
                 text="Setpoint staged" if req["kind"] == "DC" else "Uploaded")
             self.progress.set(1.0)
@@ -4990,7 +4890,6 @@ class DashboardApp:
             if not self.kepco.is_verified:
                 self._handle_comm_failure("upload")
 
-        self.is_running = False
         if req["kind"] != "DC":
             self._resume_status_polling()
         elif ok:
@@ -4999,171 +4898,9 @@ class DashboardApp:
             self._resume_or_handle_transaction_failure("upload")
         self._update_output_controls()
 
-    def _begin_uploaded_sequence(self, req, output_already_on=False, skip_first_upload=False):
-        """Begin background streaming for a staged multi-chunk LIST waveform."""
-        if not self.kepco.is_verified:
-            return False, "Device state is not verified."
-        if self.sequence_active:
-            return False, "A streamed waveform is already active."
-
-        self.stop_event.clear()
-        self.sequence_active = True
-        self.is_running = True
-        self._output_toggle_in_flight = False
-        self._pause_status_polling()
-        self._update_output_controls()
-        if not output_already_on:
-            self._set_output_ui_state(True)
-        self.prog_lbl.configure(text="Streaming...")
-        self.progress.set(0)
-        req["first_chunk_primed"] = False
-        threading.Thread(
-            target=self._sequence_worker,
-            args=(req, output_already_on, skip_first_upload),
-            daemon=True).start()
-        return True, "Streaming multi-chunk waveform."
-
-    def _sequence_worker(self, req, output_already_on=False, skip_first_upload=False):
-        """Upload/run LIST chunks until loop count completes or stop is requested."""
-        ok = True
-        final_msg = "Waveform sequence complete."
-        stopped = False
-        forever = req["loop"] == 0
-        iteration = 0
-        # A primed first chunk has already established and verified the single
-        # complementary limit. Preserve it for all later chunks; the manual
-        # recommends rewriting the limit only when its value changes.
-        limit_initialized = bool(skip_first_upload)
-        try:
-            chunks = [
-                req["points"][i:i + MAX_LIST_POINTS]
-                for i in range(0, len(req["points"]), MAX_LIST_POINTS)
-            ]
-            mode = req["mode"]
-            voltage_compliance, current_limit = self._get_request_limits(req)
-
-            while not self.stop_event.is_set():
-                iteration += 1
-                if not forever and iteration > req["loop"]:
-                    break
-
-                for chunk_idx, chunk in enumerate(chunks):
-                    if self.stop_event.is_set():
-                        stopped = True
-                        break
-
-                    self._call_on_ui(
-                        lambda pts=req["plot_points"], idx=chunk_idx:
-                            self._update_status_plot(pts, chunk_idx=idx))
-
-                    need_upload = not (skip_first_upload and iteration == 1 and chunk_idx == 0)
-                    if need_upload:
-                        def progress_cb(sent, total, ci=chunk_idx, nc=len(chunks)):
-                            pct = sent / max(total, 1)
-                            self._call_on_ui(lambda p=pct: self.progress.set(p))
-                            self._call_on_ui(
-                                lambda c=ci, n=nc, s=sent, t=total:
-                                    self.prog_lbl.configure(
-                                        text=f"Uploading chunk {c + 1}/{n}... {s}/{t} pts"))
-
-                        ok, msg = self.kepco.upload_list_chunk(
-                            chunk, req["dwell"], mode,
-                            progress_cb=progress_cb,
-                            voltage_compliance=voltage_compliance,
-                            current_limit=current_limit,
-                            apply_limit_setup=not limit_initialized)
-                        if not ok:
-                            final_msg = f"Chunk {chunk_idx + 1} upload failed: {msg}"
-                            break
-                        limit_initialized = True
-
-                    # Each uploaded chunk is armed as a one-count LIST run. Once
-                    # the output is already on, later chunks avoid another OUTP ON
-                    # transition to keep live streaming as smooth as possible.
-                    enable_output = not output_already_on
-                    ok, msg = self.kepco.run_list(
-                        mode,
-                        count=1,
-                        enable_output=enable_output,
-                        voltage_compliance=voltage_compliance,
-                        current_limit=current_limit,
-                        apply_limit_setup=False)
-                    if not ok:
-                        final_msg = f"Chunk {chunk_idx + 1} run failed: {msg}"
-                        break
-
-                    output_already_on = True
-                    self._call_on_ui(lambda: self._set_output_ui_state(True))
-                    self._call_on_ui(
-                        lambda c=chunk_idx, n=len(chunks), i=iteration:
-                            self.prog_lbl.configure(
-                                text=f"Running chunk {c + 1}/{n} (loop {i})"))
-
-                    # The hardware does not signal chunk completion back to the
-                    # UI, so estimate from dwell time and chunk size, plus a
-                    # small guard interval for command processing.
-                    wait_time = len(chunk) * req["dwell"] + 0.10
-                    end_time = time.time() + wait_time
-                    while time.time() < end_time:
-                        if self.stop_event.is_set():
-                            stopped = True
-                            break
-                        time.sleep(0.05)
-                    if stopped:
-                        break
-
-                    self._call_on_ui(
-                        lambda p=(chunk_idx + 1) / max(len(chunks), 1): self.progress.set(p))
-
-                skip_first_upload = False
-                if not ok or stopped:
-                    break
-                if forever:
-                    continue
-
-            if forever and not stopped and ok:
-                final_msg = "Streamed waveform stopped."
-        except Exception as exc:
-            ok = False
-            final_msg = str(exc)
-
-        stop_ok = True
-        if output_already_on:
-            stop_ok, stop_msg = self.kepco.stop(base_mode=req["mode"])
-            if not stop_ok:
-                ok = False
-                final_msg = stop_msg
-        self._call_on_ui(
-            lambda: self._sequence_done(req, ok, final_msg, stopped, stop_ok))
-
-    def _sequence_done(self, req, ok, msg, stopped, stop_ok):
-        self.sequence_active = False
-        self.is_running = False
-        self._output_toggle_in_flight = False
-        if self.uploaded_request:
-            self.uploaded_request["first_chunk_primed"] = False
-
-        # A failed stop may still have reached the device. Preserve uncertainty
-        # until the resumed status poll authoritatively reconciles OUTP?.
-        self._set_output_ui_state(False if stop_ok else None)
-        self.progress.set(0)
-        self.prog_lbl.configure(text="Idle")
-        self._update_status_plot(req["plot_points"])
-
-        if ok:
-            self.log("Waveform stream stopped." if stopped else msg, "ok")
-        else:
-            self.log(msg, "err")
-            if not self.kepco.is_verified:
-                self._handle_comm_failure("waveform streaming")
-
-        self._resume_status_polling()
-        self._update_output_controls()
-
     # -- Output control ------------------------------------------------------
-    # The Output button is a router: DC uses fixed setpoint commands, single
-    # LIST waveforms arm directly, and multi-chunk LISTs hand off to the
-    # streaming worker above.
+    # The Output button is a router: DC uses fixed setpoint commands and LIST
+    # waveforms arm the one verified device buffer directly.
     def _toggle_output(self):
         """Turn output on/off while preserving interlocks and staged limits."""
         if self._output_toggle_in_flight:
@@ -5208,22 +4945,6 @@ class DashboardApp:
             if not req:
                 self._set_output_ui_state(False)
                 return
-        if not target_on and self.sequence_active:
-            self._output_toggle_in_flight = True
-            self.output_toggle_btn.configure(state="disabled")
-            self.log("Stopping streamed waveform...", "info")
-            self.stop_event.set()
-            return
-        if target_on and req and req["kind"] == "LIST" and req["point_count"] > MAX_LIST_POINTS:
-            started, msg = self._begin_uploaded_sequence(
-                req, output_already_on=False,
-                skip_first_upload=req.get("first_chunk_primed", False))
-            if not started:
-                self._set_output_ui_state(False)
-                self.log(msg, "err")
-            else:
-                self.log(msg, "info")
-            return
 
         self._output_toggle_in_flight = True
         self.output_toggle_btn.configure(state="disabled")
@@ -5433,11 +5154,10 @@ class DashboardApp:
             self.conn_btn.configure(state="disabled", text="Connecting...")
             threading.Thread(target=self._connect_worker, args=(ip,), daemon=True).start()
         else:
-            if (self.sequence_active or self._upload_in_flight
-                    or self._output_toggle_in_flight):
+            if self._upload_in_flight or self._output_toggle_in_flight:
                 messagebox.showwarning(
                     "Waveform Busy",
-                    "Wait for the active output transaction, upload, or stream "
+                    "Wait for the active output transaction or upload "
                     "to finish before disconnecting.")
                 return
             self.log("Disconnect requested", "info")
@@ -5618,9 +5338,6 @@ class DashboardApp:
             return
 
         self._stop_status_polling()
-        self.stop_event.set()
-        self.sequence_active = False
-        self.is_running = False
         self._set_connected_state()
         self._reset_live_status(output_state=None if output_unknown else False)
         self._reset_uploaded_state()
@@ -5630,7 +5347,6 @@ class DashboardApp:
     # Closing the window follows the same safety gate as Disconnect, then tears
     # down polling, data collection, session logging, and queued UI callbacks.
     def _on_close(self):
-        self.stop_event.set()
         self._pause_status_polling()
 
         def close_transaction():
