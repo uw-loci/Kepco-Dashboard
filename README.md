@@ -105,7 +105,9 @@ While communication is verified (`HEALTHY`), the dashboard polls:
 - `OUTP?`
 - `FUNC:MODE?`
 
-During steady-state operation, these four-query status snapshots run every 5 seconds. Connect and operator transactions can still request an immediate refresh.
+During steady-state operation, the next four-query status snapshot is scheduled
+1 second after the previous snapshot completes. Connect and operator
+transactions can still request an immediate refresh.
 
 The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM WebMonitor log directory:
 

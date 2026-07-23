@@ -60,7 +60,7 @@ CHUNK_CMD_LIMIT  = 200       # safe margin for 253-byte SCPI buffer
 SCPI_CMD_GAP     = 0.035     # > 25ms spec throughput (PAR 1.2.2)
 LIST_VALUES_PER_CMD = 10     # manual examples show max 11 (PAR B.45/B.31)
 RECV_TIMEOUT     = 6.0       # socket recv timeout for queries
-STATUS_POLL_INTERVAL_MS = 5000
+STATUS_POLL_INTERVAL_MS = 1000
 BOP_MAX_VOLTAGE  = 100.0     # BOP 100-2ML voltage rating
 BOP_MAX_CURRENT  = 2.0       # BOP 100-2ML current rating
 # BIT 802E manual Table 1-4: the signed main channel has 15 magnitude
