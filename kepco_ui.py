@@ -2516,11 +2516,9 @@ class DashboardApp:
 
         monitor_row = ctk.CTkFrame(monitor_card, fg_color="transparent")
         monitor_row.pack(fill="x", padx=10, pady=(0, 8))
-        monitor_row.grid_columnconfigure(0, weight=1)
-        monitor_row.grid_columnconfigure(1, weight=1)
 
         v_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        v_ctrl.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        v_ctrl.pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(
             v_ctrl, text="Voltage tolerance (%):",
             text_color=C["text2"], font=ctk.CTkFont(size=12),
@@ -2544,9 +2542,14 @@ class DashboardApp:
             font=ctk.CTkFont(size=12))
         self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
         self.vmon_threshold_entry.pack(side="left")
+        ctk.CTkButton(
+            voltage_threshold_row, text="Set", width=34, height=24,
+            command=lambda: self._set_monitor_threshold("VOLT"),
+            fg_color="#374151", hover_color="#4b5563").pack(
+            side="left", padx=(4, 0))
 
         i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
-        i_ctrl.grid(row=0, column=1, sticky="ew")
+        i_ctrl.pack(fill="x")
         ctk.CTkLabel(
             i_ctrl, text="Current tolerance (%):",
             text_color=C["text2"], font=ctk.CTkFont(size=12),
@@ -2571,7 +2574,7 @@ class DashboardApp:
         self.imon_threshold_entry.pack(side="left")
         ctk.CTkButton(
             current_threshold_row, text="Set", width=34, height=24,
-            command=self._set_monitor_thresholds,
+            command=lambda: self._set_monitor_threshold("CURR"),
             fg_color="#374151", hover_color="#4b5563").pack(
             side="left", padx=(4, 0))
 
@@ -3535,25 +3538,34 @@ class DashboardApp:
     def _read_monitor_thresholds(self):
         return self.vmon_threshold_pct, self.imon_threshold_pct
 
-    def _set_monitor_thresholds(self):
-        voltage_pct = self._as_float(self.vmon_threshold_entry.get())
-        current_pct = self._as_float(self.imon_threshold_entry.get())
-        if voltage_pct is None or voltage_pct <= 0 or current_pct is None or current_pct <= 0:
+    def _set_monitor_threshold(self, channel):
+        channel = (channel or "").upper()
+        if channel == "VOLT":
+            entry = self.vmon_threshold_entry
+            display = self.vmon_threshold_display
+            name = "Voltage"
+        elif channel == "CURR":
+            entry = self.imon_threshold_entry
+            display = self.imon_threshold_display
+            name = "Current"
+        else:
+            raise ValueError(f"Unsupported monitor threshold '{channel}'")
+
+        threshold_pct = self._as_float(entry.get())
+        if threshold_pct is None or threshold_pct <= 0:
             messagebox.showerror(
-                "Invalid Monitor Thresholds",
-                "Please enter positive percentage values for both voltage and current thresholds.")
+                "Invalid Monitor Threshold",
+                f"Please enter a positive percentage value for the "
+                f"{name.lower()} threshold.")
             return
 
-        self.vmon_threshold_pct = voltage_pct
-        self.imon_threshold_pct = current_pct
-        self._normalize_limit_entry_text(
-            self.vmon_threshold_entry, voltage_pct)
-        self._normalize_limit_entry_text(
-            self.imon_threshold_entry, current_pct)
-        self.vmon_threshold_display.configure(
-            text=self._format_symmetric_display(voltage_pct))
-        self.imon_threshold_display.configure(
-            text=self._format_symmetric_display(current_pct))
+        if channel == "VOLT":
+            self.vmon_threshold_pct = threshold_pct
+        else:
+            self.imon_threshold_pct = threshold_pct
+        self._normalize_limit_entry_text(entry, threshold_pct)
+        display.configure(
+            text=self._format_symmetric_display(threshold_pct))
 
     def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
         req = self.uploaded_request or {}

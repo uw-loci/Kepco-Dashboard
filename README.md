@@ -117,7 +117,7 @@ The newest valid JSONL status entry is used. If the file cannot be found, cannot
 
 ## DC Current Monitoring
 
-The **DC Monitor Thresholds** controls set percentage tolerances for the DC current monitor. Their dark read-only boxes show the committed symmetric tolerances as `+/-value`; adjacent entries remain pending until **Set** is pressed. The default voltage and current tolerances are both `5%`.
+The **DC Monitor Thresholds** controls set percentage tolerances for the DC current monitor. Their dark read-only boxes show the committed symmetric tolerances as `+/-value`; each vertically stacked threshold has its own pending entry and **Set** button. The default voltage and current tolerances are both `5%`.
 
 The monitor is active only during this stage:
 
