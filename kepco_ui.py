@@ -69,10 +69,8 @@ MAIN_CHANNEL_MAGNITUDE_BITS = 15
 LIMIT_CHANNEL_PROGRAMMING_BITS = 12
 PROGRAMMED_VALUE_LSB_MARGIN = 2.0
 PROGRAMMED_VALUE_RELATIVE_TOLERANCE = 1e-4
-DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE = 40.0
-DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE = -40.0
-DEFAULT_POSITIVE_CURRENT_LIMIT = 2.0
-DEFAULT_NEGATIVE_CURRENT_LIMIT = -2.0
+DEFAULT_VOLTAGE_LIMIT = 40.0
+DEFAULT_CURRENT_LIMIT = 2.0
 SOLENOID_TEMPERATURE_POLL_MS = 3000
 PMON_STALE_SECONDS = 10.0
 DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
@@ -778,32 +776,20 @@ class KepcoController:
         return self.send_cmd(cmd)
 
     # -- SCPI formatting and limit helpers -----------------------------------
-    # The UI retains signed bounds for request validation, but the BIT has one
-    # complementary hardware-limit channel.  Program that channel once with an
-    # absolute magnitude, as described in manual section 4.5.1.1.
+    # The BIT has one complementary hardware-limit channel. Program that
+    # channel with one absolute magnitude, as described in manual section
+    # 4.5.1.1. The same magnitude is the symmetric software interlock.
     @staticmethod
     def format_scpi_value(value):
         return f"{float(value):.6g}"
 
-    @classmethod
-    def limit_pair(cls, values, default_positive, default_negative):
-        if values is None:
-            return float(default_positive), float(default_negative)
-        if isinstance(values, dict):
-            pos = values.get("positive", values.get("pos", default_positive))
-            neg = values.get("negative", values.get("neg", default_negative))
-            return float(pos), float(neg)
-        if isinstance(values, (list, tuple)) and len(values) >= 2:
-            return float(values[0]), float(values[1])
-        magnitude = abs(float(values))
-        return magnitude, -magnitude
-
-    @classmethod
-    def device_limit_magnitude(cls, limits, default_positive, default_negative):
-        """Return the one absolute complementary limit supported by the BIT."""
-        positive, negative = cls.limit_pair(
-            limits, default_positive, default_negative)
-        return max(abs(positive), abs(negative))
+    @staticmethod
+    def absolute_limit(value, default):
+        """Return the one positive limit magnitude supported by the BIT."""
+        magnitude = abs(float(default if value is None else value))
+        if not math.isfinite(magnitude) or magnitude <= 0:
+            raise ValueError("Limit magnitude must be finite and greater than zero")
+        return magnitude
 
     @classmethod
     def complementary_limit_cmd(cls, mode, voltage_compliance=None,
@@ -811,16 +797,12 @@ class KepcoController:
         """Build the manual-style single complementary-channel limit command."""
         mode = (mode or "VOLT").upper()
         if mode == "CURR":
-            magnitude = cls.device_limit_magnitude(
-                voltage_compliance,
-                DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
-                DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE)
+            magnitude = cls.absolute_limit(
+                voltage_compliance, DEFAULT_VOLTAGE_LIMIT)
             return f"VOLT {cls.format_scpi_value(magnitude)}"
         if mode == "VOLT":
-            magnitude = cls.device_limit_magnitude(
-                current_limit,
-                DEFAULT_POSITIVE_CURRENT_LIMIT,
-                DEFAULT_NEGATIVE_CURRENT_LIMIT)
+            magnitude = cls.absolute_limit(
+                current_limit, DEFAULT_CURRENT_LIMIT)
             return f"CURR {cls.format_scpi_value(magnitude)}"
         raise ValueError(f"Unsupported FUNC:MODE '{mode}'")
 
@@ -852,18 +834,12 @@ class KepcoController:
         )
 
     @classmethod
-    def default_voltage_limits(cls):
-        return (
-            DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
-            DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE,
-        )
+    def default_voltage_limit(cls):
+        return DEFAULT_VOLTAGE_LIMIT
 
     @classmethod
-    def default_current_limits(cls):
-        return (
-            DEFAULT_POSITIVE_CURRENT_LIMIT,
-            DEFAULT_NEGATIVE_CURRENT_LIMIT,
-        )
+    def default_current_limit(cls):
+        return DEFAULT_CURRENT_LIMIT
 
     def _log_sequence(self, label, cmds):
         self._dbg("info", f"{label}: {'; '.join(cmds)}")
@@ -1026,6 +1002,53 @@ class KepcoController:
                 f"{label}: expected {mode}:MODE FIX, received {source_resp!r}")
         return True, "Fixed mode verified"
 
+    def verify_complementary_limit(
+            self, mode, voltage_compliance=None, current_limit=None,
+            label="Complementary-limit verification"):
+        """Verify only the absolute limit channel for the selected main mode."""
+        if not self._is_socket_worker():
+            return self.run_transaction(
+                self.verify_complementary_limit,
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                label=label)
+        mode = (mode or "VOLT").upper()
+        if mode not in ("VOLT", "CURR"):
+            return False, f"Unsupported FUNC:MODE '{mode}'"
+        channel = "VOLT" if mode == "CURR" else "CURR"
+        expected_limit = float(
+            self.complementary_limit_cmd(
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit).split()[1])
+        limit_resp = self.send_query(f"{channel}?")
+        try:
+            actual_limit = abs(float(str(limit_resp).strip()))
+            if not (math.isfinite(actual_limit)
+                    and math.isfinite(expected_limit)):
+                raise ValueError("non-finite programmed limit")
+        except (TypeError, ValueError):
+            return self._reject_invalid_response(
+                f"{label}: invalid {channel}? response {limit_resp!r}")
+        tolerance = self.programmed_value_tolerance(
+            channel, expected_limit, limit_channel=True)
+        difference = abs(actual_limit - expected_limit)
+        if difference > tolerance:
+            return False, (
+                f"{label}: expected {channel} limit magnitude "
+                f"{expected_limit:g}, received {limit_resp!r} "
+                f"(difference {difference:.6g} exceeds hardware-aware "
+                f"tolerance {tolerance:.6g})")
+        if difference > 0:
+            self._dbg(
+                "info",
+                f"{label}: accepted calibrated {channel} limit "
+                f"{actual_limit:.9g} for requested {expected_limit:.9g} "
+                f"(difference {difference:.6g}, tolerance "
+                f"{tolerance:.6g})")
+        return True, "Complementary limit verified"
+
     def verify_programmed_configuration(
             self, mode, voltage_compliance=None, current_limit=None,
             expected_setpoint=None, verify_limit=True,
@@ -1055,37 +1078,13 @@ class KepcoController:
                 f"{label}: invalid {mode}:RANG? response {range_resp!r}")
 
         if verify_limit:
-            channel = "VOLT" if mode == "CURR" else "CURR"
-            expected_limit = float(
-                self.complementary_limit_cmd(
-                    mode,
-                    voltage_compliance=voltage_compliance,
-                    current_limit=current_limit).split()[1])
-            limit_resp = self.send_query(f"{channel}?")
-            try:
-                actual_limit = abs(float(str(limit_resp).strip()))
-                if not (math.isfinite(actual_limit)
-                        and math.isfinite(expected_limit)):
-                    raise ValueError("non-finite programmed limit")
-            except (TypeError, ValueError):
-                return self._reject_invalid_response(
-                    f"{label}: invalid {channel}? response {limit_resp!r}")
-            tolerance = self.programmed_value_tolerance(
-                channel, expected_limit, limit_channel=True)
-            difference = abs(actual_limit - expected_limit)
-            if difference > tolerance:
-                return False, (
-                    f"{label}: expected {channel} limit magnitude "
-                    f"{expected_limit:g}, received {limit_resp!r} "
-                    f"(difference {difference:.6g} exceeds hardware-aware "
-                    f"tolerance {tolerance:.6g})")
-            if difference > 0:
-                self._dbg(
-                    "info",
-                    f"{label}: accepted calibrated {channel} limit "
-                    f"{actual_limit:.9g} for requested {expected_limit:.9g} "
-                    f"(difference {difference:.6g}, tolerance "
-                    f"{tolerance:.6g})")
+            ok, reason = self.verify_complementary_limit(
+                mode,
+                voltage_compliance=voltage_compliance,
+                current_limit=current_limit,
+                label=label)
+            if not ok:
+                return False, reason
 
         if expected_setpoint is not None:
             setpoint_resp = self.send_query(f"{mode}?")
@@ -1138,7 +1137,7 @@ class KepcoController:
             [command, "*WAI"], label=label)
         if not ok:
             return False, reason
-        return self.verify_programmed_configuration(
+        return self.verify_complementary_limit(
             mode,
             voltage_compliance=voltage_compliance,
             current_limit=current_limit,
@@ -1455,12 +1454,13 @@ class KepcoController:
     # -- List upload (single chunk <= 1000 pts) -----------------------------
     def upload_list_chunk(self, points, dwell, mode="VOLT",
                           progress_cb=None, voltage_compliance=None,
-                          current_limit=None):
+                          current_limit=None, apply_limit_setup=True):
         """Upload one chunk (<= 1000 points) with paced writes + verification.
 
         Strategy:
           1. Disarm: switch the active LIST program back to FIX, then zero it
-          2. Setup: FUNC:MODE, RANG, zero, one limit, LIST:CLE, *WAI
+          2. Setup: FUNC:MODE, RANG, zero, optional one-time limit,
+             LIST:CLE, *WAI
           3. Values: send LIST:{mode} batches of <= 10 values each,
              each followed only by the mandatory 35 ms gap
           4. Dwell: send LIST:DWEL once after values
@@ -1478,7 +1478,8 @@ class KepcoController:
                 self.upload_list_chunk, points, dwell, mode,
                 progress_cb=progress_cb,
                 voltage_compliance=voltage_compliance,
-                current_limit=current_limit)
+                current_limit=current_limit,
+                apply_limit_setup=apply_limit_setup)
         with self._lock:
             try:
                 self._ensure_verified_for_io()
@@ -1520,6 +1521,7 @@ class KepcoController:
                     voltage_compliance=voltage_compliance,
                     current_limit=current_limit,
                     initial_setpoint=0.0,
+                    apply_complementary_limit=apply_limit_setup,
                     label=f"LIST upload fixed-mode setup ({mode})")
                 if not ok:
                     return False, setup_msg
@@ -1869,6 +1871,13 @@ class DashboardApp:
         self.preview_points = []
         self.uploaded_request = None
         self.uploaded_waveform_ready = False
+        # Canonical dashboard limits. The adjacent entry fields are pending
+        # edits; these values change only after the operator presses Set and
+        # the local staging/device transaction succeeds.
+        self._dashboard_limits = {
+            "VOLT": DEFAULT_VOLTAGE_LIMIT,
+            "CURR": DEFAULT_CURRENT_LIMIT,
+        }
         # None means the physical output has not been verified.  Never coerce
         # this to False: a lost dashboard session does not turn off a BOP.
         self.current_output_on: bool | None = None
@@ -2401,41 +2410,39 @@ class DashboardApp:
             self.mode_buttons[mode] = btn
         ctk.CTkLabel(
             mode_card, text="Waveform uploads use the selected mode.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            text_color=C["text2"], font=ctk.CTkFont(size=12),
             justify="left", wraplength=220).pack(
             anchor="w", padx=10, pady=(0, 8))
 
         limits_card = ctk.CTkFrame(left_controls, corner_radius=12)
         limits_card.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(
-            limits_card, text="Set V/I Limits",
+            limits_card, text="Set Absolute V/I Limits",
             font=ctk.CTkFont(size=13, weight="bold")).pack(
-            anchor="w", padx=10, pady=(8, 4))
-        ctk.CTkLabel(
-            limits_card,
-            text="Signed software bounds; hardware uses the larger |limit|.",
-            text_color=C["text2"], font=ctk.CTkFont(size=9),
-            justify="left", wraplength=220).pack(
-            anchor="w", padx=10, pady=(0, 5))
+            anchor="w", padx=10, pady=(8, 6))
 
         v_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         v_row.pack(fill="x", padx=10, pady=(0, 4))
-        ctk.CTkLabel(v_row, text="Voltage limit (V):",
-                     font=ctk.CTkFont(size=10), anchor="w", wraplength=175).pack(fill="x")
+        ctk.CTkLabel(v_row, text="Voltage limit (+/- V):",
+                     font=ctk.CTkFont(size=12), anchor="w", wraplength=175).pack(fill="x")
         v_ctrl = ctk.CTkFrame(v_row, fg_color="transparent")
         v_ctrl.pack(fill="x", pady=(2, 0))
-        ctk.CTkLabel(v_ctrl, text="+", width=12).pack(side="left")
-        self.soft_volt_pos_limit_entry = ctk.CTkEntry(
-            v_ctrl, width=38, height=24, font=ctk.CTkFont(size=10))
-        self.soft_volt_pos_limit_entry.insert(
-            0, str(DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE))
-        self.soft_volt_pos_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkLabel(v_ctrl, text="-", width=12).pack(side="left")
-        self.soft_volt_neg_limit_entry = ctk.CTkEntry(
-            v_ctrl, width=38, height=24, font=ctk.CTkFont(size=10))
-        self.soft_volt_neg_limit_entry.insert(
-            0, str(abs(DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE)))
-        self.soft_volt_neg_limit_entry.pack(side="left", padx=(0, 4))
+        self.soft_volt_limit_display = ctk.CTkLabel(
+            v_ctrl,
+            text=self._format_symmetric_display(
+                self._dashboard_limits["VOLT"]),
+            width=62,
+            height=24,
+            anchor="center",
+            corner_radius=5,
+            fg_color=C["graph_bg"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=12))
+        self.soft_volt_limit_display.pack(side="left", padx=(0, 4))
+        self.soft_volt_limit_entry = ctk.CTkEntry(
+            v_ctrl, width=62, height=24, font=ctk.CTkFont(size=12))
+        self.soft_volt_limit_entry.insert(0, str(DEFAULT_VOLTAGE_LIMIT))
+        self.soft_volt_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
             v_ctrl, text="Set", width=34, height=24,
             command=lambda: self._set_software_limit("VOLT"),
@@ -2443,22 +2450,26 @@ class DashboardApp:
 
         c_row = ctk.CTkFrame(limits_card, fg_color="transparent")
         c_row.pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkLabel(c_row, text="Current limit (A):",
-                     font=ctk.CTkFont(size=10), anchor="w", wraplength=175).pack(fill="x")
+        ctk.CTkLabel(c_row, text="Current limit (+/- A):",
+                     font=ctk.CTkFont(size=12), anchor="w", wraplength=175).pack(fill="x")
         c_ctrl = ctk.CTkFrame(c_row, fg_color="transparent")
         c_ctrl.pack(fill="x", pady=(2, 0))
-        ctk.CTkLabel(c_ctrl, text="+", width=12).pack(side="left")
-        self.soft_curr_pos_limit_entry = ctk.CTkEntry(
-            c_ctrl, width=38, height=24, font=ctk.CTkFont(size=10))
-        self.soft_curr_pos_limit_entry.insert(
-            0, str(DEFAULT_POSITIVE_CURRENT_LIMIT))
-        self.soft_curr_pos_limit_entry.pack(side="left", padx=(0, 4))
-        ctk.CTkLabel(c_ctrl, text="-", width=12).pack(side="left")
-        self.soft_curr_neg_limit_entry = ctk.CTkEntry(
-            c_ctrl, width=38, height=24, font=ctk.CTkFont(size=10))
-        self.soft_curr_neg_limit_entry.insert(
-            0, str(abs(DEFAULT_NEGATIVE_CURRENT_LIMIT)))
-        self.soft_curr_neg_limit_entry.pack(side="left", padx=(0, 4))
+        self.soft_curr_limit_display = ctk.CTkLabel(
+            c_ctrl,
+            text=self._format_symmetric_display(
+                self._dashboard_limits["CURR"]),
+            width=62,
+            height=24,
+            anchor="center",
+            corner_radius=5,
+            fg_color=C["graph_bg"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=12))
+        self.soft_curr_limit_display.pack(side="left", padx=(0, 4))
+        self.soft_curr_limit_entry = ctk.CTkEntry(
+            c_ctrl, width=62, height=24, font=ctk.CTkFont(size=12))
+        self.soft_curr_limit_entry.insert(0, str(DEFAULT_CURRENT_LIMIT))
+        self.soft_curr_limit_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(
             c_ctrl, text="Set", width=34, height=24,
             command=lambda: self._set_software_limit("CURR"),
@@ -2472,7 +2483,7 @@ class DashboardApp:
             anchor="w", padx=10, pady=(8, 4))
         ctk.CTkLabel(
             range_card, text="Full-scale avoids quarter-scale transients.",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            text_color=C["text2"], font=ctk.CTkFont(size=12),
             justify="left", wraplength=220).pack(
             anchor="w", padx=10, pady=(0, 5))
         range_row = ctk.CTkFrame(range_card, fg_color="transparent")
@@ -2481,7 +2492,7 @@ class DashboardApp:
         self.man_range_combo = ctk.CTkComboBox(
             range_row, variable=self.man_range_var,
             values=["Auto", "Full Scale", "Quarter Scale"],
-            width=116, height=24, font=ctk.CTkFont(size=10))
+            width=116, height=24, font=ctk.CTkFont(size=12))
         self.man_range_combo.pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             range_row, text="Set", width=40, height=24,
@@ -2493,7 +2504,7 @@ class DashboardApp:
             range_card, text="Reset Device (*RST)",
             command=self._man_reset,
             fg_color=C["red"], hover_color="#dc2626",
-            height=26, font=ctk.CTkFont(size=11, weight="bold")).pack(
+            height=26, font=ctk.CTkFont(size=12, weight="bold")).pack(
             fill="x", padx=10, pady=(0, 8))
 
         monitor_card = ctk.CTkFrame(left_controls, corner_radius=12)
@@ -2512,30 +2523,57 @@ class DashboardApp:
         v_ctrl.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ctk.CTkLabel(
             v_ctrl, text="Voltage tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            text_color=C["text2"], font=ctk.CTkFont(size=12),
             justify="left", wraplength=150).pack(anchor="w")
+        voltage_threshold_row = ctk.CTkFrame(
+            v_ctrl, fg_color="transparent")
+        voltage_threshold_row.pack(anchor="w", pady=(2, 0))
+        self.vmon_threshold_display = ctk.CTkLabel(
+            voltage_threshold_row,
+            text=self._format_symmetric_display(self.vmon_threshold_pct),
+            width=52,
+            height=24,
+            anchor="center",
+            corner_radius=5,
+            fg_color=C["graph_bg"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=12))
+        self.vmon_threshold_display.pack(side="left", padx=(0, 4))
         self.vmon_threshold_entry = ctk.CTkEntry(
-            v_ctrl, width=80, height=24, font=ctk.CTkFont(size=10))
+            voltage_threshold_row, width=52, height=24,
+            font=ctk.CTkFont(size=12))
         self.vmon_threshold_entry.insert(0, str(DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT))
-        self.vmon_threshold_entry.pack(anchor="w", pady=(2, 0))
+        self.vmon_threshold_entry.pack(side="left")
 
         i_ctrl = ctk.CTkFrame(monitor_row, fg_color="transparent")
         i_ctrl.grid(row=0, column=1, sticky="ew")
         ctk.CTkLabel(
             i_ctrl, text="Current tolerance (%):",
-            text_color=C["text2"], font=ctk.CTkFont(size=10),
+            text_color=C["text2"], font=ctk.CTkFont(size=12),
             justify="left", wraplength=150).pack(anchor="w")
         current_threshold_row = ctk.CTkFrame(i_ctrl, fg_color="transparent")
         current_threshold_row.pack(anchor="w", pady=(2, 0))
+        self.imon_threshold_display = ctk.CTkLabel(
+            current_threshold_row,
+            text=self._format_symmetric_display(self.imon_threshold_pct),
+            width=52,
+            height=24,
+            anchor="center",
+            corner_radius=5,
+            fg_color=C["graph_bg"],
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=12))
+        self.imon_threshold_display.pack(side="left", padx=(0, 4))
         self.imon_threshold_entry = ctk.CTkEntry(
-            current_threshold_row, width=80, height=24, font=ctk.CTkFont(size=10))
+            current_threshold_row, width=52, height=24,
+            font=ctk.CTkFont(size=12))
         self.imon_threshold_entry.insert(0, str(DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT))
         self.imon_threshold_entry.pack(side="left")
         ctk.CTkButton(
-            current_threshold_row, text="Set", width=40, height=24,
+            current_threshold_row, text="Set", width=34, height=24,
             command=self._set_monitor_thresholds,
             fg_color="#374151", hover_color="#4b5563").pack(
-            side="left", padx=(6, 0))
+            side="left", padx=(4, 0))
 
         self._update_mode_buttons(self.control_mode_var.get())
 
@@ -3508,6 +3546,14 @@ class DashboardApp:
 
         self.vmon_threshold_pct = voltage_pct
         self.imon_threshold_pct = current_pct
+        self._normalize_limit_entry_text(
+            self.vmon_threshold_entry, voltage_pct)
+        self._normalize_limit_entry_text(
+            self.imon_threshold_entry, current_pct)
+        self.vmon_threshold_display.configure(
+            text=self._format_symmetric_display(voltage_pct))
+        self.imon_threshold_display.configure(
+            text=self._format_symmetric_display(current_pct))
 
     def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
         req = self.uploaded_request or {}
@@ -3735,55 +3781,66 @@ class DashboardApp:
         entry.delete(0, "end")
         entry.insert(0, KepcoController.format_scpi_value(value))
 
-    def _read_signed_limit_pair(self, pos_entry, neg_entry, name, max_abs):
-        pos = abs(float(pos_entry.get().strip()))
-        neg = -abs(float(neg_entry.get().strip()))
-        if pos <= 0 or abs(neg) <= 0:
-            raise ValueError(f"{name} limits must be nonzero.")
-        if pos > max_abs or abs(neg) > max_abs:
-            raise ValueError(f"{name} limits must be within +/-{max_abs:.1f}.")
-        self._normalize_limit_entry_text(pos_entry, pos)
-        self._normalize_limit_entry_text(neg_entry, abs(neg))
-        return pos, neg
+    @staticmethod
+    def _format_symmetric_display(value):
+        return f"+/-{float(value)}"
 
-    def _get_device_limits_from_ui(self, show_error=False):
+    def _read_absolute_limit(self, entry, name, maximum):
+        limit = abs(float(entry.get().strip()))
+        if not math.isfinite(limit) or limit <= 0:
+            raise ValueError(f"{name} must be a finite value greater than zero.")
+        if limit > maximum:
+            raise ValueError(f"{name} must not exceed {maximum:.1f}.")
+        self._normalize_limit_entry_text(entry, limit)
+        return limit
+
+    def _read_limit_candidate(self, mode, show_error=False):
+        mode = (mode or "").upper()
+        if mode not in ("VOLT", "CURR"):
+            raise ValueError(f"Unsupported limit channel '{mode}'")
+        entry = (
+            self.soft_volt_limit_entry
+            if mode == "VOLT" else self.soft_curr_limit_entry)
+        name = "Voltage limit" if mode == "VOLT" else "Current limit"
+        maximum = BOP_MAX_VOLTAGE if mode == "VOLT" else BOP_MAX_CURRENT
         try:
-            voltage_limits = self._read_signed_limit_pair(
-                self.soft_volt_pos_limit_entry,
-                self.soft_volt_neg_limit_entry,
-                "Voltage compliance / limit",
-                BOP_MAX_VOLTAGE)
-            current_limits = self._read_signed_limit_pair(
-                self.soft_curr_pos_limit_entry,
-                self.soft_curr_neg_limit_entry,
-                "Current limit",
-                BOP_MAX_CURRENT)
-            return voltage_limits, current_limits
+            return self._read_absolute_limit(entry, name, maximum)
         except Exception as exc:
             if show_error:
                 messagebox.showerror(
                     "Device Limits",
                     str(exc) if str(exc) else
-                    "Voltage and current limits must be valid signed numbers.")
+                    f"{name} must be a valid absolute value.")
             return None
+
+    def _commit_dashboard_limit(self, mode, value):
+        """Store one accepted limit and refresh its read-only display box."""
+        mode = (mode or "").upper()
+        if mode not in ("VOLT", "CURR"):
+            raise ValueError(f"Unsupported limit channel '{mode}'")
+        value = KepcoController.absolute_limit(
+            value,
+            DEFAULT_VOLTAGE_LIMIT if mode == "VOLT" else DEFAULT_CURRENT_LIMIT)
+        self._dashboard_limits[mode] = value
+        display_name = (
+            "soft_volt_limit_display"
+            if mode == "VOLT" else "soft_curr_limit_display")
+        display = getattr(self, display_name, None)
+        if display is not None and threading.current_thread() is threading.main_thread():
+            display.configure(text=self._format_symmetric_display(value))
 
     def _get_request_limits(self, req):
         req = req or {}
-        voltage_limits = req.get(
-            "voltage_limits",
-            req.get("voltage_compliance", KepcoController.default_voltage_limits()))
-        current_limits = req.get(
-            "current_limits",
-            req.get("current_limit", KepcoController.default_current_limits()))
+        voltage_limit = req.get(
+            "voltage_limit",
+            req.get("voltage_compliance", KepcoController.default_voltage_limit()))
+        current_limit = req.get(
+            "current_limit", KepcoController.default_current_limit())
         return (
-            KepcoController.limit_pair(
-                voltage_limits,
-                DEFAULT_POSITIVE_VOLTAGE_COMPLIANCE,
-                DEFAULT_NEGATIVE_VOLTAGE_COMPLIANCE),
-            KepcoController.limit_pair(
-                current_limits,
-                DEFAULT_POSITIVE_CURRENT_LIMIT,
-                DEFAULT_NEGATIVE_CURRENT_LIMIT),
+            KepcoController.absolute_limit(
+                voltage_limit, DEFAULT_VOLTAGE_LIMIT),
+            KepcoController.absolute_limit(
+                current_limit, DEFAULT_CURRENT_LIMIT),
         )
 
     def _request_with_latest_ui_limits(self, req):
@@ -3799,8 +3856,8 @@ class DashboardApp:
                 req["mode"], req["points"], context, limits):
             return None
         limited_req = dict(req)
-        limited_req["voltage_limits"] = limits["VOLT"]
-        limited_req["current_limits"] = limits["CURR"]
+        limited_req["voltage_limit"] = limits["VOLT"]
+        limited_req["current_limit"] = limits["CURR"]
         return limited_req
 
     def _log_scpi_sequence(self, label, cmds):
@@ -3869,9 +3926,9 @@ class DashboardApp:
                              label="Safe output prepare"):
         mode = (mode or "VOLT").upper()
         if voltage_compliance is None:
-            voltage_compliance = KepcoController.default_voltage_limits()
+            voltage_compliance = KepcoController.default_voltage_limit()
         if current_limit is None:
-            current_limit = KepcoController.default_current_limits()
+            current_limit = KepcoController.default_current_limit()
         if mode not in ("VOLT", "CURR"):
             return False, f"Unsupported FUNC:MODE '{mode}'"
 
@@ -3916,22 +3973,20 @@ class DashboardApp:
             label=label)
 
     def _get_software_limits(self, show_error=False):
-        limits = self._get_device_limits_from_ui(show_error=show_error)
-        if not limits:
-            return None
-        voltage_limits, current_limits = limits
-        return {"VOLT": voltage_limits, "CURR": current_limits}
+        return dict(self._dashboard_limits)
 
     def _set_software_limit(self, mode):
-        limits = self._get_software_limits(show_error=True)
-        if not limits:
+        mode = (mode or "").upper()
+        limit = self._read_limit_candidate(mode, show_error=True)
+        if limit is None:
             return
+        limits = self._get_software_limits()
+        limits[mode] = limit
         unit = "V" if mode == "VOLT" else "A"
-        pos_limit, neg_limit = limits[mode]
         if not self._man_require_conn():
+            self._commit_dashboard_limit(mode, limit)
             self.log(
-                f"{mode} limits staged locally at "
-                f"{neg_limit:.4f} to {pos_limit:.4f} {unit}; "
+                f"{mode} absolute limit staged locally at {limit:.4f} {unit}; "
                 "connect to send it to the device.",
                 "warn")
             return
@@ -3948,10 +4003,6 @@ class DashboardApp:
             transaction_state["active_mode"] = active
             if not active:
                 return False, "Could not confirm device control mode"
-            fixed_ok, fixed_msg = self.kepco.select_fixed_mode(
-                active, label=f"{mode} device limit fixed-mode setup")
-            if not fixed_ok:
-                return False, fixed_msg
             complementary = (
                 (active == "CURR" and mode == "VOLT")
                 or (active == "VOLT" and mode == "CURR")
@@ -3963,8 +4014,11 @@ class DashboardApp:
                 voltage_compliance=limits["VOLT"],
                 current_limit=limits["CURR"])
             transaction_state["commands"] = [command]
-            sent, send_msg = self.kepco.send_sequence(
-                [command, "*WAI"], label=f"{mode} device limit command")
+            sent, send_msg = self.kepco.apply_complementary_limit(
+                active,
+                voltage_compliance=limits["VOLT"],
+                current_limit=limits["CURR"],
+                label=f"{mode} device limit command")
             transaction_state["sent"] = sent
             return sent, send_msg
 
@@ -3991,6 +4045,7 @@ class DashboardApp:
             self._update_mode_buttons(active_mode)
 
         if ok and not transaction_state["sent"]:
+            self._commit_dashboard_limit(mode, limit)
             self.log(
                 f"{mode} is the active output channel in {active_mode} mode; "
                 "this field is staged as a UI/software limit only.",
@@ -4001,11 +4056,12 @@ class DashboardApp:
         cmds = transaction_state["commands"]
         self.log(f"Sending device limit command: {'; '.join(cmds)}", "info")
         self.log(
-            f"{mode} software limits are {neg_limit:.4f} to {pos_limit:.4f} "
-            f"{unit}; device limit programmed as absolute magnitude"
+            f"{mode} absolute limit is {limit:.4f} {unit}; "
+            "complementary device limit programmed and verified"
             if ok else f"Failed to send {mode} limit command: {msg}",
             "ok" if ok else "err")
         if ok:
+            self._commit_dashboard_limit(mode, limit)
             self._resume_after_dc_postflight(snapshot)
         else:
             self._resume_or_handle_transaction_failure(f"set {mode} limit")
@@ -4017,16 +4073,16 @@ class DashboardApp:
         return self._check_points_within_limits(mode, points, context, limits)
 
     def _check_points_within_limits(self, mode, points, context, limits):
-        pos_limit, neg_limit = limits[mode]
+        limit = limits[mode]
         high = max(float(point) for point in points)
         low = min(float(point) for point in points)
         unit = "V" if mode == "VOLT" else "A"
-        if high > pos_limit + 1e-12 or low < neg_limit - 1e-12:
+        if high > limit + 1e-12 or low < -limit - 1e-12:
             messagebox.showerror(
                 "Software Interlock",
                 f"{context} exceeds the configured {mode.lower()} limit.\n\n"
                 f"Requested range: {low:.4f} to {high:.4f} {unit}\n"
-                f"Limit range: {neg_limit:.4f} to {pos_limit:.4f} {unit}")
+                f"Limit range: {-limit:.4f} to {limit:.4f} {unit}")
             return False
         return True
 
@@ -4146,8 +4202,8 @@ class DashboardApp:
         limits = self._get_software_limits(show_error=True)
         if not limits:
             return None
-        req["voltage_limits"] = limits["VOLT"]
-        req["current_limits"] = limits["CURR"]
+        req["voltage_limit"] = limits["VOLT"]
+        req["current_limit"] = limits["CURR"]
         return req
 
     def _preview(self):
@@ -4660,10 +4716,11 @@ class DashboardApp:
         if live_dc_update:
             previous_voltage_compliance, previous_current_limit = (
                 self._get_request_limits(prev_req))
-            limits_changed = (
-                voltage_compliance != previous_voltage_compliance
-                or current_limit != previous_current_limit)
-            if limits_changed:
+            complementary_limit_changed = (
+                current_limit != previous_current_limit
+                if mode == "VOLT"
+                else voltage_compliance != previous_voltage_compliance)
+            if complementary_limit_changed:
                 ok, msg = self.kepco.apply_complementary_limit(
                     mode,
                     voltage_compliance=voltage_compliance,
@@ -4671,6 +4728,14 @@ class DashboardApp:
                     label=f"DC live {mode} complementary limit update")
                 if not ok:
                     return False, f"DC limit update failed: {msg}"
+                ok, msg = self.kepco.verify_programmed_configuration(
+                    mode,
+                    voltage_compliance=voltage_compliance,
+                    current_limit=current_limit,
+                    verify_limit=False,
+                    label="DC live setpoint preflight")
+                if not ok:
+                    return False, msg
             else:
                 ok, msg = self.kepco.verify_programmed_configuration(
                     mode,
@@ -4841,6 +4906,10 @@ class DashboardApp:
         stopped = False
         forever = req["loop"] == 0
         iteration = 0
+        # A primed first chunk has already established and verified the single
+        # complementary limit. Preserve it for all later chunks; the manual
+        # recommends rewriting the limit only when its value changes.
+        limit_initialized = bool(skip_first_upload)
         try:
             chunks = [
                 req["points"][i:i + MAX_LIST_POINTS]
@@ -4877,10 +4946,12 @@ class DashboardApp:
                             chunk, req["dwell"], mode,
                             progress_cb=progress_cb,
                             voltage_compliance=voltage_compliance,
-                            current_limit=current_limit)
+                            current_limit=current_limit,
+                            apply_limit_setup=not limit_initialized)
                         if not ok:
                             final_msg = f"Chunk {chunk_idx + 1} upload failed: {msg}"
                             break
+                        limit_initialized = True
 
                     # Each uploaded chunk is armed as a one-count LIST run. Once
                     # the output is already on, later chunks avoid another OUTP ON
