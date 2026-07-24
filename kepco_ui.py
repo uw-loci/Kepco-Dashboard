@@ -346,6 +346,11 @@ class KepcoController:
             detail = f" ({reason})" if reason else ""
             self._dbg("info", f"COMM STATE {old_state.value} -> {state.value}{detail}")
 
+    @staticmethod
+    def _validate_identity_reply(raw):
+        """Validate identity without colliding with connect's boolean option."""
+        return validate_identity(raw)
+
     def _close_socket(self):
         if self.sock:
             try:
@@ -444,6 +449,17 @@ class KepcoController:
                         self._dbg(
                             "warn",
                             f"Identity check failed {ip}:{target_port} ({transport}): {last_err}",
+                        )
+                        self.disconnect()
+                        continue
+                    try:
+                        idn = self._validate_identity_reply(idn)
+                    except ProtocolError as exc:
+                        last_err = str(exc)
+                        self._dbg(
+                            "warn",
+                            f"Identity check failed {ip}:{target_port} "
+                            f"({transport}): {last_err}",
                         )
                         self.disconnect()
                         continue
