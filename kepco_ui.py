@@ -5656,6 +5656,12 @@ class DashboardApp:
             # just before the operator closed the application.
             if not self.kepco.is_transport_connected:
                 return True, ""
+            if not self.kepco.is_verified:
+                # Match Disconnect: do not issue output commands against an
+                # untrusted response stream. Retire the socket and close with
+                # the physical output state unknown.
+                self.kepco.disconnect()
+                return True, ""
             ok, err_msg = self._safe_output_off_before_disconnect()
             if ok:
                 self.kepco.disconnect()
