@@ -216,7 +216,7 @@ All device-facing Manual Override actions run on background workers. An applicat
 
 ## Known Limitations
 
-- Automated tests cover transport framing, socket-owner serialization, atomic snapshots, command-error behavior, output-control gating, and the manual-recommended DC command sequence. Hardware-in-the-loop endurance testing is still required on the target BIT 802E firmware.
+- The repository does not currently include automated tests.
 - CSV mode is labeled `untested` in the UI and should be validated on target hardware.
 - BIT 802E readback can be inaccurate while LIST-driven AC output is active; the UI shows a warning during that state.
 - Higher frequency requests may reduce the requested point count because dwell cannot go below `0.0005 s`.
