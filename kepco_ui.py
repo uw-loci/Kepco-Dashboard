@@ -516,14 +516,6 @@ class KepcoController:
 
     def _pop_complete_line(self):
         """Pop one CR/LF-terminated protocol line, preserving any tail."""
-        if self.port == SCPI_SOCKET_PORT:
-            lf = self._recv_buffer.find(b"\n")
-            if lf < 0:
-                return None
-            line = self._recv_buffer[:lf].rstrip(b"\r")
-            self._recv_buffer = self._recv_buffer[lf + 1:]
-            return self._decode_response_line(line)
-
         cr = self._recv_buffer.find(b"\r")
         lf = self._recv_buffer.find(b"\n")
         endings = [index for index in (cr, lf) if index >= 0]
