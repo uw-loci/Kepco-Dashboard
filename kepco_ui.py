@@ -1173,31 +1173,44 @@ class KepcoController:
             current_limit=current_limit,
             label=f"{label} verification")
 
-    @staticmethod
-    def _is_advisory_device_error(error):
-        """Return True for BIT errors that are logged but not state-fatal."""
-        code = str(error or "").strip().split(",", 1)[0].strip()
-        return code == "-221"
-
     def _classify_device_errors(self, errors, label):
-        """Log every device error and separate advisory from blocking codes."""
-        advisory = []
+        """Log device execution errors; none are globally safe to ignore."""
         blocking = []
         for error in errors or []:
-            if self._is_advisory_device_error(error):
-                advisory.append(error)
-                self._dbg(
-                    "warn",
-                    f"{label}: advisory BIT error {error}; continuing to "
-                    "live state verification")
-            else:
-                blocking.append(error)
-                self._dbg("err", f"{label}: blocking BIT error {error}")
-        return advisory, blocking
+            blocking.append(error)
+            self._dbg("err", f"{label}: blocking BIT device error {error}")
+        return blocking
+
+    def _drain_preexisting_device_errors(self, label):
+        """Clear and visibly report errors that predate a programming action."""
+        errors = self.drain_errors(fail_on_timeout=True)
+        if errors is None:
+            return False, (
+                self.last_error or
+                f"{label}: timed out draining existing BIT system errors")
+        for error in errors:
+            self._dbg(
+                "warn",
+                f"{label}: existing BIT system error drained before "
+                f"transaction: {error}")
+        return True, ""
+
+    def _require_clean_device_error_queue(self, label):
+        """Fail an action if the BIT reports any newly queued device error."""
+        errors = self.drain_errors(fail_on_timeout=True)
+        if errors is None:
+            return False, (
+                self.last_error or f"{label}: SYST:ERR? verification timeout")
+        blocking = self._classify_device_errors(errors, label)
+        if blocking:
+            return False, (
+                f"{label}: blocking device errors after transaction: "
+                f"{'; '.join(blocking)}")
+        return True, ""
 
     def verify_dc_postflight(self, expected_mode=None, expected_output=None,
                              label="DC transaction"):
-        """Require valid live state; log advisory -221 errors without locking."""
+        """Require a clean error queue and valid live state after DC writes."""
         if not self._is_socket_worker():
             return self.run_transaction(
                 self.verify_dc_postflight,
@@ -1205,15 +1218,8 @@ class KepcoController:
                 expected_output=expected_output,
                 label=label)
 
-        errors = self.drain_errors(fail_on_timeout=True)
-        if errors is None:
-            return False, self.last_error or f"{label}: error-queue timeout", None
-        advisory_errors, blocking_errors = self._classify_device_errors(
-            errors, label)
-        if blocking_errors:
-            reason = (
-                f"{label}: blocking device errors after transaction: "
-                f"{'; '.join(blocking_errors)}")
+        error_free, reason = self._require_clean_device_error_queue(label)
+        if not error_free:
             return False, reason, None
 
         snapshot, reason = self.read_status_snapshot()
@@ -1238,11 +1244,6 @@ class KepcoController:
             f"I={snapshot.current:.6g}, "
             f"OUTP={'ON' if snapshot.output_on else 'OFF'}, "
             f"MODE={snapshot.mode}")
-        if advisory_errors:
-            self._dbg(
-                "warn",
-                f"{label}: verified expected live state despite advisory "
-                f"device error(s): {'; '.join(advisory_errors)}")
         return True, "", snapshot
 
     # -- synchronization helpers --------------------------------------------
@@ -1494,7 +1495,7 @@ class KepcoController:
           3. Values: send LIST:{mode} batches of <= 10 values each,
              each followed only by the mandatory 35 ms gap
           4. Dwell: send LIST:DWEL once after values
-          5. Verify: *WAI -> LIST:{mode}:POIN? -> SYST:ERR?
+          5. Verify: *WAI -> SYST:ERR? -> LIST:{mode}:POIN? -> SYST:ERR?
 
         Key change from previous revision: *OPC? is NOT used anywhere
         in the upload path.  The manual (PAR A.17) recommends *WAI for
@@ -1524,9 +1525,12 @@ class KepcoController:
                 return False, f"Unsupported list mode '{mode}'"
 
             try:
-                # Clear stale error queue first so prior test noise is not
-                # reported as a fresh upload failure.
-                self.drain_errors()
+                # Attribute only errors produced by this upload. Historical
+                # entries are drained first but remain visible to the operator.
+                clean, reason = self._drain_preexisting_device_errors(
+                    f"LIST upload preflight ({mode})")
+                if not clean:
+                    return False, reason
 
                 # -- Phase 1: Disarm any active LIST mode --
                 # Live waveform replacement keeps OUTP ON, so the previous
@@ -1612,11 +1616,20 @@ class KepcoController:
                 if not self.sync():
                     return False, f"Post-upload *WAI failed: {self.last_error}"
 
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST upload verification ({mode})")
+                if not clean:
+                    return False, reason
+
                 pcount_str = self.send_query(f"LIST:{mode}:POIN?")
                 if pcount_str is None:
                     return False, (
                         f"LIST:{mode}:POIN? verification failed: "
                         f"{self.last_error}")
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST point-count query verification ({mode})")
+                if not clean:
+                    return False, reason
                 try:
                     actual_count = int(pcount_str.strip())
                 except (AttributeError, ValueError):
@@ -1626,20 +1639,6 @@ class KepcoController:
                     return False, (
                         f"Point count mismatch: sent {total}, "
                         f"device reports {actual_count}")
-
-                errors = self.drain_errors(fail_on_timeout=True)
-                if errors is None:
-                    return False, "SYST:ERR? timeout during verification"
-                advisory_errors, blocking_errors = self._classify_device_errors(
-                    errors, f"LIST upload verification ({mode})")
-                if blocking_errors:
-                    return False, (
-                        f"Blocking device errors: {'; '.join(blocking_errors)}")
-                if advisory_errors:
-                    self._dbg(
-                        "warn",
-                        "LIST point count verified despite advisory device "
-                        f"error(s): {'; '.join(advisory_errors)}")
 
                 return True, (
                     f"{total} pts @ {dwell*1000:.3f} ms/step (verified)")
@@ -1673,6 +1672,10 @@ class KepcoController:
             return False, f"Unsupported list mode '{mode}'"
         with self._lock:
             try:
+                clean, reason = self._drain_preexisting_device_errors(
+                    f"LIST run preflight ({mode})")
+                if not clean:
+                    return False, reason
                 cmds = []
                 if apply_limit_setup:
                     ok, setup_msg = self.configure_fixed_mode(
@@ -1697,6 +1700,11 @@ class KepcoController:
                 if not ok:
                     return False, run_msg
 
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST run verification ({mode})")
+                if not clean:
+                    return False, reason
+
                 outp_resp = self.send_query("OUTP?")
                 if outp_resp is None:
                     return False, "Run verification failed: OUTP? unavailable"
@@ -1705,6 +1713,10 @@ class KepcoController:
                 if mode_resp is None:
                     return False, (
                         f"Run verification failed: {mode}:MODE? unavailable")
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST run readback verification ({mode})")
+                if not clean:
+                    return False, reason
                 mode_state = mode_resp.strip().upper()
                 if enable_output and outp not in ("1", "ON"):
                     return False, "Run verification failed: output not enabled"
@@ -1724,6 +1736,10 @@ class KepcoController:
             return False, f"Unsupported FUNC:MODE '{base_mode}'"
         with self._lock:
             try:
+                clean, reason = self._drain_preexisting_device_errors(
+                    f"LIST stop preflight ({base_mode})")
+                if not clean:
+                    return False, reason
                 # Only the source selected by FUNC:MODE can safely accept a
                 # mode command on BIT 802E hardware.  If LIST is active,
                 # disarm that source before switching the output off.
@@ -1734,6 +1750,11 @@ class KepcoController:
                     ["OUTP OFF", "*WAI"], label="LIST output disable")
                 if not ok:
                     return False, msg
+
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST stop output-disable verification ({base_mode})")
+                if not clean:
+                    return False, reason
 
                 # Socket delivery is not proof that the BIT accepted OUTP OFF.
                 # Query immediately after the manual-required wait barrier,
@@ -1759,6 +1780,10 @@ class KepcoController:
                     base_mode, label=f"Stop fixed-mode setup ({base_mode})")
                 if not ok:
                     return False, msg
+                clean, reason = self._require_clean_device_error_queue(
+                    f"LIST stop verification ({base_mode})")
+                if not clean:
+                    return False, reason
                 return True, "Output OFF verified; LIST stopped"
             except Exception as e:
                 return False, str(e)
@@ -3265,8 +3290,7 @@ class DashboardApp:
         visible = (
             tag in ("err", "critical")
             or "KEPCO HW WRITE sent:" in msg
-            or "advisory BIT error" in msg
-            or "despite advisory device error" in msg)
+            or "existing BIT system error" in msg)
         if threading.current_thread() is threading.main_thread():
             self.log(f"[COMM] {msg}", tag, visible=visible)
         else:
@@ -4058,6 +4082,16 @@ class DashboardApp:
                 f"{context}: existing BIT system error: {error}", "warn")
         return True, ""
 
+    def _capture_device_errors_after_failure(self, ok, msg, context):
+        """Attach and log queued execution errors after a failed device action."""
+        if ok or not self.kepco.is_verified:
+            return ok, msg
+        queue_clean, queue_msg = self.kepco._require_clean_device_error_queue(
+            f"{context} failed-operation error check")
+        if not queue_clean:
+            msg = f"{msg}; {queue_msg}" if msg else queue_msg
+        return ok, msg
+
     def _run_dc_transaction(self, operation, context, expected_mode=None,
                             expected_output=None):
         """Run one paused DC operation plus mandatory postflight checks."""
@@ -4069,6 +4103,8 @@ class DashboardApp:
 
             ok, msg = operation()
             if not ok:
+                ok, msg = self._capture_device_errors_after_failure(
+                    ok, msg, context)
                 return False, msg or f"{context} command transaction failed", None
 
             verified, verify_msg, snapshot = self.kepco.verify_dc_postflight(
@@ -5151,6 +5187,8 @@ class DashboardApp:
             progress_cb=progress_cb,
             voltage_compliance=voltage_compliance,
             current_limit=current_limit)
+        ok, msg = self._capture_device_errors_after_failure(
+            ok, msg, f"LIST upload ({req['mode']})")
         if not ok:
             return False, msg
         return True, msg
@@ -5333,9 +5371,13 @@ class DashboardApp:
                         voltage_compliance=voltage_compliance,
                         current_limit=current_limit,
                         apply_limit_setup=False)
+                    list_ok, list_msg = self._capture_device_errors_after_failure(
+                        list_ok, list_msg, f"LIST output enable ({mode})")
                     return list_ok, list_msg, None
                 if req and req["kind"] == "LIST":
                     list_ok, list_msg = self.kepco.stop(base_mode=mode)
+                    list_ok, list_msg = self._capture_device_errors_after_failure(
+                        list_ok, list_msg, f"LIST output disable ({mode})")
                     return list_ok, list_msg, None
                 sent = bool(self.kepco.send("OUTP OFF"))
                 return (
