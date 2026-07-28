@@ -1,4 +1,4 @@
-"""Read solenoid temperatures from EBEAM dashboard WebMonitor JSONL logs."""
+"""Read solenoid temperatures from EBEAM dashboard Data Log JSONL files."""
 
 import json
 from dataclasses import dataclass
@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Any, List, Optional, Union
 
 
-WEBMONITOR_LOG_PATTERN = "webMonitor_log_*.txt"
+DATALOG_FILE_PATTERN = "datalog_*.txt"
 EBEAM_DASHBOARD_DIR = "EBEAM_dashboard"
-WEBMONITOR_LOG_DIR = "EBEAM-Dashboard-WMLogs"
-WEBMONITOR_TAIL_CHUNK_BYTES = 64 * 1024
-WEBMONITOR_TAIL_SCAN_BYTES = 2 * 1024 * 1024
+DATALOG_DIR = "EBEAM-Dashboard-Datalogs"
+DATALOG_TAIL_CHUNK_BYTES = 64 * 1024
+DATALOG_TAIL_SCAN_BYTES = 2 * 1024 * 1024
 
 TemperatureValue = Optional[Union[float, str]]
 
@@ -24,34 +24,41 @@ class SolenoidTemperatureSnapshot:
     error: Optional[str] = None
 
 
-class WebMonitorSolenoidTemperatureReader:
-    """Read the most recent solenoid temperature values from EBEAM JSONL logs."""
+class DatalogSolenoidTemperatureReader:
+    """Read the most recent solenoid temperature values from EBEAM Data Logs."""
 
-    def __init__(self, log_dir: Optional[Union[str, Path]] = None):
-        self.log_dir = Path(log_dir) if log_dir is not None else self.default_log_dir()
+    def __init__(self, datalog_dir: Optional[Union[str, Path]] = None):
+        self.datalog_dir = (
+            Path(datalog_dir)
+            if datalog_dir is not None
+            else self.default_datalog_dir()
+        )
 
     @staticmethod
-    def default_log_dir() -> Path:
-        """Match the EBEAM dashboard's WebMonitor log directory."""
-        return Path.home() / EBEAM_DASHBOARD_DIR / WEBMONITOR_LOG_DIR
+    def default_datalog_dir() -> Path:
+        """Match the EBEAM dashboard's Data Log directory."""
+        return Path.home() / EBEAM_DASHBOARD_DIR / DATALOG_DIR
 
     def read_latest(self) -> SolenoidTemperatureSnapshot:
-        """Return solenoid 1/2 values from the newest valid WebMonitor log entry."""
+        """Return solenoid 1/2 values from the newest valid Data Log entry."""
         try:
-            log_files = self._find_log_files_newest_first()
-            if not log_files:
+            datalog_files = self._find_datalog_files_newest_first()
+            if not datalog_files:
                 return SolenoidTemperatureSnapshot(
-                    error=f"No {WEBMONITOR_LOG_PATTERN} files found in {self.log_dir}"
+                    error=(
+                        f"No {DATALOG_FILE_PATTERN} files found in "
+                        f"{self.datalog_dir}"
+                    )
                 )
 
-            for log_file in log_files:
+            for datalog_file in datalog_files:
                 try:
-                    if log_file.stat().st_size == 0:
+                    if datalog_file.stat().st_size == 0:
                         continue
                 except OSError:
                     continue
 
-                entry = self._read_last_valid_entry(log_file)
+                entry = self._read_last_valid_entry(datalog_file)
                 if entry is None:
                     continue
 
@@ -71,27 +78,27 @@ class WebMonitorSolenoidTemperatureReader:
                         self._get_temperature(temperatures, "2")
                     ),
                     timestamp=timestamp,
-                    source_path=str(log_file),
+                    source_path=str(datalog_file),
                 )
 
             return SolenoidTemperatureSnapshot(
                 error=(
                     "No valid JSON status entry found in the newest "
-                    f"{WEBMONITOR_TAIL_SCAN_BYTES} bytes of any "
-                    f"{WEBMONITOR_LOG_PATTERN} file in {self.log_dir}"
+                    f"{DATALOG_TAIL_SCAN_BYTES} bytes of any "
+                    f"{DATALOG_FILE_PATTERN} file in {self.datalog_dir}"
                 )
             )
         except OSError as exc:
             return SolenoidTemperatureSnapshot(
-                error=f"Unable to read WebMonitor log directory {self.log_dir}: {exc}"
+                error=f"Unable to read Data Log directory {self.datalog_dir}: {exc}"
             )
 
-    def _find_log_files_newest_first(self) -> List[Path]:
-        if not self.log_dir.exists() or not self.log_dir.is_dir():
+    def _find_datalog_files_newest_first(self) -> List[Path]:
+        if not self.datalog_dir.exists() or not self.datalog_dir.is_dir():
             return []
 
         candidates = []
-        for path in self.log_dir.glob(WEBMONITOR_LOG_PATTERN):
+        for path in self.datalog_dir.glob(DATALOG_FILE_PATTERN):
             try:
                 if path.is_file():
                     stat = path.stat()
@@ -110,13 +117,13 @@ class WebMonitorSolenoidTemperatureReader:
             with path.open("rb") as handle:
                 handle.seek(0, 2)
                 file_size = handle.tell()
-                bytes_remaining = min(file_size, WEBMONITOR_TAIL_SCAN_BYTES)
+                bytes_remaining = min(file_size, DATALOG_TAIL_SCAN_BYTES)
                 position = file_size
                 pending_prefix = b""
 
                 while position > 0 and bytes_remaining > 0:
                     read_size = min(
-                        WEBMONITOR_TAIL_CHUNK_BYTES,
+                        DATALOG_TAIL_CHUNK_BYTES,
                         position,
                         bytes_remaining,
                     )

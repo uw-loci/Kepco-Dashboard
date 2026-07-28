@@ -20,7 +20,7 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 ## Main Files
 
 - `kepco_ui.py`: main desktop application, SCPI controller, waveform generation, discovery, and UI orchestration
-- `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM WebMonitor JSONL logs for DC current monitoring
+- `solenoid_temperature_reader.py`: reads latest solenoid temperatures from EBEAM Data Log JSONL files for DC current monitoring
 - `requirements.txt`: Python dependencies
 - `docs/802e_manual.md`: device reference material
 - [`docs/KEPCO LAN IP Configuration Steps 2026-3-15-CMov.pdf`](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf): Kepco LAN/IP setup reference for configuring network access to the supply
@@ -119,13 +119,13 @@ During steady-state operation, the next four-query status snapshot is scheduled
 1 second after the previous snapshot completes. Connect and operator
 transactions can still request an immediate refresh.
 
-The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM WebMonitor log directory:
+The status panel also shows the latest solenoid 1 and solenoid 2 temperatures read from the EBEAM Data Log directory:
 
 ```text
-~/EBEAM_dashboard/EBEAM-Dashboard-WMLogs/webMonitor_log_*.txt
+~/EBEAM_dashboard/EBEAM-Dashboard-Datalogs/datalog_*.txt
 ```
 
-The newest valid JSONL status entry is used. If the file cannot be found, cannot be parsed, or no longer updates, the live console shows a WebMonitor warning. WebMonitor values are polled every `3 s`; values older than `10 s` are marked stale.
+The newest valid JSONL status entry is used. This includes hourly rotated files and collision-safe filenames with numeric suffixes. If the file cannot be found, cannot be parsed, or no longer receives the EBEAM dashboard's one-second heartbeat, the live console shows a Data Log warning. Data Log values are polled every `3 s`; values older than `10 s` are marked stale.
 
 The on-screen **Event Log** starts at a compact height. Use **Expand Log**
 or press `Alt+L` to enlarge it vertically; the expanded height follows the
@@ -148,7 +148,7 @@ The monitor is active only during this stage:
 
 In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload or output, and output transitions, the voltage and current monitor lines are set to inactive.
 
-When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two WebMonitor solenoid temperatures:
+When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two Data Log solenoid temperatures:
 
 ```text
 expected voltage = Iset * (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
@@ -215,8 +215,6 @@ All device-facing Manual Override actions run on background workers. An applicat
 - Review the on-screen log or the saved session log for SCPI-level details.
 
 ## Known Limitations
-
-- The repository does not currently include automated tests.
 - CSV mode is labeled `untested` in the UI and should be validated on target hardware.
 - BIT 802E readback can be inaccurate while LIST-driven AC output is active; the UI shows a warning during that state.
 - Higher frequency requests may reduce the requested point count because dwell cannot go below `0.0005 s`.
