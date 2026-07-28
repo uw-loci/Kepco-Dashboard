@@ -215,10 +215,6 @@ All device-facing Manual Override actions run on background workers. An applicat
 - Review the on-screen log or the saved session log for SCPI-level details.
 
 ## Known Limitations
-
-- Automated tests currently cover the EBEAM Data Log consumer contract. Run
-  them with `python -m unittest discover -s tests -v`. Kepco communication and
-  control workflows still require hardware-in-the-loop qualification.
 - CSV mode is labeled `untested` in the UI and should be validated on target hardware.
 - BIT 802E readback can be inaccurate while LIST-driven AC output is active; the UI shows a warning during that state.
 - Higher frequency requests may reduce the requested point count because dwell cannot go below `0.0005 s`.
