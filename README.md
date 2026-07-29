@@ -12,7 +12,8 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 - Supports voltage (`VOLT`) and current (`CURR`) control modes with one absolute limit value for each channel
 - Provides manual SCPI controls, quick diagnostic queries, range control, health check, and reset
 - Shows the uploaded waveform, live output state, control mode, and voltage/current readback only while device communication is verified
-- Monitors DC current-mode setpoints against live current and temperature-adjusted voltage expectations
+- Monitors DC setpoints in both control modes against live readback and
+  temperature-adjusted complementary-channel expectations
 - Optionally records live readback samples to CSV
 - Logs session and communication activity to `logs/`
 - Attempts a safe shutdown on disconnect or close by stopping output and verifying `OFF` at approximately `0 V` and `0 A`
@@ -134,27 +135,53 @@ are condensed so the log receives its requested space on low-resolution
 displays. Use **Collapse Log** or `Alt+L` again to restore the compact log and
 normal graph sizes.
 
-## DC Current Monitoring
+## DC Monitoring
 
-The **DC Monitor Thresholds** controls set percentage tolerances for the DC current monitor. Their dark read-only boxes show the committed symmetric tolerances as `+/-value`; each vertically stacked threshold has its own pending entry and **Set** button. The default voltage and current tolerances are both `5%`.
+The **DC Monitor Thresholds** controls set percentage tolerances for the DC
+monitor. Their dark read-only boxes show the committed symmetric tolerances as
+`+/-value`; each vertically stacked threshold has its own pending entry and
+**Set** button. The default voltage and current tolerances are both `5%`.
+The BIT 802E readback accuracy of 0.05% of full scale provides minimum
+tolerance bands of `0.05 V` and `0.001 A`, preventing zero and near-zero
+setpoints from requiring an exact, noise-free readback.
 
 The monitor is active only during this stage:
 
 - The app is connected to the Kepco
 - Output is enabled
 - The uploaded/staged request is `DC`
-- The selected uploaded control mode is `CURR`
-- The device status poll reports `CURR` mode
+- The device status poll reports the same `VOLT` or `CURR` mode as the
+  uploaded request
 
-In every other stage, including disconnected, uploaded-but-output-off, voltage-mode DC, LIST waveform upload or output, and output transitions, the voltage and current monitor lines are set to inactive.
+In every other stage, including disconnected, uploaded-but-output-off, LIST
+waveform upload or output, mode mismatches, and output transitions, the voltage
+and current monitor lines are set to inactive.
 
-When active, the current monitor compares measured current against the uploaded DC current setpoint using the configured current tolerance. The voltage monitor calculates the expected supply voltage from the current setpoint and the two Data Log solenoid temperatures:
+In current mode, the current monitor compares measured current against the
+uploaded DC current setpoint. The voltage monitor calculates the expected
+supply voltage from the current setpoint and the two Data Log solenoid
+temperatures:
 
 ```text
 expected voltage = Iset * (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
 ```
 
-Measured voltage is then compared with that expected voltage using the configured voltage tolerance. If either temperature, the setpoint, or the live voltage is unavailable, the voltage monitor reports that it cannot compute the expected voltage. These monitor messages are indicators in the live console; they do not replace the upload-time limit checks or the disconnect/close safety interlock.
+In voltage mode, the voltage monitor compares measured voltage against the
+uploaded DC voltage setpoint. The current monitor uses the reciprocal of the
+same resistance model:
+
+```text
+expected current = Vset / (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
+```
+
+Each measured value is compared with its expectation using the configured
+channel tolerance and the readback-accuracy floor. Temperature-dependent
+predictions are unavailable if either temperature or the setpoint is missing,
+the relevant live value is unavailable, or the Data Log heartbeat is more than
+`10 s` old. The directly controlled channel remains monitored when temperature
+data is unavailable. These monitor messages are indicators in the live
+console; they do not replace the upload-time limit checks, device current
+limit, or disconnect/close safety interlock.
 
 Session logs are written to:
 
