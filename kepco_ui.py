@@ -73,14 +73,14 @@ SOLENOID_TEMPERATURE_POLL_MS = 3000
 DATALOG_STALE_SECONDS = 10.0
 DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
 DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
-# BIT 802E manual Table 1-4 specifies readback accuracy as 0.05% of
-# full scale.  Percentage-only monitor bands collapse to zero at a zero
-# setpoint, so use the specified readback accuracy as the minimum band.
-MONITOR_READBACK_ACCURACY_FRACTION = 0.0005
-VOLTAGE_MONITOR_ABSOLUTE_FLOOR = (
-    BOP_MAX_VOLTAGE * MONITOR_READBACK_ACCURACY_FRACTION)
-CURRENT_MONITOR_ABSOLUTE_FLOOR = (
-    BOP_MAX_CURRENT * MONITOR_READBACK_ACCURACY_FRACTION)
+# BIT 802E manual Tables 1-2 and 1-3, specifically for the BOP 100-2M.
+# The dashboard locks the active channel to full-scale RANG 1, so the
+# high-range programming figures apply.  Monitor uncertainty combines these
+# worst-case bounds linearly instead of using the generic BIT-card percentage.
+BOP_100_2M_VOLTAGE_MEASUREMENT_ACCURACY = 0.060
+BOP_100_2M_VOLTAGE_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.012
+BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY = 0.001
+BOP_100_2M_CURRENT_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.00025
 SOLENOID_BASE_RESISTANCE_OHMS = 20.95
 SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C = 0.0470
 VERIFY_SNAPSHOT_COUNT = 3
@@ -138,20 +138,37 @@ def dc_monitor_is_active(is_verified, is_on, mode_text, request):
     )
 
 
-def dc_monitor_tolerance(channel, expected_value, threshold_pct):
-    """Return a percentage band with a BIT readback-accuracy floor."""
+def dc_monitor_tolerance(
+        channel, expected_value, threshold_pct,
+        propagated_programming_accuracy=0.0):
+    """Return a percentage band with model-specific hardware uncertainty.
+
+    ``propagated_programming_accuracy`` is expressed in the monitored
+    channel's units.  It is added to measurement accuracy as a conservative
+    worst-case bound before comparison with the operator's percentage band.
+    """
     channel = str(channel or "").strip().upper()
     expected = _monitor_float(expected_value)
     threshold = _monitor_float(threshold_pct)
-    if expected is None or threshold is None or threshold < 0:
+    programming_accuracy = _monitor_float(propagated_programming_accuracy)
+    if (
+        expected is None
+        or threshold is None
+        or threshold < 0
+        or programming_accuracy is None
+        or programming_accuracy < 0
+    ):
         return None
     if channel == "VOLT":
-        absolute_floor = VOLTAGE_MONITOR_ABSOLUTE_FLOOR
+        measurement_accuracy = (
+            BOP_100_2M_VOLTAGE_MEASUREMENT_ACCURACY)
     elif channel == "CURR":
-        absolute_floor = CURRENT_MONITOR_ABSOLUTE_FLOOR
+        measurement_accuracy = (
+            BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY)
     else:
         raise ValueError(f"Unsupported monitor channel '{channel}'")
-    return max(abs(expected) * threshold / 100.0, absolute_floor)
+    hardware_floor = measurement_accuracy + programming_accuracy
+    return max(abs(expected) * threshold / 100.0, hardware_floor)
 
 
 def evaluate_dc_monitor(
@@ -188,9 +205,28 @@ def evaluate_dc_monitor(
             "status": "unavailable", "expected": None, "predicted": False},
     }
 
+    temp_1 = _monitor_float(solenoid_temp_1)
+    temp_2 = _monitor_float(solenoid_temp_2)
+    resistance = None
+    if temperatures_fresh and temp_1 is not None and temp_2 is not None:
+        resistance = (
+            SOLENOID_BASE_RESISTANCE_OHMS
+            + SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C
+            * (temp_1 + temp_2))
+        if not math.isfinite(resistance) or resistance <= 0:
+            resistance = None
+
+    controlled_programming_accuracy = (
+        BOP_100_2M_VOLTAGE_HIGH_RANGE_PROGRAMMING_ACCURACY
+        if controlled_channel == "VOLT"
+        else BOP_100_2M_CURRENT_HIGH_RANGE_PROGRAMMING_ACCURACY)
     if setpoint is not None:
         tolerance = dc_monitor_tolerance(
-            controlled_channel, setpoint, thresholds[controlled_channel])
+            controlled_channel,
+            setpoint,
+            thresholds[controlled_channel],
+            controlled_programming_accuracy,
+        )
         controlled_status = "unavailable"
         if measured[controlled_channel] is not None and tolerance is not None:
             controlled_status = (
@@ -203,17 +239,6 @@ def evaluate_dc_monitor(
             "predicted": False,
         }
 
-    temp_1 = _monitor_float(solenoid_temp_1)
-    temp_2 = _monitor_float(solenoid_temp_2)
-    resistance = None
-    if temperatures_fresh and temp_1 is not None and temp_2 is not None:
-        resistance = (
-            SOLENOID_BASE_RESISTANCE_OHMS
-            + SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C
-            * (temp_1 + temp_2))
-        if not math.isfinite(resistance) or resistance <= 0:
-            resistance = None
-
     expected_predicted = None
     if setpoint is not None and resistance is not None:
         expected_predicted = (
@@ -223,9 +248,16 @@ def evaluate_dc_monitor(
 
     predicted_status = "unavailable"
     if expected_predicted is not None:
+        propagated_programming_accuracy = (
+            controlled_programming_accuracy / resistance
+            if mode == "VOLT"
+            else controlled_programming_accuracy * resistance)
         tolerance = dc_monitor_tolerance(
-            predicted_channel, expected_predicted,
-            thresholds[predicted_channel])
+            predicted_channel,
+            expected_predicted,
+            thresholds[predicted_channel],
+            propagated_programming_accuracy,
+        )
         if measured[predicted_channel] is not None and tolerance is not None:
             predicted_status = (
                 "ok"

@@ -141,9 +141,13 @@ The **DC Monitor Thresholds** controls set percentage tolerances for the DC
 monitor. Their dark read-only boxes show the committed symmetric tolerances as
 `+/-value`; each vertically stacked threshold has its own pending entry and
 **Set** button. The default voltage and current tolerances are both `5%`.
-The BIT 802E readback accuracy of 0.05% of full scale provides minimum
-tolerance bands of `0.05 V` and `0.001 A`, preventing zero and near-zero
-setpoints from requiring an exact, noise-free readback.
+The BOP 100-2M model-specific readback accuracies provide minimum measurement
+bands of `0.060 V` and `0.001 A`. Because the dashboard operates the active
+channel in full-scale `RANG 1`, direct comparisons with a programmed setpoint
+also include the documented high-range programming errors of `0.012 V` or
+`0.00025 A`. Thus the minimum direct setpoint bands are `0.072 V` and
+`0.00125 A`, preventing zero and near-zero setpoints from requiring accuracy
+beyond the hardware specification.
 
 The monitor is active only during this stage:
 
@@ -175,7 +179,10 @@ expected current = Vset / (20.95 + 0.0470 * (solenoid_1_temp + solenoid_2_temp))
 ```
 
 Each measured value is compared with its expectation using the configured
-channel tolerance and the readback-accuracy floor. Temperature-dependent
+channel tolerance and the model-specific hardware-accuracy floor. For the
+temperature-predicted channel, programming uncertainty from the controlled
+channel is propagated through the resistance model and combined with the
+predicted channel's measurement accuracy. Temperature-dependent
 predictions are unavailable if either temperature or the setpoint is missing,
 the relevant live value is unavailable, or the Data Log heartbeat is more than
 `10 s` old. The directly controlled channel remains monitored when temperature
