@@ -196,7 +196,7 @@ Session logs are written to:
 logs/kepco_dashboard_date_YYYY-MM-DD_HHMMSS.log
 ```
 
-The session file retains all application and communication diagnostics, including high-frequency polling traffic. Every successfully transmitted state-changing SCPI command is also recorded explicitly as a `KEPCO HW WRITE` event; synchronization-only barriers such as `*WAI` are excluded. LIST data writes are summarized by channel and batch point count in the visible event panel, while the session file retains the complete transmitted command. The bottom event panel intentionally shows only successful events, hardware writes, warnings, errors, and critical errors so hardware actions are not displaced by SCPI polling. Each visible line includes an `INFO`, `WARNING`, `ERROR`, or `CRITICAL ERROR` level.
+The session file retains all application and communication diagnostics, including high-frequency polling traffic. Every successfully transmitted state-changing SCPI command is also recorded explicitly as a `KEPCO HW WRITE` event; synchronization-only barriers such as `*WAI` are excluded. Routine communication traffic, including polling and `KEPCO HW WRITE` entries, remains file-only. LIST data writes are summarized by channel and batch point count in the visible event panel. The bottom event panel intentionally shows only successful operator-facing events, warnings, errors, and critical errors. Each visible line includes an `INFO`, `WARNING`, `ERROR`, or `CRITICAL ERROR` level.
 
 When **Collect data** is enabled, readback samples are written to:
 

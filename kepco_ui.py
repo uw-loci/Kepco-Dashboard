@@ -3141,8 +3141,8 @@ class DashboardApp:
 
     # -- Session logging and readback collection -----------------------------
     # All diagnostics are retained in logs/*.log.  The bottom event panel is
-    # deliberately quieter: controller polling traffic stays file-only while
-    # hardware events and errors remain visible to the operator.
+    # deliberately quieter: routine controller traffic, including hardware
+    # writes and polling, stays file-only while errors remain visible.
     def _init_log_file(self):
         try:
             log_dir = os.path.join(os.getcwd(), "logs")
@@ -3457,7 +3457,6 @@ class DashboardApp:
         # must not displace operator events in the visible event panel.
         visible = (
             tag in ("err", "critical")
-            or "KEPCO HW WRITE sent:" in msg
             or "existing BIT system error" in msg)
         if threading.current_thread() is threading.main_thread():
             self.log(f"[COMM] {msg}", tag, visible=visible)
