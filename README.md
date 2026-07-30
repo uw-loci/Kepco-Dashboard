@@ -11,7 +11,9 @@ Desktop GUI for configuring, previewing, uploading, and running DC setpoints or 
 - Uploads and verifies one LIST waveform of up to `1000` points
 - Supports voltage (`VOLT`) and current (`CURR`) control modes with one absolute limit value for each channel
 - Provides manual SCPI controls, quick diagnostic queries, range control, health check, and reset
-- Shows the uploaded waveform, live output state, control mode, and voltage/current readback only while device communication is verified
+- Shows the uploaded waveform, live output state, control mode, and
+  voltage/current readback with derived resistance only while device
+  communication is verified
 - Monitors DC setpoints in both control modes against live readback and
   temperature-adjusted complementary-channel expectations
 - Optionally records live readback samples to CSV
@@ -204,7 +206,11 @@ When **Collect data** is enabled, readback samples are written to:
 logs/kepco_readback_collection_date_YYYY-MM-DD_HHMMSS.csv
 ```
 
-The data collection CSV includes timestamp, elapsed seconds, readback voltage, readback current, output state, and mode. Only accepted, verified status snapshots are recorded.
+The data collection CSV includes timestamp, elapsed seconds, readback voltage,
+readback current, derived resistance, output state, and mode. The always-on
+session log also records the derived resistance alongside every accepted
+voltage/current status snapshot. Only accepted, verified status snapshots are
+recorded.
 
 ## Communication Notes
 

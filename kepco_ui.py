@@ -81,6 +81,7 @@ BOP_100_2M_VOLTAGE_MEASUREMENT_ACCURACY = 0.060
 BOP_100_2M_VOLTAGE_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.012
 BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY = 0.001
 BOP_100_2M_CURRENT_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.00025
+RESISTANCE_MIN_CURRENT_A = BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY
 SOLENOID_BASE_RESISTANCE_OHMS = 20.95
 SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C = 0.0470
 VERIFY_SNAPSHOT_COUNT = 3
@@ -122,6 +123,20 @@ def _monitor_float(value):
     except Exception:
         return None
     return number if math.isfinite(number) else None
+
+
+def derive_readback_resistance(measured_voltage, measured_current):
+    """Return V/I when the current readback is large enough to be meaningful."""
+    voltage = _monitor_float(measured_voltage)
+    current = _monitor_float(measured_current)
+    if (
+        voltage is None
+        or current is None
+        or abs(current) <= RESISTANCE_MIN_CURRENT_A
+    ):
+        return None
+    resistance = voltage / current
+    return resistance if math.isfinite(resistance) else None
 
 
 def dc_monitor_is_active(is_verified, is_on, mode_text, request):
@@ -1504,12 +1519,24 @@ class KepcoController:
                     f"Status snapshot rejected: {reason}; "
                     "session synchronization uncertain")
                 return None, reason
-        return StatusSnapshot(
+        snapshot = StatusSnapshot(
             voltage=replies[0],
             current=replies[1],
             output_on=replies[2],
             mode=replies[3],
-        ), ""
+        )
+        resistance = derive_readback_resistance(
+            snapshot.voltage, snapshot.current)
+        resistance_text = (
+            f"{resistance:.6g} ohm"
+            if resistance is not None
+            else "unavailable"
+        )
+        self._dbg(
+            "info",
+            f"Status snapshot readback: V={snapshot.voltage:.6g} V, "
+            f"I={snapshot.current:.6g} A, R={resistance_text}")
+        return snapshot, ""
 
     def verify_device_state(self):
         """Run the full multi-snapshot health gate before enabling control."""
@@ -2294,6 +2321,7 @@ class DashboardApp:
         meas_font = ctk.CTkFont(family="Consolas", size=meas_font_size)
         self.status_meas_volt_lbl.configure(font=meas_font)
         self.status_meas_curr_lbl.configure(font=meas_font)
+        self.status_meas_resistance_lbl.configure(font=meas_font)
         self.status_solenoid_temp_1_lbl.configure(font=meas_font)
         self.status_solenoid_temp_2_lbl.configure(font=meas_font)
         live_font = ctk.CTkFont(family="Consolas", size=9, weight="bold")
@@ -3004,7 +3032,12 @@ class DashboardApp:
             vi_values, text="Current:  ---.----  A",
             font=ctk.CTkFont(family="Consolas", size=14),
             text_color="#34d399")
-        self.status_meas_curr_lbl.pack(anchor="w", pady=(1, 0))
+        self.status_meas_curr_lbl.pack(anchor="w", pady=1)
+        self.status_meas_resistance_lbl = ctk.CTkLabel(
+            vi_values, text="Resistance:  ---.----  \N{OHM SIGN}",
+            font=ctk.CTkFont(family="Consolas", size=14),
+            text_color="#fb923c")
+        self.status_meas_resistance_lbl.pack(anchor="w", pady=(1, 0))
 
         temp_values = ctk.CTkFrame(meas_values, fg_color="transparent")
         self.temp_values = temp_values
@@ -3236,6 +3269,7 @@ class DashboardApp:
                 "elapsed_s",
                 "readback_voltage_v",
                 "readback_current_a",
+                "derived_resistance_ohm",
                 "output_state",
                 "mode",
             ])
@@ -3292,6 +3326,7 @@ class DashboardApp:
             started_at = self.data_collection_started_at or now
             voltage = self._as_float(v)
             current = self._as_float(c)
+            resistance = derive_readback_resistance(voltage, current)
             output_text = str(outp).strip().upper()
             if output_text in ("1", "ON"):
                 output_text = "ON"
@@ -3309,6 +3344,7 @@ class DashboardApp:
                 f"{now - started_at:.3f}",
                 voltage if voltage is not None else str(v).strip(),
                 current if current is not None else str(c).strip(),
+                resistance if resistance is not None else "",
                 output_text,
                 mode_text,
             ])
@@ -3531,6 +3567,8 @@ class DashboardApp:
         self.current_control_mode = control_mode or "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
         self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
+        self.status_meas_resistance_lbl.configure(
+            text="Resistance:  ---.----  \N{OHM SIGN}")
         self._set_dc_monitors_inactive()
         self._set_status_mode_display(None)
         self.control_mode_var.set(self.current_control_mode)
@@ -3834,6 +3872,8 @@ class DashboardApp:
         if visible:
             self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
             self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
+            self.status_meas_resistance_lbl.configure(
+                text="Resistance:  ---.----  \N{OHM SIGN}")
         if visible and not self._ac_invalid_label_visible:
             self._ac_invalid_label_visible = True
             self._place_ac_operation_notice()
@@ -3985,6 +4025,10 @@ class DashboardApp:
     def _format_measurement_value(self, value):
         numeric = self._as_float(value)
         return f"{numeric:.4f}" if numeric is not None else "---.----"
+
+    def _format_resistance_value(self, voltage, current):
+        resistance = derive_readback_resistance(voltage, current)
+        return f"{resistance:.4f}" if resistance is not None else "---.----"
 
     def _format_temperature_value(self, value):
         numeric = self._as_float(value)
@@ -5160,8 +5204,15 @@ class DashboardApp:
         ac_operation = self._is_ac_operation_active(is_on)
         v_str = "---.----" if ac_operation else self._format_measurement_value(v)
         c_str = "---.----" if ac_operation else self._format_measurement_value(c)
+        resistance_str = (
+            "---.----"
+            if ac_operation
+            else self._format_resistance_value(v, c)
+        )
         self.status_meas_volt_lbl.configure(text=f"Voltage:  {v_str}  V")
         self.status_meas_curr_lbl.configure(text=f"Current:  {c_str}  A")
+        self.status_meas_resistance_lbl.configure(
+            text=f"Resistance:  {resistance_str}  \N{OHM SIGN}")
         self._set_status_output_display(is_on)
         self._set_status_mode_display(mode_text)
 
