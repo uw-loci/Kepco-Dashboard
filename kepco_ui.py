@@ -73,6 +73,16 @@ SOLENOID_TEMPERATURE_POLL_MS = 3000
 DATALOG_STALE_SECONDS = 10.0
 DEFAULT_VOLTAGE_MONITOR_THRESHOLD_PCT = 5.0
 DEFAULT_CURRENT_MONITOR_THRESHOLD_PCT = 5.0
+# BIT 802E manual Tables 1-2 and 1-3, specifically for the BOP 100-2M.
+# The dashboard locks the active channel to full-scale RANG 1, so the
+# high-range programming figures apply.  Monitor uncertainty combines these
+# worst-case bounds linearly instead of using the generic BIT-card percentage.
+BOP_100_2M_VOLTAGE_MEASUREMENT_ACCURACY = 0.060
+BOP_100_2M_VOLTAGE_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.012
+BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY = 0.001
+BOP_100_2M_CURRENT_HIGH_RANGE_PROGRAMMING_ACCURACY = 0.00025
+SOLENOID_BASE_RESISTANCE_OHMS = 20.95
+SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C = 0.0470
 VERIFY_SNAPSHOT_COUNT = 3
 
 
@@ -103,6 +113,164 @@ class StatusSnapshot:
     current: float
     output_on: bool
     mode: str
+
+
+def _monitor_float(value):
+    """Return a finite float for the pure DC-monitor helpers."""
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def dc_monitor_is_active(is_verified, is_on, mode_text, request):
+    """Return whether a staged request is eligible for steady-DC monitoring."""
+    request = request or {}
+    mode = str(mode_text or "").strip().upper()
+    request_mode = str(request.get("mode") or "").strip().upper()
+    return bool(
+        is_verified
+        and is_on
+        and mode in ("VOLT", "CURR")
+        and request.get("kind") == "DC"
+        and request_mode == mode
+    )
+
+
+def dc_monitor_tolerance(
+        channel, expected_value, threshold_pct,
+        propagated_programming_accuracy=0.0):
+    """Return a percentage band with model-specific hardware uncertainty.
+
+    ``propagated_programming_accuracy`` is expressed in the monitored
+    channel's units.  It is added to measurement accuracy as a conservative
+    worst-case bound before comparison with the operator's percentage band.
+    """
+    channel = str(channel or "").strip().upper()
+    expected = _monitor_float(expected_value)
+    threshold = _monitor_float(threshold_pct)
+    programming_accuracy = _monitor_float(propagated_programming_accuracy)
+    if (
+        expected is None
+        or threshold is None
+        or threshold < 0
+        or programming_accuracy is None
+        or programming_accuracy < 0
+    ):
+        return None
+    if channel == "VOLT":
+        measurement_accuracy = (
+            BOP_100_2M_VOLTAGE_MEASUREMENT_ACCURACY)
+    elif channel == "CURR":
+        measurement_accuracy = (
+            BOP_100_2M_CURRENT_MEASUREMENT_ACCURACY)
+    else:
+        raise ValueError(f"Unsupported monitor channel '{channel}'")
+    hardware_floor = measurement_accuracy + programming_accuracy
+    return max(abs(expected) * threshold / 100.0, hardware_floor)
+
+
+def evaluate_dc_monitor(
+        mode, setpoint, measured_voltage, measured_current,
+        solenoid_temp_1, solenoid_temp_2, temperatures_fresh,
+        voltage_threshold_pct, current_threshold_pct):
+    """Evaluate both DC channels without touching UI state.
+
+    In current mode, current is compared directly with its setpoint and
+    voltage is predicted from V=I*R(T).  Voltage mode applies the reciprocal
+    relationship: voltage is compared with its setpoint and current is
+    predicted from I=V/R(T).
+    """
+    mode = str(mode or "").strip().upper()
+    if mode not in ("VOLT", "CURR"):
+        raise ValueError(f"Unsupported DC monitor mode '{mode}'")
+
+    setpoint = _monitor_float(setpoint)
+    measured = {
+        "VOLT": _monitor_float(measured_voltage),
+        "CURR": _monitor_float(measured_current),
+    }
+    thresholds = {
+        "VOLT": voltage_threshold_pct,
+        "CURR": current_threshold_pct,
+    }
+    result_keys = {"VOLT": "voltage", "CURR": "current"}
+    controlled_channel = mode
+    predicted_channel = "CURR" if mode == "VOLT" else "VOLT"
+    results = {
+        "voltage": {
+            "status": "unavailable", "expected": None, "predicted": False},
+        "current": {
+            "status": "unavailable", "expected": None, "predicted": False},
+    }
+
+    temp_1 = _monitor_float(solenoid_temp_1)
+    temp_2 = _monitor_float(solenoid_temp_2)
+    resistance = None
+    if temperatures_fresh and temp_1 is not None and temp_2 is not None:
+        resistance = (
+            SOLENOID_BASE_RESISTANCE_OHMS
+            + SOLENOID_TEMPERATURE_COEFFICIENT_OHMS_PER_C
+            * (temp_1 + temp_2))
+        if not math.isfinite(resistance) or resistance <= 0:
+            resistance = None
+
+    controlled_programming_accuracy = (
+        BOP_100_2M_VOLTAGE_HIGH_RANGE_PROGRAMMING_ACCURACY
+        if controlled_channel == "VOLT"
+        else BOP_100_2M_CURRENT_HIGH_RANGE_PROGRAMMING_ACCURACY)
+    if setpoint is not None:
+        tolerance = dc_monitor_tolerance(
+            controlled_channel,
+            setpoint,
+            thresholds[controlled_channel],
+            controlled_programming_accuracy,
+        )
+        controlled_status = "unavailable"
+        if measured[controlled_channel] is not None and tolerance is not None:
+            controlled_status = (
+                "ok"
+                if abs(measured[controlled_channel] - setpoint) <= tolerance
+                else "triggered")
+        results[result_keys[controlled_channel]] = {
+            "status": controlled_status,
+            "expected": setpoint,
+            "predicted": False,
+        }
+
+    expected_predicted = None
+    if setpoint is not None and resistance is not None:
+        expected_predicted = (
+            setpoint / resistance
+            if mode == "VOLT"
+            else setpoint * resistance)
+
+    predicted_status = "unavailable"
+    if expected_predicted is not None:
+        propagated_programming_accuracy = (
+            controlled_programming_accuracy / resistance
+            if mode == "VOLT"
+            else controlled_programming_accuracy * resistance)
+        tolerance = dc_monitor_tolerance(
+            predicted_channel,
+            expected_predicted,
+            thresholds[predicted_channel],
+            propagated_programming_accuracy,
+        )
+        if measured[predicted_channel] is not None and tolerance is not None:
+            predicted_status = (
+                "ok"
+                if abs(
+                    measured[predicted_channel] - expected_predicted
+                ) <= tolerance
+                else "triggered")
+    results[result_keys[predicted_channel]] = {
+        "status": predicted_status,
+        "expected": expected_predicted,
+        "predicted": True,
+    }
+    return results
 
 
 @dataclass
@@ -1993,7 +2161,7 @@ class DashboardApp:
         self.solenoid_temperature_error = None
         self._last_unique_datalog_timestamp = None
         self._last_unique_datalog_seen_at = None
-        self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
+        self.dc_monitor_state = {"voltage": "inactive", "current": "inactive"}
 
         # UI-thread handoff state. Worker callbacks are queued here and drained
         # by a short root.after loop so Tk widgets stay on the main thread.
@@ -2973,8 +3141,8 @@ class DashboardApp:
 
     # -- Session logging and readback collection -----------------------------
     # All diagnostics are retained in logs/*.log.  The bottom event panel is
-    # deliberately quieter: controller polling traffic stays file-only while
-    # hardware events and errors remain visible to the operator.
+    # deliberately quieter: routine controller traffic, including hardware
+    # writes and polling, stays file-only while errors remain visible.
     def _init_log_file(self):
         try:
             log_dir = os.path.join(os.getcwd(), "logs")
@@ -3289,7 +3457,6 @@ class DashboardApp:
         # must not displace operator events in the visible event panel.
         visible = (
             tag in ("err", "critical")
-            or "KEPCO HW WRITE sent:" in msg
             or "existing BIT system error" in msg)
         if threading.current_thread() is threading.main_thread():
             self.log(f"[COMM] {msg}", tag, visible=visible)
@@ -3364,7 +3531,7 @@ class DashboardApp:
         self.current_control_mode = control_mode or "VOLT"
         self.status_meas_volt_lbl.configure(text="Voltage:  ---.----  V")
         self.status_meas_curr_lbl.configure(text="Current:  ---.----  A")
-        self._set_dc_current_monitors_inactive()
+        self._set_dc_monitors_inactive()
         self._set_status_mode_display(None)
         self.control_mode_var.set(self.current_control_mode)
         if hasattr(self, "mode_buttons"):
@@ -3386,7 +3553,7 @@ class DashboardApp:
         self.status_cfg_labels["device_state"].configure(text=device_state)
         self.prog_lbl.configure(text=progress_text)
         self.progress.set(0)
-        self._set_dc_current_monitors_inactive()
+        self._set_dc_monitors_inactive()
         self._refresh_ac_operation_notice()
         self._update_output_controls()
 
@@ -3435,7 +3602,7 @@ class DashboardApp:
         self._refresh_output_toggle_button()
         self._set_status_output_display(is_on)
         if not is_on:
-            self._set_dc_current_monitors_inactive()
+            self._set_dc_monitors_inactive()
         self._refresh_ac_operation_notice(is_on)
 
     def _set_status_output_display(self, is_on):
@@ -3712,12 +3879,12 @@ class DashboardApp:
             C["amber"],
             visible=stale)
 
-    def _set_dc_current_monitors_inactive(self):
+    def _set_dc_monitors_inactive(self):
         self._set_live_console_line(
             "voltage", "Voltage monitor inactive", C["text2"])
         self._set_live_console_line(
             "current", "Current monitor inactive", C["text2"])
-        self.dc_current_monitor_state = {"voltage": "inactive", "current": "inactive"}
+        self.dc_monitor_state = {"voltage": "inactive", "current": "inactive"}
         self._refresh_datalog_console_lines()
 
     def _read_monitor_thresholds(self):
@@ -3752,53 +3919,59 @@ class DashboardApp:
         display.configure(
             text=self._format_symmetric_display(threshold_pct))
 
-    def _update_dc_current_monitors(self, voltage, current, is_on, mode_text):
+    def _update_dc_monitors(self, voltage, current, is_on, mode_text):
         req = self.uploaded_request or {}
-        active = (
-            self.kepco.is_verified
-            and is_on
-            and mode_text == "CURR"
-            and req.get("kind") == "DC"
-            and req.get("mode") == "CURR"
-        )
-        if not active:
-            self._set_dc_current_monitors_inactive()
+        if not dc_monitor_is_active(
+                self.kepco.is_verified, is_on, mode_text, req):
+            self._set_dc_monitors_inactive()
             return
 
-        iset = self._as_float(req.get("amplitude"))
-        live_current = self._as_float(current)
-        live_voltage = self._as_float(voltage)
         voltage_threshold_pct, current_threshold_pct = self._read_monitor_thresholds()
+        stale_age = self._datalog_stale_age_seconds()
+        temperatures_fresh = bool(
+            not self.solenoid_temperature_error
+            and stale_age is not None
+            and stale_age <= DATALOG_STALE_SECONDS)
+        results = evaluate_dc_monitor(
+            mode_text,
+            req.get("amplitude"),
+            voltage,
+            current,
+            self.solenoid_temperatures.get("1"),
+            self.solenoid_temperatures.get("2"),
+            temperatures_fresh,
+            voltage_threshold_pct,
+            current_threshold_pct,
+        )
 
-        if iset is not None and live_current is not None:
-            current_ok = abs(live_current - iset) <= abs(iset) * current_threshold_pct / 100.0
-        else:
-            current_ok = False
-        self._set_live_console_line(
-            "current",
-            "Current within expected range" if current_ok else "Current outside expected range",
-            C["green"] if current_ok else C["red"])
-        self.dc_current_monitor_state["current"] = "ok" if current_ok else "triggered"
+        for channel, label in (("voltage", "Voltage"), ("current", "Current")):
+            result = results[channel]
+            status = result["status"]
+            if status == "unavailable":
+                unavailable_text = (
+                    f"Cannot compute expected {channel}"
+                    if result["predicted"]
+                    else f"Cannot compare {channel} setpoint")
+                self._set_live_console_line(
+                    channel, unavailable_text, C["amber"])
+                self.dc_monitor_state[channel] = "unavailable"
+                continue
 
-        temp_a = self._as_float(self.solenoid_temperatures.get("1"))
-        temp_b = self._as_float(self.solenoid_temperatures.get("2"))
-        if temp_a is None or temp_b is None or iset is None or live_voltage is None:
+            if status == "ok":
+                text = f"{label} within expected range"
+                color = C["green"]
+            elif result["predicted"]:
+                unit = "V" if channel == "voltage" else "A"
+                text = (
+                    f"{label} outside expected range "
+                    f"(expected {result['expected']:.3f} {unit})")
+                color = C["red"]
+            else:
+                text = f"{label} outside expected range"
+                color = C["red"]
             self._set_live_console_line(
-                "voltage", "Cannot compute expected voltage", C["amber"])
-            self.dc_current_monitor_state["voltage"] = "unavailable"
-            self._refresh_datalog_console_lines()
-            return
-
-        expected_voltage = iset * (20.95 + 0.0470 * (temp_a + temp_b))
-        voltage_ok = abs(live_voltage - expected_voltage) <= (
-            abs(expected_voltage) * voltage_threshold_pct / 100.0)
-        self._set_live_console_line(
-            "voltage",
-            "Voltage within expected range"
-            if voltage_ok
-            else f"Voltage outside expected range (expected {expected_voltage:.2f} V)",
-            C["green"] if voltage_ok else C["red"])
-        self.dc_current_monitor_state["voltage"] = "ok" if voltage_ok else "triggered"
+                channel, text, color)
+            self.dc_monitor_state[channel] = status
         self._refresh_datalog_console_lines()
 
     @staticmethod
@@ -5004,7 +5177,7 @@ class DashboardApp:
             self._set_status_output_display(is_on)
 
         self._refresh_ac_operation_notice(is_on)
-        self._update_dc_current_monitors(v, c, is_on, mode_text)
+        self._update_dc_monitors(v, c, is_on, mode_text)
         self._update_output_controls()
 
     # -- Upload ---------------------------------------------------------------
