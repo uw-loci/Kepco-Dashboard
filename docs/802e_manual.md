@@ -4595,6 +4595,13 @@ sion=n.m, e.g, 1.0) ><Firmware revision>=n.m (n.m revision, e.g, 1.0) (See examp
 
 A.7 *OPC — OPERATION COMPLETE COMMAND *OPC
 
+> **Dashboard project validation note (not part of the original Kepco
+> manual):** The deployed BIT 802E running firmware `5.16-5.15` was observed
+> accepting the `*OPC?` query and returning `1`. The dashboard connection
+> health gate uses this observed query behavior successfully, although the
+> original command table and description below document only the `*OPC`
+> command and the `*OPC`/`*ESR?` completion sequence.
+
 ```
 Syntax: *OPC
 ```
