@@ -36,11 +36,14 @@ The main code paths in `kepco_ui.py` are organized around four classes:
 New Kepco devices must be configured for LAN/IP access before the dashboard can connect to them. Follow the steps in the [Kepco LAN/IP configuration guide](docs/KEPCO%20LAN%20IP%20Configuration%20Steps%202026-3-15-CMov.pdf) before using **Scan Network** or **Connect** with a new supply.
 
 
+Use Python **3.11.17** and pip **26.2.2**. The `.python-version` file records the interpreter version for tools that support it. Confirm that `python --version` reports `3.11.17` before creating the virtual environment.
+
 Create a virtual environment and install dependencies:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip==26.2.2
 pip install -r requirements.txt
 ```
 
